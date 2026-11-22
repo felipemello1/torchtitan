@@ -259,6 +259,9 @@ class AsyncLoopConfig(Configurable.Config):
                            start, wait for their batch, or train
     """
 
+    # TODO: drop `AdaptiveRolloutGroupWorkBuffer.Config.target_offpolicy_steps` and pass this config's
+    # `target_offpolicy_steps` at build, so one field sets both the mean-age cap and the metric. Waits for the
+    # adaptive buffer's upstream PR.
     group_buffer: (
         RolloutGroupWorkBuffer.Config | AdaptiveRolloutGroupWorkBuffer.Config
     ) = field(default_factory=RolloutGroupWorkBuffer.Config)
@@ -266,9 +269,11 @@ class AsyncLoopConfig(Configurable.Config):
     - `RolloutGroupWorkBuffer` (default): `(target_offpolicy_steps + 1) * P` slots, windowed by
       `windowed_fifo_batches`.
     - `AdaptiveRolloutGroupWorkBuffer`: slots learned from the run, under its own age knobs; it drops
-      and cancels groups past its `max_offpolicy_steps`. It ignores `windowed_fifo_batches`, and
+      and cancels groups past its `max_offpolicy_steps`. It rejects `windowed_fifo_batches`, and
       `target_offpolicy_steps` here only sets `train_batch/pct_samples_over_target_age` and the
-      default `num_concurrent_rollout_groups`."""
+      default `num_concurrent_rollout_groups`. Groups it drops or cancels never reach the batcher,
+      so their `rollout/*` metrics are not logged; `rollout_samples.jsonl` keeps the dropped
+      finished ones."""
     batcher: Batcher.Config = field(default_factory=Batcher.Config)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
 
@@ -291,21 +296,29 @@ class AsyncLoopConfig(Configurable.Config):
                 f"windowed_fifo_batches must be None or >= 1, got {self.windowed_fifo_batches}"
             )
 
-        max_concurrent = self.max_concurrent_rollout_groups
-        if max_concurrent is not None and isinstance(
+        is_adaptive = isinstance(
             self.group_buffer, AdaptiveRolloutGroupWorkBuffer.Config
-        ):
-            # The adaptive buffer's slots follow its demand, not `(S + 1) * P`.
-            if max_concurrent < 1:
-                raise ValueError(
-                    f"max_concurrent_rollout_groups must be None or >= 1, got {max_concurrent}"
-                )
-        elif max_concurrent is not None and not (
-            1 <= max_concurrent <= self.max_active_rollout_groups
-        ):
+        )
+        if is_adaptive and self.windowed_fifo_batches is not None:
             raise ValueError(
-                "max_concurrent_rollout_groups must be None or in [1, (S + 1) * P = "
-                f"{self.max_active_rollout_groups}], got {max_concurrent}"
+                "windowed_fifo_batches applies to RolloutGroupWorkBuffer only; got "
+                f"{self.windowed_fifo_batches} with AdaptiveRolloutGroupWorkBuffer"
+            )
+
+        # At most one rollout loop per active slot, `(S + 1) * P`. The adaptive buffer's slots follow its
+        # demand, so it has no upper bound.
+        max_concurrent_bound = (
+            math.inf if is_adaptive else self.max_active_rollout_groups
+        )
+        if self.max_concurrent_rollout_groups is not None and not (
+            1 <= self.max_concurrent_rollout_groups <= max_concurrent_bound
+        ):
+            bound_text = (
+                "inf" if is_adaptive else f"(S + 1) * P = {max_concurrent_bound}"
+            )
+            raise ValueError(
+                f"max_concurrent_rollout_groups must be None or in [1, {bound_text}], "
+                f"got {self.max_concurrent_rollout_groups}"
             )
 
     @property
@@ -1412,6 +1425,8 @@ class Controller(Configurable):
                 # TODO: a generate call already on a generator still finishes there, after the
                 # `release_groups` below, and its session can hold KV again until eviction. Release the
                 # group again once its calls end, or abort them (generators have no abort path yet).
+                # TODO: a cancelled group has no summary, so the curriculum keeps drawing a task that always
+                # runs past max_offpolicy_steps. Report the cancel to the curriculum (needs a Curriculum hook).
                 await self._rollouter.cancel_group(work.group_id)
             except Exception:
                 logger.exception(f"rollout group {work.group_id} failed; dropping")
@@ -1602,8 +1617,10 @@ class Controller(Configurable):
                     # batcher includes every consumed group ID here, including
                     # metric-only zero-std groups excluded from model inputs, plus
                     # the groups the buffer dropped as too old.
+                    # Dropped groups first: they are older, so a curriculum that keeps each task's last
+                    # result keeps the trained one.
                     self._rollouter.commit_training_sample_ids(
-                        [*packed.group_ids, *self._group_buffer.pop_dropped_group_ids()]
+                        [*self._group_buffer.pop_dropped_group_ids(), *packed.group_ids]
                     )
                     optimizer_result = self._get_rank_0_value(
                         await self.trainer.all_ranks.optim_step.call(

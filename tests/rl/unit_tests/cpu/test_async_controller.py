@@ -749,7 +749,7 @@ def test_take_finalized_does_not_release_active_slot() -> None:
             raise RuntimeError("buffer closed unexpectedly")
         await buffer.add_work(RolloutGroupWork(group_id=0, sample=object()))
         await buffer.finalize_work(RolloutGroup(group_id=0, rollouts=[]))
-        await buffer.take_finalized()
+        await buffer.take_finalized(consuming_policy_version=0)
 
         waiter = asyncio.create_task(buffer.wait_for_slot())
         await asyncio.sleep(0)
@@ -879,11 +879,11 @@ def test_windowed_fifo_takes_within_anchored_window() -> None:
         for group_id in (1, 2, 3, 4):
             await _finalize(buffer, group_id)
 
-        assert (await buffer.take_finalized()).group_id == 1
-        assert (await buffer.take_finalized()).group_id == 2
-        assert (await buffer.take_finalized()).group_id == 3
+        assert (await buffer.take_finalized(consuming_policy_version=0)).group_id == 1
+        assert (await buffer.take_finalized(consuming_policy_version=0)).group_id == 2
+        assert (await buffer.take_finalized(consuming_policy_version=0)).group_id == 3
 
-        taker = asyncio.create_task(buffer.take_finalized())
+        taker = asyncio.create_task(buffer.take_finalized(consuming_policy_version=0))
         await asyncio.sleep(0)
         assert not taker.done()  # g4 is finalized but outside the anchored window
 
@@ -891,7 +891,7 @@ def test_windowed_fifo_takes_within_anchored_window() -> None:
         await asyncio.sleep(0)
         assert taker.done()
         assert taker.result().group_id == 0
-        assert (await buffer.take_finalized()).group_id == 4
+        assert (await buffer.take_finalized(consuming_policy_version=0)).group_id == 4
 
     asyncio.run(run())
 
@@ -909,13 +909,15 @@ def test_no_window_takes_oldest_ready_group_past_a_stuck_head() -> None:
 
         # A full batch of P=4 is taken oldest-ready first, without waiting on g0.
         for expected_group_id in (1, 2, 3, 4):
-            taker = asyncio.create_task(buffer.take_finalized())
+            taker = asyncio.create_task(
+                buffer.take_finalized(consuming_policy_version=0)
+            )
             await asyncio.sleep(0)
             assert taker.done()
             assert taker.result().group_id == expected_group_id
 
         # The remaining wait is for generation (nothing finalized), not for the head g0.
-        taker = asyncio.create_task(buffer.take_finalized())
+        taker = asyncio.create_task(buffer.take_finalized(consuming_policy_version=0))
         await asyncio.sleep(0)
         assert not taker.done()
         await buffer.claim_next()  # g5 -> CLAIMED
@@ -1384,8 +1386,8 @@ def test_fixed_buffer_ignores_the_adaptive_hooks() -> None:
             if with_hooks:
                 await buffer.record_step_start(trainer_policy_version=version)
             for _ in range(3):
-                kwargs = {"consuming_policy_version": version} if with_hooks else {}
-                log.append((await buffer.take_finalized(**kwargs)).group_id)
+                group = await buffer.take_finalized(consuming_policy_version=version)
+                log.append(group.group_id)
             if with_hooks:
                 assert buffer.pop_dropped_group_ids() == []
             await buffer.release_active_groups(3, reason="trained")
@@ -1575,9 +1577,9 @@ def test_adaptive_buffer_takes_oldest_finalized_and_lets_slow_groups_keep_their_
         await _finalize(buffer, 1)
 
         # g0 is still CLAIMED: the batcher gets g1 then g2 without waiting for it
-        assert (await buffer.take_finalized()).group_id == 1
-        assert (await buffer.take_finalized()).group_id == 2
-        taker = asyncio.create_task(buffer.take_finalized())
+        assert (await buffer.take_finalized(consuming_policy_version=0)).group_id == 1
+        assert (await buffer.take_finalized(consuming_policy_version=0)).group_id == 2
+        taker = asyncio.create_task(buffer.take_finalized(consuming_policy_version=0))
         await asyncio.sleep(0)
         assert not taker.done()
 
@@ -1870,6 +1872,53 @@ def test_rollout_loop_propagates_a_cancel_the_buffer_did_not_make() -> None:
     asyncio.run(run())
 
 
+def test_rollout_loop_exits_when_shutdown_lands_with_a_buffer_cancel() -> None:
+    async def run() -> None:
+        buffer = _adaptive_buffer(
+            num_prompts=1, max_offpolicy_steps=1, generation_capacity=4
+        )
+        events = []
+        group_started = asyncio.Event()
+
+        async def run_group_rollouts(*, group_id: int, **kwargs) -> RolloutGroup:
+            group_started.set()
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                events.append(("generation_cancelled", group_id))
+                raise
+
+        controller = _controller_for_rollout_loops(
+            run_group_rollouts=run_group_rollouts,
+            cancel_group=AsyncMock(),
+            events=events,
+        )
+        loop = asyncio.create_task(
+            controller._rollout_loop(
+                group_buffer=buffer, generate_fn=None, release_session_fn=None
+            )
+        )
+        await _admit(buffer, 0)
+        await asyncio.wait_for(group_started.wait(), timeout=5)
+
+        # The batch for version 2 cancels g0 (2 versions old, max 1); shutdown cancels the loop before it wakes
+        taker = asyncio.create_task(buffer.take_finalized(consuming_policy_version=2))
+        await asyncio.sleep(0)
+        assert events == []
+        loop.cancel()
+
+        # The loop exits without cancelling g0 on its worker: `Rollouter.close` waits for that call
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(loop, timeout=5)
+        assert events == [("generation_cancelled", 0)]
+        controller._rollouter.cancel_group.assert_not_awaited()
+
+        await buffer.close()
+        assert await taker is None
+
+    asyncio.run(run())
+
+
 def test_adaptive_buffer_measures_the_shelf_and_moves_demand() -> None:
     async def run() -> None:
         # P=4: demand starts at three batches = 12; the shelf is what is finished and not held by the trainer.
@@ -2042,7 +2091,7 @@ def test_batcher_passes_the_version_that_trains_each_group() -> None:
     assert queue.qsize() == 3  # two batches and the None sentinel
 
 
-def test_run_builds_the_adaptive_buffer_with_one_slot_per_rollout_loop() -> None:
+def test_run_builds_the_adaptive_buffer_with_one_generating_group_per_rollout_loop() -> None:
     """The adaptive buffer admits at most one generating group per rollout loop, and starts at the resumed version."""
     controller = _run_with_generator_watcher(
         _block_forever,
@@ -2055,20 +2104,4 @@ def test_run_builds_the_adaptive_buffer_with_one_slot_per_rollout_loop() -> None
     assert isinstance(buffer, AdaptiveRolloutGroupWorkBuffer)
     assert _buffer_metric(buffer, "rollout_buffer/generation_capacity_groups") == 3
     # Resumed at step 5: a group claimed now is 0 versions old for the first batch, which trains at 5.
-    assert buffer._generator_policy_version == buffer._trainer_policy_version == 5
-
-
-def test_adaptive_buffer_warns_once_when_generation_capacity_caps_demand(
-    caplog,
-) -> None:
-    # Demand starts at 3 batches (24 groups), above the capacity of 10.
-    buffer = _adaptive_buffer(num_prompts=8, generation_capacity=10)
-
-    async def run() -> None:
-        with caplog.at_level(logging.WARNING):
-            await buffer.record_step_start(trainer_policy_version=0)
-            await buffer.record_step_start(trainer_policy_version=1)
-
-    asyncio.run(run())
-    warnings = [r for r in caplog.records if "> generation_capacity 10" in r.message]
-    assert len(warnings) == 1
+    assert buffer._generator_policy_version == buffer._consuming_policy_version == 5

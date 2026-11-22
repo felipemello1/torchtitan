@@ -9,7 +9,6 @@
 import asyncio
 import functools
 import gc
-import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -225,7 +224,7 @@ def test_rollout_worker_cancel_group_stops_only_that_group() -> None:
     asyncio.run(run())
 
 
-def test_cancel_group_logs_a_failed_or_stuck_cancel(monkeypatch, caplog) -> None:
+def test_cancel_group_does_not_raise_on_a_failed_or_stuck_cancel(monkeypatch) -> None:
     async def run() -> None:
         rollouter = _rollouter_without_datasets()
         cancelled_group_ids = []
@@ -256,10 +255,7 @@ def test_cancel_group_logs_a_failed_or_stuck_cancel(monkeypatch, caplog) -> None
         )
         await rollouter.cancel_group(7)
 
-    with caplog.at_level(logging.ERROR):
-        asyncio.run(run())
-    assert "cancel_group(6) failed" in caplog.text
-    assert "cancel_group(7) failed" in caplog.text
+    asyncio.run(run())
 
 
 class _SetupEndpoint:

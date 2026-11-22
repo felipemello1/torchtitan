@@ -98,7 +98,8 @@ class Rollouter(Configurable):
             train step): set `curriculum`; see `Curriculum`.
           - Group execution, coarse: override `_run_group_rollouts` for your own
             orchestration. The worker then becomes optional -- but override
-            `setup_async` too, or the worker pool is still spawned unused.
+            `setup_async` too, or the worker pool is still spawned unused, and
+            `cancel_group`: the base one stops the group on its rollout worker.
           - Group execution, fine: keep the stock orchestration and point `worker`
             at a `MessageEnvRolloutWorker.Config` subclass, overriding only what you need
             (`make_env_group`, `score_group`, `run_group`). A worker whose env isn't a
@@ -257,6 +258,9 @@ class Rollouter(Configurable):
                 for call in pending:
                     call.cancel()
                 await asyncio.gather(*pending, return_exceptions=True)
+
+        # TODO: also wait for the generate calls of groups that `cancel_group` stopped. Their worker no longer
+        # waits for them, so a generator router that answers after the workers stop may make the job exit 130.
         if actor_system is not None:
             await actor_system.stop_rollout_workers()
 
