@@ -14,7 +14,11 @@ metrics that ride with it), the SamplingParams contract, and the vLLM metric tim
 
 import asyncio
 import concurrent.futures
+import copy
+import json
+import os
 from contextlib import nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, Mock, patch
@@ -48,6 +52,7 @@ from torchtitan.rl.generator.vllm.engine import (
     VLLMEngine,
 )
 from torchtitan.rl.generator.vllm.session_kv_holder import VLLMSessionKVHolder
+from torchtitan.rl.generator.vllm.simple_cpu_offload import SimpleCPUOffloadConnector
 from torchtitan.rl.generator.vllm.worker import (
     TorchTitanCudagraphDispatcher,
     TorchTitanGPUModelRunner,
@@ -62,9 +67,11 @@ from vllm.config import (
     CompilationMode,
     CUDAGraphMode,
     DeviceConfig,
+    KVTransferConfig,
     SchedulerConfig,
     VllmConfig,
 )
+from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.exceptions import VLLMValidationError
 from vllm.logprobs import FlatLogprobs, Logprob
 from vllm.sampling_params import RequestOutputKind
@@ -144,6 +151,8 @@ def _vllm_engine(*, reset_kv_cache_on_model_state_dict_load=False, model=None):
     """A `VLLMEngine` around a fake `LLMEngine` (no engine build)."""
     engine = VLLMEngine.__new__(VLLMEngine)
     engine._engine = _FakeLLMEngine()
+    engine._uses_kv_offload = False
+    engine._coordinate_kv_offload = False
     engine._reset_kv_cache_on_model_state_dict_load = (
         reset_kv_cache_on_model_state_dict_load
     )
@@ -371,9 +380,11 @@ def _image_prompt() -> Prompt:
     )
 
 
-def test_admission_passes_group_id_as_priority_and_arrival_time():
+@pytest.mark.parametrize("coordinate_kv_offload", [False, True])
+def test_admission_preserves_priority_arrival_time_and_shared_id(coordinate_kv_offload):
     # Priority is the group id (3), not the pinned version (6); every validation id shares -1.
     engine = _vllm_engine()
+    engine._coordinate_kv_offload = coordinate_kv_offload
     engine.add_requests(
         [
             _engine_request("train", min_policy_version=6, group_id=3),
@@ -386,6 +397,14 @@ def test_admission_passes_group_id_as_priority_and_arrival_time():
     added_kwargs = [kwargs for _, kwargs in llm_engine.add_requests]
     assert [kwargs["priority"] for kwargs in added_kwargs] == [3, -1, -1]
     assert [kwargs["arrival_time"] for kwargs in added_kwargs] == [1.5] * 3
+    for kwargs in added_kwargs:
+        extra = kwargs["params"].extra_args
+        if coordinate_kv_offload:
+            assert (
+                extra["kv_transfer_params"]["shared_request_id"] == kwargs["request_id"]
+            )
+        else:
+            assert extra is None
 
 
 def test_session_kv_holder_tracks_admitted_requests_and_releases_sessions():
@@ -767,7 +786,14 @@ def test_qwen36_27b_perf_config():
 # --- vLLM engine kwargs (what VLLMEngine passes to EngineArgs) ---
 
 
-def _build_engine_kwargs(monkeypatch, tmp_path, config: Generator.Config) -> dict:
+def _build_engine_kwargs(
+    monkeypatch,
+    tmp_path,
+    config: Generator.Config,
+    *,
+    generator_name="generator",
+    mooncake_master_address=None,
+) -> dict:
     """Build ``config.engine`` as the generator does, with vLLM's ``EngineArgs``,
     ``LLMEngine`` and model registration mocked; return the ``EngineArgs`` kwargs."""
     engine_args = Mock()
@@ -789,9 +815,9 @@ def _build_engine_kwargs(monkeypatch, tmp_path, config: Generator.Config) -> dic
         reset_kv_cache_on_model_state_dict_load=False,
         model_state_dict_load_mode="cpu_prefetch",
         vision_processor=None,
-        mooncake_master_address=None,
+        mooncake_master_address=mooncake_master_address,
         rank=0,
-        generator_name="generator",
+        generator_name=generator_name,
         output_dir=str(tmp_path),
     )
     return engine_args.call_args.kwargs
@@ -814,6 +840,167 @@ def test_engine_config_reaches_engine_args(monkeypatch, tmp_path):
     assert engine_kwargs["scheduling_policy"] == "priority"
 
 
+def _mooncake_transfer_config():
+    return KVTransferConfig(
+        kv_connector="MooncakeStoreConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={
+            "cache_prefix": "run-1",
+            "save_decode_cache": True,
+        },
+    )
+
+
+def test_mooncake_engine_args(monkeypatch, tmp_path):
+    store_config = tmp_path / "store.json"
+    store_config.write_text(json.dumps({"protocol": "tcp"}))
+    monkeypatch.setenv("MOONCAKE_CONFIG_PATH", str(store_config))
+    transfer = _mooncake_transfer_config()
+    original = copy.deepcopy(transfer)
+    holder_build = Mock()
+    monkeypatch.setattr(VLLMSessionKVHolder.Config, "build", holder_build)
+    config = Generator.Config(
+        model=_MODEL_CONFIG,
+        engine=VLLMEngine.Config(
+            kv_transfer_config=transfer, session_kv_holder=VLLMSessionKVHolder.Config()
+        ),
+    )
+    assert config.engine.uses_mooncake_store
+    first = _build_engine_kwargs(
+        monkeypatch,
+        tmp_path,
+        config,
+        generator_name="first",
+        mooncake_master_address="controller:1234",
+    )
+    # vLLM reads the controller's master from a copy of the Store config.
+    with open(os.environ["MOONCAKE_CONFIG_PATH"]) as f:
+        assert json.load(f) == {
+            "protocol": "tcp",
+            "master_server_address": "controller:1234",
+        }
+    # Mooncake has no CPU release hints: the session holder gets no connector.
+    scheduler = (
+        vllm_engine_module.LLMEngine.from_engine_args.return_value.engine_core.engine_core.scheduler
+    )
+    holder_build.assert_called_once_with(scheduler=scheduler, offload_connector=None)
+    second = _build_engine_kwargs(
+        monkeypatch, tmp_path, config, generator_name="second"
+    )
+    resolved = first["kv_transfer_config"]
+    assert resolved.kv_connector_module_path == "torchtitan.rl.generator.vllm.mooncake"
+    # Generators on one host must not share a lookup IPC socket.
+    first_port = resolved.kv_connector_extra_config.pop("lookup_rpc_port")
+    second_port = second["kv_transfer_config"].kv_connector_extra_config[
+        "lookup_rpc_port"
+    ]
+    assert first_port != second_port
+    assert resolved.kv_connector_extra_config == original.kv_connector_extra_config
+    assert transfer == original
+
+
+@pytest.mark.parametrize("hold_sessions", [False, True])
+def test_simple_cpu_offload_uses_shared_coordination_without_store_settings(
+    monkeypatch, tmp_path, hold_sessions
+):
+    transfer = KVTransferConfig(
+        kv_connector="SimpleCPUOffloadConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={"cpu_bytes_to_use_per_rank": 1 << 30},
+    )
+    original = copy.deepcopy(transfer)
+    holder_build = Mock()
+    monkeypatch.setattr(VLLMSessionKVHolder.Config, "build", holder_build)
+    kwargs = _build_engine_kwargs(
+        monkeypatch,
+        tmp_path,
+        Generator.Config(
+            model=_MODEL_CONFIG,
+            parallelism=InferenceParallelismConfig(tensor_parallel_degree=2),
+            engine=VLLMEngine.Config(
+                kv_transfer_config=transfer,
+                session_kv_holder=(
+                    VLLMSessionKVHolder.Config() if hold_sessions else None
+                ),
+            ),
+        ),
+    )
+    resolved = kwargs["kv_transfer_config"]
+    assert KVConnectorFactory.get_connector_class(resolved) is SimpleCPUOffloadConnector
+    assert kwargs["scheduler_cls"].endswith(
+        "cpu_kv_offload.create_kv_offload_scheduler"
+    )
+    assert resolved.kv_connector_extra_config == original.kv_connector_extra_config
+    assert transfer == original
+    if hold_sessions:
+        scheduler = (
+            vllm_engine_module.LLMEngine.from_engine_args.return_value.engine_core.engine_core.scheduler
+        )
+        holder_build.assert_called_once_with(
+            scheduler=scheduler, offload_connector=scheduler.connector
+        )
+    else:
+        holder_build.assert_not_called()
+
+
+def _simple_cpu_transfer_config(kv_role="kv_both", module_path=None):
+    return KVTransferConfig(
+        kv_connector="SimpleCPUOffloadConnector",
+        kv_role=kv_role,
+        kv_connector_module_path=module_path,
+    )
+
+
+@pytest.mark.parametrize(
+    "transfer, extra_engine_args, match",
+    [
+        (
+            _simple_cpu_transfer_config(module_path="custom.cpu_offload_connector"),
+            {},
+            "custom kv_connector_module_path",
+        ),
+        (
+            _simple_cpu_transfer_config(kv_role="kv_producer"),
+            {},
+            "requires kv_role='kv_both'",
+        ),
+        (
+            _simple_cpu_transfer_config(kv_role="kv_consumer"),
+            {},
+            "requires kv_role='kv_both'",
+        ),
+        (
+            _simple_cpu_transfer_config(),
+            {"enable_prefix_caching": False},
+            "requires prefix caching",
+        ),
+        (
+            replace(_mooncake_transfer_config(), kv_connector_extra_config={}),
+            {},
+            "non-empty cache_prefix",
+        ),
+        (
+            replace(
+                _mooncake_transfer_config(),
+                kv_connector_extra_config={
+                    "cache_prefix": "run-1",
+                    "lookup_rpc_port": 4321,
+                },
+            ),
+            {},
+            "derives lookup_rpc_port",
+        ),
+    ],
+)
+def test_unsupported_kv_transfer_config_rejected_before_engine_creation(
+    transfer, extra_engine_args, match
+):
+    with pytest.raises(ValueError, match=match):
+        VLLMEngine.Config(
+            kv_transfer_config=transfer, extra_engine_args=extra_engine_args
+        )
+
+
 @pytest.mark.parametrize(
     "key, match",
     [
@@ -826,6 +1013,7 @@ def test_engine_config_reaches_engine_args(monkeypatch, tmp_path):
         ),
         ("seed", r"use Generator\.Config\.debug\.seed"),
         ("watermark", r"use VLLMEngine\.Config\.watermark"),
+        ("kv_transfer_config", r"use VLLMEngine\.Config\.kv_transfer_config"),
     ],
 )
 def test_extra_engine_args_rejects_torchtitan_owned_keys(key, match):
