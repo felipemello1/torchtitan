@@ -1013,6 +1013,7 @@ def test_unsupported_kv_transfer_config_rejected_before_engine_creation(
         ),
         ("seed", r"use Generator\.Config\.debug\.seed"),
         ("watermark", r"use VLLMEngine\.Config\.watermark"),
+        ("kv_cache_dtype", r"use VLLMEngine\.Config\.kv_cache_dtype"),
         ("kv_transfer_config", r"use VLLMEngine\.Config\.kv_transfer_config"),
     ],
 )
