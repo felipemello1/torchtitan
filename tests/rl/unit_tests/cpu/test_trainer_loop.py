@@ -126,8 +126,15 @@ def _controller(
         ],
         state_dict=lambda: {},
     )
+
+    async def record_step_start(*, trainer_policy_version):
+        pass
+
     controller._group_buffer = SimpleNamespace(
-        metrics=lambda: [], release_active_groups=release_active_groups
+        metrics=lambda: [],
+        release_active_groups=release_active_groups,
+        record_step_start=record_step_start,
+        pop_dropped_group_ids=list,
     )
     controller._event_loop_lag = SimpleNamespace(flush=lambda: [])
     controller.logged_metrics = []
