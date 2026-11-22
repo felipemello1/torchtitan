@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import tempfile
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
@@ -139,6 +140,25 @@ def _use_mooncake_master(address: str) -> None:
     os.environ["MOONCAKE_CONFIG_PATH"] = path
 
 
+def _enable_breakable_cuda_graphs() -> None:
+    """Turn on vLLM's breakable CUDA graphs: piecewise graphs that run attention eagerly.
+
+    vLLM marks its attention op as a graph break when it imports the op, so the variable
+    must be set before that (``VLLMEngine.Config.process_env`` sets it at process start).
+    """
+    if os.environ.get("VLLM_USE_BREAKABLE_CUDAGRAPH") == "1":
+        return
+    attention_module = "vllm.model_executor.layers.attention.attention"
+    if attention_module in sys.modules:
+        raise RuntimeError(
+            "num_speculative_tokens > 0 with cuda_graph.mode='FULL' needs "
+            "VLLM_USE_BREAKABLE_CUDAGRAPH=1 before vLLM imports its attention ops "
+            f"({attention_module} is already imported); start the process with "
+            "VLLMEngine.Config.process_env"
+        )
+    os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
+
+
 class VLLMEngine(GenerationEngine):
     """The generator's vLLM ``LLMEngine``, behind the calls the engine loop makes.
 
@@ -197,26 +217,27 @@ class VLLMEngine(GenerationEngine):
 
         @property
         def process_env(self) -> dict[str, str]:
+            env = {}
             # vLLM rejects a KV connector with expandable segments (vllm/config/vllm.py):
             # turn them off in the generators only; the trainer keeps the RL default.
-            if self.kv_transfer_config is None:
-                return {}
-            return {
-                "PYTORCH_ALLOC_CONF": "expandable_segments:False",
-                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False",
-            }
+            if self.kv_transfer_config is not None:
+                env["PYTORCH_ALLOC_CONF"] = "expandable_segments:False"
+                env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:False"
+            # Piecewise graphs for steps with drafts and prefill (VLLMCudaGraphConfig).
+            # vLLM reads this when it imports its attention ops, before any engine exists.
+            if self.uses_breakable_cuda_graphs:
+                env["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
+            return env
+
+        @property
+        def uses_breakable_cuda_graphs(self) -> bool:
+            return self.num_speculative_tokens > 0 and self.cuda_graph.mode == "FULL"
 
         def __post_init__(self) -> None:
             GenerationEngine.Config.__post_init__(self)
             if self.num_speculative_tokens < 0:
                 raise ValueError(
                     f"num_speculative_tokens must be >= 0, got {self.num_speculative_tokens}"
-                )
-            if self.num_speculative_tokens > 0 and self.cuda_graph.mode == "FULL":
-                raise ValueError(
-                    f"num_speculative_tokens={self.num_speculative_tokens} needs "
-                    'cuda_graph.mode="FULL_DECODE_ONLY" or "NONE": with drafts, vLLM\'s GDN '
-                    "metadata builder supports CUDA graphs for decode steps only"
                 )
             if self.kv_transfer_config is None:
                 return
@@ -275,8 +296,9 @@ class VLLMEngine(GenerationEngine):
           acceptance can fall as the policy drifts.
         - With `session_kv_holder`, prefix hits keep the last block that vLLM drops by
           default for drafts (see `_build_engine_args`).
-        - Not supported with `cuda_graph.mode="FULL"` (use FULL_DECODE_ONLY),
-          `debug.batch_invariant` or models with a vision encoder."""
+        - With `cuda_graph.mode="FULL"`, steps with prefill replay piecewise graphs
+          (`VLLMCudaGraphConfig.mode`); the process needs `process_env`.
+        - Not supported with `debug.batch_invariant` or models with a vision encoder."""
 
     def __init__(
         self,
@@ -330,6 +352,8 @@ class VLLMEngine(GenerationEngine):
                 "debug.batch_invariant=False: the target verifies 1 + k tokens per step "
                 "with kernels the trainer does not run"
             )
+        if config.uses_breakable_cuda_graphs:
+            _enable_breakable_cuda_graphs()
         if config.num_speculative_tokens > 0 and vision_processor is not None:
             # TODO: vLLM's drafter reads the image token id from the target's config
             # (SpecDecodeBaseProposer.load_model); support vision models once tested.

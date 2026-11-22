@@ -46,7 +46,9 @@ class VLLMCudaGraphConfig:
     - ``"FULL_DECODE_ONLY"``: graph pure-decode batches; prefill / mixed
       batches run eager. Cheap (no inductor compile).
     - ``"FULL"`` (default): graph the whole forward, prefill included, attention
-      captured too.
+      captured too. With MTP drafts, steps that carry prefill replay piecewise
+      graphs instead: attention and GDN run eagerly between graph pieces (see
+      ``get_vllm_compilation_config``).
     """
 
     capture_sizes: list[int] | None = None
@@ -105,6 +107,16 @@ class VLLMCudaGraphConfig:
 
         All modes capture with ``mode=CompilationMode.NONE`` to avoid nesting
         vLLM's Inductor compile with TorchTitan local compile.
+
+        ``FULL`` with drafts (k > 0) becomes vLLM's ``FULL_AND_PIECEWISE``, on breakable
+        CUDA graphs (``VLLMEngine.Config.process_env`` turns them on):
+
+            verify-only step (every row 1 + k tokens)   FULL graph
+            step with prefill, and the MTP drafter      piecewise graph, attention and GDN eager
+
+        TODO: FULL graphs for steps with prefill too (see `VLLMInnerGDN.get_attn_backend`).
+        Piecewise, a Qwen3.8-27B step with 1.7k prefill tokens spends 183 ms of CPU
+        launching 1,850 eager kernels for 147 ms of GPU work (GB300).
         """
         if self.mode == "NONE":
             return CompilationConfig(
@@ -168,7 +180,11 @@ class VLLMCudaGraphConfig:
                 )
 
         return CompilationConfig(
-            cudagraph_mode=self.mode,
+            cudagraph_mode=(
+                "FULL_AND_PIECEWISE"
+                if self.mode == "FULL" and num_speculative_tokens > 0
+                else self.mode
+            ),
             mode=CompilationMode.NONE,
             cudagraph_capture_sizes=sizes,
             pass_config=PassConfig(

@@ -272,10 +272,10 @@ class TorchTitanEagleProposer(EagleProposer):
     # TODO: on vLLM's V2 runner (vLLM >= 0.34, pytorch/torchtitan#5956), subclass
     # MTPSpeculator instead and register it with register_speculative_method.
 
-    # TODO: the drafter's k forward passes per decode step run eagerly. vLLM captures
-    # drafter graphs only in PIECEWISE mode (SpecDecodeBaseProposer.initialize_cudagraph_keys),
-    # which needs CompilationMode.VLLM_COMPILE; TorchTitan builds with CompilationMode.NONE.
-    # Payoff unmeasured: profile a decode step before choosing a fix.
+    # TODO: with cuda_graph.mode="FULL_DECODE_ONLY" the drafter's k forward passes run
+    # eagerly (15.6 ms of CPU per Qwen3.8-27B verify step, GB300). vLLM captures drafter
+    # graphs only as PIECEWISE (SpecDecodeBaseProposer.initialize_cudagraph_keys), which
+    # "FULL" gets on breakable CUDA graphs (VLLMCudaGraphConfig).
 
     def __init__(
         self,
