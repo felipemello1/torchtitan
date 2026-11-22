@@ -205,6 +205,9 @@ class Trainer(Configurable):
         engine.load_checkpoint()
         self._master_weights: list[torch.Tensor] | None = None
         if config.bf16_weight_rounding == "stochastic":
+            # TODO: leave out preserve_dtype_params (e.g. GDN's A_log and dt_bias), which the forward
+            #   and the push keep in fp32: rounding puts them on the bf16 grid, one bf16 spacing of
+            #   noise. felipemello1/torchtitan#478 (2c0aa2446, `_rounded_params`) has the filter and its test.
             trainable_params = self._local_params(trainable_only=True)
             self._master_weights = [
                 torch.empty_like(param) for param in trainable_params
