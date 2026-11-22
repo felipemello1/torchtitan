@@ -36,7 +36,9 @@ _ERROR = frozenset(
         "first_prompt_too_long",
     }
 )
-_NOT_TRAINABLE = frozenset({"error_infra", "error_unknown", "first_prompt_too_long"})
+_NOT_TRAINABLE = frozenset(
+    {"error_infra", "error_timeout", "error_unknown", "first_prompt_too_long"}
+)
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -219,9 +221,11 @@ class ReleaseSessionFn(Protocol):
 
 
 # TODO: let users add a status without editing this file. A StrEnum with members can't be subclassed.
-#   Also make the set of trainable statuses a config field, e.g. to leave ERROR and ERROR_TIMEOUT out
-#   of training, instead of editing `_NOT_TRAINABLE`. Not done yet: `is_trainable()` is read by the
-#   rollout worker (`make_scored_group`) and the batcher (`build_from_group`), so both configs need it.
+#   Also make the set of trainable statuses a config field, e.g. to leave ERROR out of training,
+#   instead of editing `_NOT_TRAINABLE`. Scoring ERROR_TIMEOUT as a fail in validation only (now
+#   it gets no reward there either) also needs `make_scored_group` to tell validation groups apart.
+#   Not done yet: `is_trainable()` is read by the rollout worker (`make_scored_group`) and the
+#   batcher (`build_from_group`), so both configs need it.
 class RolloutStatus(StrEnum):
     """How a rollout ended. Used to debug and decide if a rollout is trainable."""
 
@@ -238,8 +242,9 @@ class RolloutStatus(StrEnum):
     """The completion couldn't be parsed, e.g. a malformed tool call."""
 
     ERROR_TIMEOUT = "error_timeout"
-    """A deadline passed, e.g. the policy ran a command that never ends. Counts as the policy's
-    failure."""
+    """A deadline passed, e.g. the policy ran a command that never ends or reasoned for hours.
+    Not scored or trained: a long cut-off rollout at reward 0 would outweigh its finished
+    siblings in the token-mean loss."""
 
     ERROR_UNKNOWN = "error_unknown"
     """The env can't tell how the rollout ended, e.g. a stop it doesn't map. Not trained, so a
