@@ -93,8 +93,7 @@ class RolloutWorkerActor(Actor):
         group_size: int,
         sampling: Any,
     ) -> RolloutGroup:
-        task = asyncio.current_task()
-        self._group_tasks[group_id] = task
+        self._group_tasks[group_id] = asyncio.current_task()
         try:
             group = await self._worker.run_group(
                 generate_fn=generate_fn,
@@ -105,9 +104,7 @@ class RolloutWorkerActor(Actor):
                 sampling=sampling,
             )
         finally:
-            # Drop only this call's entry, so a later `run_group` with the same id stays cancellable.
-            if self._group_tasks.get(group_id) is task:
-                del self._group_tasks[group_id]
+            self._group_tasks.pop(group_id, None)
         # Add this worker's metrics to each training group. What each shows and when to act:
         # "Rollout worker metrics" in `torchtitan/rl/observability/metrics/README.md`.
         #   Since its previous training group: event_loop_lag_ms, event_loop_lag_ms_per_s,
