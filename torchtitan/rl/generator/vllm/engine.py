@@ -15,7 +15,7 @@ import tempfile
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from hashlib import sha256
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.distributed as dist
@@ -85,6 +85,7 @@ def add_extra_vllm_engine_args(
     config_field_by_engine_arg = {
         "max_num_batched_tokens": "Generator.Config.max_num_batched_tokens",
         "compilation_config": "VLLMEngine.Config.cuda_graph",
+        "kv_cache_dtype": "VLLMEngine.Config.kv_cache_dtype",
         "kv_transfer_config": "VLLMEngine.Config.kv_transfer_config",
         "seed": "Generator.Config.debug.seed",
         "watermark": "VLLMEngine.Config.watermark",
@@ -202,6 +203,22 @@ class VLLMEngine(GenerationEngine):
             watermark=0.03   admitted (400 >= 300)
             watermark=0.1    waits (400 < 1,000)
             no request running: admitted at any watermark
+        """
+
+        kv_cache_dtype: Literal["auto", "fp8"] = "auto"
+        """KV cache element type:
+
+            "auto"   the model dtype (bf16); attention runs the trainer's kernel
+            "fp8"    e4m3 with scale 1; the query is quantized to e4m3 too, and attention
+                     runs FA4's fp8 forward (SM100 family only)
+
+        fp8 vs auto, Qwen3.8-27B (hybrid attention + GDN) on one GB300:
+
+            KV tokens that fit                          5.6M vs 2.8M
+            output tok/s, 32 sessions at 27k-135k       1,043 vs 902
+            output tok/s, 26 sessions sharing prompts   857 vs 892 (see `paged_varlen_attention_out`)
+            trainer-vs-generator logprob mean abs diff  0.022 vs 0.0096 (temperature 1)
+            KV block, the prefix-cache reuse unit       1,664 vs 896 tokens
         """
 
         kv_transfer_config: KVTransferConfig | None = None
@@ -497,6 +514,11 @@ class VLLMEngine(GenerationEngine):
         if max_num_batched_tokens is not None:
             engine_kwargs["max_num_batched_tokens"] = max_num_batched_tokens
         engine_kwargs["watermark"] = self.config.watermark
+        # TODO: fp8 grows a hybrid model's KV block (Qwen3.8-27B: 896 -> 1,664 tokens), and a
+        # prefix-cache hit ends on a block boundary, so each agent turn recomputes ~400 more
+        # prompt tokens (GB300, 2,053 vs 1,679). Untested: vLLM's `prefix_match_unit` or a
+        # smaller `mamba_block_size`.
+        engine_kwargs["kv_cache_dtype"] = self.config.kv_cache_dtype
         # Smaller `priority` runs first and is preempted last; we pass `EngineRequest.group_id`
         # (-1 for all validation), so older groups have higher priority (see its docstring).
         # TODO: validation requests (priority -1) are admitted before training requests, also while a

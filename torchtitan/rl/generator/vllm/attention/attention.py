@@ -12,8 +12,12 @@ import spmd_types as spmd
 
 import torch
 from torch.nn.attention import current_flash_attention_impl
+from vllm.config.cache import CacheDType
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention.attention import get_attention_context
+from vllm.platforms import current_platform
+from vllm.platforms.interface import DeviceCapability
+from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionType, MultipleOf
 from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionBackend,
@@ -97,6 +101,35 @@ class TorchTitanVarlenInnerAttentionBackend(_FA4PageSize, FlashAttentionBackend)
         # name so the backend registry can look it up correctly.
         return "CUSTOM"
 
+    @classmethod
+    def supports_combination(
+        cls,
+        head_size: int,
+        dtype: torch.dtype,
+        kv_cache_dtype: CacheDType | None,
+        block_size: int | None,
+        use_mla: bool,
+        has_sink: bool,
+        use_sparse: bool,
+        use_mm_prefix: bool,
+        device_capability: DeviceCapability,
+    ) -> str | None:
+        # vLLM checks an fp8 KV cache against its own FlashAttention build, which has no fp8
+        # kernel at head dim 256. This backend runs fp8 on FA4 (TorchTitanVarlenInnerAttentionImpl).
+        if kv_cache_dtype is not None and is_quantized_kv_cache(kv_cache_dtype):
+            kv_cache_dtype = None
+        return super().supports_combination(
+            head_size,
+            dtype,
+            kv_cache_dtype,
+            block_size,
+            use_mla,
+            has_sink,
+            use_sparse,
+            use_mm_prefix,
+            device_capability,
+        )
+
     @staticmethod
     def get_impl_cls():
         return TorchTitanVarlenInnerAttentionImpl
@@ -147,10 +180,45 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
     Custom vLLM attention backend impl using PyTorch's native FlashAttention varlen API.
     Instead of using vLLM's FlashAttention kernel, this implementation takes the kernel
     dependency from torch directly while supporting the same interface.
+    An fp8 KV cache calls FA4's fp8 forward instead (see `paged_varlen_attention_out`).
     """
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(
+        self,
+        num_heads: int,
+        head_size: int,
+        scale: float,
+        num_kv_heads: int,
+        alibi_slopes: list[float] | None,
+        sliding_window: int | None,
+        kv_cache_dtype: str,
+        *args,
+        **kwargs,
+    ) -> None:
+        # FlashAttentionImpl rejects fp8 for vLLM's own FlashAttention build (no fp8 kernel at
+        # head dim 256); this impl runs fp8 on FA4, checked below.
+        super().__init__(
+            num_heads,
+            head_size,
+            scale,
+            num_kv_heads,
+            alibi_slopes,
+            sliding_window,
+            "auto",
+            *args,
+            **kwargs,
+        )
+        self.kv_cache_dtype = kv_cache_dtype
+
+        if is_quantized_kv_cache(self.kv_cache_dtype):
+            flash_attention_impl = get_cuda_flash_attention_impl()
+            capability = torch.cuda.get_device_capability()
+            if flash_attention_impl != "FA4" or capability[0] != 10:
+                raise ValueError(
+                    f"kv_cache_dtype={self.kv_cache_dtype!r} runs FA4's fp8 forward, which "
+                    f"needs an SM100-family GPU; got {flash_attention_impl} on capability "
+                    f"{capability}."
+                )
 
         # optional post-attention epilogue transform (out, lse) -> out
         # set by VLLMModelWrapper in vllm_wrapper.py
@@ -230,9 +298,20 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
         # varlen attention before splitting them.
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
 
-        assert not self.kv_cache_dtype.startswith(
-            "fp8"
-        ), "FP8 KV cache not supported yet."
+        descales = None
+        if is_quantized_kv_cache(self.kv_cache_dtype):
+            # The cache holds e4m3 bytes, and vLLM's Attention layer quantized the query.
+            key_cache = key_cache.view(current_platform.fp8_dtype())
+            value_cache = value_cache.view(current_platform.fp8_dtype())
+            descale_shape = (
+                attn_metadata.query_start_loc.shape[0] - 1,
+                self.num_kv_heads,
+            )
+            descales = (
+                layer._q_scale.expand(descale_shape),
+                layer._k_scale.expand(descale_shape),
+                layer._v_scale.expand(descale_shape),
+            )
 
         assert not attn_metadata.use_cascade, "Cascade not supported yet."
 
@@ -306,6 +385,7 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
                 window_size=sliding_window_size,
                 enable_gqa=self.enable_gqa,
                 return_lse=self.out_transform is not None,
+                descales=descales,
             )
         if self.out_transform is None:
             return result
@@ -501,7 +581,11 @@ class VLLMInnerAttention(InnerAttention):
             # KV projection), but vLLM's cache writer assumes V heads are packed
             # with stride value_head_dim, so repack before updating the cache.
             v_THV = v_THV.contiguous()
-        out_TD = self.vllm_attn(q_THK, k_THK, v_THV)
+        query = q_THK
+        if self.vllm_attn.query_quant is not None:
+            # With an fp8 KV cache, vLLM quantizes the query in a kernel that takes 2D input.
+            query = q_THK.flatten(1)
+        out_TD = self.vllm_attn(query, k_THK, v_THV)
 
         # vLLM's flash attention backend may pad the token count (e.g.
         # round up to an even number), which introduces a new symbolic
