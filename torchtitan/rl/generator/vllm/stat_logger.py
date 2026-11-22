@@ -75,6 +75,7 @@ class _StepStats:
     num_generation_tokens: int
     num_prompt_tokens: int
     num_cached_prompt_tokens: int
+    num_external_prompt_tokens: int
     num_preempted_reqs: int
     ttft_ms: list[float] = field(default_factory=list)
     itl_ms: list[float] = field(default_factory=list)
@@ -103,6 +104,7 @@ def _extract_step_stats(
     gen_tokens = 0
     prompt_tokens = 0
     cached_prompt_tokens = 0
+    external_prompt_tokens = 0
     num_preempted = 0
     ttft_ms: list[float] = []
     itl_ms: list[float] = []
@@ -111,6 +113,7 @@ def _extract_step_stats(
         gen_tokens = iteration_stats.num_generation_tokens
         prompt_tokens = iteration_stats.prompt_token_stats.total
         cached_prompt_tokens = iteration_stats.prompt_token_stats.cached_tokens
+        external_prompt_tokens = iteration_stats.prompt_token_stats.external_kv_transfer
         num_preempted = iteration_stats.num_preempted_reqs
         ttft_ms = [t * 1000 for t in iteration_stats.time_to_first_tokens_iter]
         itl_ms = [t * 1000 for t in iteration_stats.inter_token_latencies_iter]
@@ -132,6 +135,7 @@ def _extract_step_stats(
         num_generation_tokens=gen_tokens,
         num_prompt_tokens=prompt_tokens,
         num_cached_prompt_tokens=cached_prompt_tokens,
+        num_external_prompt_tokens=external_prompt_tokens,
         num_preempted_reqs=num_preempted,
         ttft_ms=ttft_ms,
         itl_ms=itl_ms,
@@ -290,6 +294,10 @@ class VllmOtelStatLogger(Configurable, StatLoggerBase):
         self._c_cached_prompt_tokens = meter.create_counter(
             "vllm.cached_prompt_tokens", unit="token"
         )
+        # The part of the cached prompt tokens a KV connector loaded (e.g. from CPU offload).
+        self._c_external_prompt_tokens = meter.create_counter(
+            "vllm.external_prompt_tokens", unit="token"
+        )
         self._c_preempted = meter.create_counter(
             "vllm.preempted_requests", unit="request"
         )
@@ -355,6 +363,7 @@ class VllmOtelStatLogger(Configurable, StatLoggerBase):
             self._c_gen_tokens.add(step.num_generation_tokens)
             self._c_prompt_tokens.add(step.num_prompt_tokens)
             self._c_cached_prompt_tokens.add(step.num_cached_prompt_tokens)
+            self._c_external_prompt_tokens.add(step.num_external_prompt_tokens)
             self._c_preempted.add(step.num_preempted_reqs)
             for ttft in step.ttft_ms:
                 self._h_ttft.record(ttft)
