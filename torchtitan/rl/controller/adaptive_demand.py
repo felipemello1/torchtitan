@@ -238,7 +238,7 @@ def prediction_multiplier(
     # in powers of 1 / dof:
     #   t = z + (z^3 + z) / (4 dof) + (5 z^5 + 16 z^3 + 3 z) / (96 dof^2) + (3 z^7 + 19 z^5 + 17 z^3 - 15 z) / (384 dof^3)
     # Table check: dof 9 at 95% -> 1.833 (exact 1.833); dof 4 at 95% -> 2.13 (exact 2.132).
-    # Same as scipy.stats.t.ppf(probability, dof).
+    # At probability 0.95: within 0.3% of scipy.stats.t.ppf for dof >= 3; 12% low at dof 1.
     t = (
         z
         + (z**3 + z) / (4 * dof)

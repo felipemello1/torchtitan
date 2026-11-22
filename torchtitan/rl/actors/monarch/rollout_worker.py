@@ -93,7 +93,8 @@ class RolloutWorkerActor(Actor):
         group_size: int,
         sampling: Any,
     ) -> RolloutGroup:
-        self._group_tasks[group_id] = asyncio.current_task()
+        task = asyncio.current_task()
+        self._group_tasks[group_id] = task
         try:
             group = await self._worker.run_group(
                 generate_fn=generate_fn,
@@ -104,7 +105,9 @@ class RolloutWorkerActor(Actor):
                 sampling=sampling,
             )
         finally:
-            self._group_tasks.pop(group_id, None)
+            # Drop only this call's entry, so a later `run_group` with the same id stays cancellable.
+            if self._group_tasks.get(group_id) is task:
+                del self._group_tasks[group_id]
         # Add this worker's metrics to each training group. What each shows and when to act:
         # "Rollout worker metrics" in `torchtitan/rl/observability/metrics/README.md`.
         #   Since its previous training group: event_loop_lag_ms, event_loop_lag_ms_per_s,
@@ -137,8 +140,13 @@ class RolloutWorkerActor(Actor):
             group runs on this worker      cancel it, return when it ended
             group not on this worker       return at once
 
+        Monarch starts one sender's concurrent calls in order, so a `run_group` sent before this call is found.
         The cancelled `run_group` call fails with an `ActorError` at its caller.
         """
+        # TODO: a cancel that reaches this worker before the group's `run_group` does nothing, and the group runs
+        # to its end. The buffer cancels only groups past `max_offpolicy_steps` (a fresh claim is ~3 versions
+        # behind at most), so it needs max < 3. Fix: remember cancelled ids and have `run_group` return at once
+        # for one, or require `max_offpolicy_steps >= 3`.
         task = self._group_tasks.get(group_id)
         if task is not None:
             task.cancel()
