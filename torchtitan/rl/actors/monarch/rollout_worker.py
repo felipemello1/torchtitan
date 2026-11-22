@@ -48,6 +48,8 @@ class RolloutWorkerActor(Actor):
         )
         asyncio.get_running_loop().set_default_executor(self._executor)
         self._worker = worker_config.build(**worker_kwargs)
+        # group id -> the task running its `run_group` here, for `cancel_group`.
+        self._group_tasks: dict[int, asyncio.Task] = {}
         # Created at the end of `setup_async`, so setup isn't counted as lag or as a GC pause.
         self._event_loop_lag: m.EventLoopLag
         self._gc_pause: m.GcPause
@@ -91,14 +93,18 @@ class RolloutWorkerActor(Actor):
         group_size: int,
         sampling: Any,
     ) -> RolloutGroup:
-        group = await self._worker.run_group(
-            generate_fn=generate_fn,
-            release_session_fn=release_session_fn,
-            sample=sample,
-            group_id=group_id,
-            group_size=group_size,
-            sampling=sampling,
-        )
+        self._group_tasks[group_id] = asyncio.current_task()
+        try:
+            group = await self._worker.run_group(
+                generate_fn=generate_fn,
+                release_session_fn=release_session_fn,
+                sample=sample,
+                group_id=group_id,
+                group_size=group_size,
+                sampling=sampling,
+            )
+        finally:
+            self._group_tasks.pop(group_id, None)
         # Add this worker's metrics to each training group. What each shows and when to act:
         # "Rollout worker metrics" in `torchtitan/rl/observability/metrics/README.md`.
         #   Since its previous training group: event_loop_lag_ms, event_loop_lag_ms_per_s,
@@ -123,6 +129,20 @@ class RolloutWorkerActor(Actor):
                 ),
             ]
         return group
+
+    @concurrent_endpoint
+    async def cancel_group(self, group_id: int) -> None:
+        """Cancel this group's `run_group` if this worker runs it; return once it ended.
+
+            group runs on this worker      cancel it, return when it ended
+            group not on this worker       return at once
+
+        The cancelled `run_group` call fails with an `ActorError` at its caller.
+        """
+        task = self._group_tasks.get(group_id)
+        if task is not None:
+            task.cancel()
+            await asyncio.wait([task])
 
     @concurrent_endpoint
     async def sync_log_step(self, step: int) -> None:

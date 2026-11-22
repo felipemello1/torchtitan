@@ -9,6 +9,7 @@
 import asyncio
 import functools
 import gc
+import logging
 import time
 from types import SimpleNamespace
 
@@ -171,6 +172,91 @@ def test_rollout_worker_reports_its_metrics() -> None:
     assert second_metrics["rollout_worker/gc_pause_ms/max"] > 0.0
     assert second_metrics["rollout_worker/rss_gib/max"] > 0.0
     assert second_metrics["rollout_worker/pss_gib/max"] > 0.0
+
+
+class _BlockingWorker:
+    """Runs each group until it is cancelled."""
+
+    async def run_group(self, **kwargs) -> RolloutGroup:
+        await asyncio.Event().wait()
+
+
+def test_rollout_worker_cancel_group_stops_only_that_group() -> None:
+    async def run() -> None:
+        actor = object.__new__(RolloutWorkerActor)
+        RolloutWorkerActor.__init__(
+            actor,
+            worker_config=SimpleNamespace(build=_BlockingWorker),
+            worker_kwargs={},
+            num_threads=1,
+            structured_logger_init_fn=None,
+        )
+        # Each endpoint's own body, as in test_rollout_worker_reports_its_metrics.
+        run_group = RolloutWorkerActor.run_group._method.__wrapped__
+        cancel_group = RolloutWorkerActor.cancel_group._method.__wrapped__
+        kwargs = dict(
+            generate_fn=None,
+            release_session_fn=None,
+            sample=None,
+            group_size=1,
+            sampling=None,
+        )
+        group_3 = asyncio.create_task(run_group(actor, group_id=3, **kwargs))
+        group_4 = asyncio.create_task(run_group(actor, group_id=4, **kwargs))
+        await asyncio.sleep(0)
+
+        # Not on this worker: returns at once.
+        await cancel_group(actor, 7)
+        assert not group_3.done() and not group_4.done()
+
+        # Returns once group 3's run_group ended; group 4 keeps running.
+        await cancel_group(actor, 3)
+        assert group_3.cancelled()
+        assert not group_4.done()
+        assert list(actor._group_tasks) == [4]
+
+        group_4.cancel()
+        await asyncio.gather(group_4, return_exceptions=True)
+        assert actor._group_tasks == {}
+
+    asyncio.run(run())
+
+
+def test_cancel_group_logs_a_failed_or_stuck_cancel(monkeypatch, caplog) -> None:
+    async def run() -> None:
+        rollouter = _rollouter_without_datasets()
+        cancelled_group_ids = []
+
+        async def cancel(group_id: int) -> None:
+            cancelled_group_ids.append(group_id)
+
+        async def fail(group_id: int) -> None:
+            raise RuntimeError("worker gone")
+
+        async def hang(group_id: int) -> None:
+            await asyncio.Event().wait()
+
+        rollouter._worker_actors = SimpleNamespace(
+            cancel_group=SimpleNamespace(call=cancel)
+        )
+        await rollouter.cancel_group(5)
+        assert cancelled_group_ids == [5]
+
+        # Neither raises: the caller's rollout loop keeps serving groups.
+        rollouter._worker_actors = SimpleNamespace(
+            cancel_group=SimpleNamespace(call=fail)
+        )
+        await rollouter.cancel_group(6)
+        monkeypatch.setattr(rollouter_module, "_RUN_GROUP_DRAIN_TIMEOUT_S", 0.0)
+        rollouter._worker_actors = SimpleNamespace(
+            cancel_group=SimpleNamespace(call=hang)
+        )
+        await rollouter.cancel_group(7)
+
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(run())
+    assert "cancel_group(6) failed" in caplog.text
+    assert "cancel_group(7) failed" in caplog.text
 
 
 class _SetupEndpoint:
