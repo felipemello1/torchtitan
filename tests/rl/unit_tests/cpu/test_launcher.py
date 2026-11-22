@@ -326,6 +326,7 @@ def _provision(actor_system):
             trainer_parallelism=ParallelismConfig(data_parallel_shard_degree=4),
             generator_parallelism=InferenceParallelismConfig(tensor_parallel_degree=2),
             num_generators=2,
+            generator_env={},
         )
     )
 

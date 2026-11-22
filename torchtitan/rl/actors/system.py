@@ -87,9 +87,11 @@ class ActorSystem(Configurable, abc.ABC):
         trainer_parallelism: ParallelismConfig,
         generator_parallelism: InferenceParallelismConfig,
         num_generators: int,
+        generator_env: dict[str, str],
     ) -> None:
         """Reserve the processes for the trainer, ``num_generators`` generators, the
-        generator router and the batcher, before any of them is spawned."""
+        generator router and the batcher, before any of them is spawned. The generator
+        processes start with ``generator_env`` on top of the job's environment."""
 
     @abc.abstractmethod
     async def spawn_trainer(

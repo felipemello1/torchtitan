@@ -194,6 +194,17 @@ class VLLMEngine(GenerationEngine):
                 and self.kv_transfer_config.kv_connector == "MooncakeStoreConnector"
             )
 
+        @property
+        def process_env(self) -> dict[str, str]:
+            # vLLM rejects a KV connector with expandable segments (vllm/config/vllm.py):
+            # turn them off in the generators only; the trainer keeps the RL default.
+            if self.kv_transfer_config is None:
+                return {}
+            return {
+                "PYTORCH_ALLOC_CONF": "expandable_segments:False",
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False",
+            }
+
         def __post_init__(self):
             if self.kv_transfer_config is None:
                 return
