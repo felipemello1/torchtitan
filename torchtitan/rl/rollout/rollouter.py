@@ -52,8 +52,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# How long `Rollouter.close` waits for in-flight `run_group` calls before stopping their workers anyway.
-# Drains took under 0.3 s once the generators closed; 30 s only covers a group stuck in a slow env step.
+# How long `Rollouter.close` waits for in-flight `run_group` calls before stopping their workers anyway,
+# and `Rollouter.cancel_group` for a cancelled group to end. Drains took under 0.3 s once the generators
+# closed; 30 s only covers a group stuck in a slow env step.
 _RUN_GROUP_DRAIN_TIMEOUT_S = 30.0
 
 
@@ -336,6 +337,28 @@ class Rollouter(Configurable):
         call.add_done_callback(self._on_run_group_call_done)
         # Shield `call` from the controller's end-of-training cancel, so `close` can still wait for it.
         return await asyncio.shield(call)
+
+    async def cancel_group(self, group_id: int) -> None:
+        """Stop a training group's `run_group` on its rollout worker; return once it ended there.
+
+            cancel the caller of `run_group_rollouts`   the worker keeps running the group (Monarch
+                                                        runs a call to the end)
+            then `cancel_group(group_id)`               the worker cancels it; this returns once it ended
+            the worker errors, or takes longer than     logged, not raised; the group may keep running
+                `_RUN_GROUP_DRAIN_TIMEOUT_S`
+
+        Every rollout worker gets the call; only the one running the group cancels it.
+        """
+        if self._worker_actors is None:
+            raise RuntimeError("rollout worker pool is not initialized")
+        try:
+            async with asyncio.timeout(_RUN_GROUP_DRAIN_TIMEOUT_S):
+                await self._worker_actors.cancel_group.call(group_id)
+        except Exception:
+            # Logged, not raised: the caller's rollout loop must keep serving groups.
+            logger.exception(
+                "cancel_group(%d) failed; the group may keep running", group_id
+            )
 
     def _on_run_group_call_done(self, call: asyncio.Future[RolloutGroup]) -> None:
         self._inflight_run_group_calls.discard(call)

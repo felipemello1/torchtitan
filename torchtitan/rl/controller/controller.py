@@ -32,6 +32,8 @@ RolloutGroupWorkBuffer
 | _rollout_loop[N]  claim_next()                                                 WAITING -> CLAIMED                   |
 | _rollout_loop[N]  finalize_work(RolloutGroup)                                  CLAIMED -> FINALIZED                 |
 | _batcher_loop     RolloutGroup = take_finalized()                              FINALIZED -> taken (slot still held) |
+|                                                                                adaptive: too-old CLAIMED cancelled  |
+| _rollout_loop[N]  release_cancelled(group_id)                                  cancelled group stopped; slot freed  |
 | _batcher_loop     release_active_groups(1, "untrainable_group")                slot released                        |
 | _trainer_loop     record_step_start(trainer_policy_version)                    adaptive: demand updated             |
 | _trainer_loop     release_active_groups(num_prompts_per_train_step, "trained")  slots released after state dict pull |
@@ -264,7 +266,7 @@ class AsyncLoopConfig(Configurable.Config):
     - `RolloutGroupWorkBuffer` (default): `(target_offpolicy_steps + 1) * P` slots, windowed by
       `windowed_fifo_batches`.
     - `AdaptiveRolloutGroupWorkBuffer`: slots learned from the run, under its own age knobs; it drops
-      groups past its `max_offpolicy_steps`. It ignores `windowed_fifo_batches`, and
+      and cancels groups past its `max_offpolicy_steps`. It ignores `windowed_fifo_batches`, and
       `target_offpolicy_steps` here only sets `train_batch/pct_samples_over_target_age` and the
       default `num_concurrent_rollout_groups`."""
     batcher: Batcher.Config = field(default_factory=Batcher.Config)
@@ -792,8 +794,9 @@ class Controller(Configurable):
             sampling_config: SamplingConfig | None = None,
         ) -> Completion | None:
             # TODO: a cancelled caller releases while the generator still runs its call,
-            #   and a caller that dies never releases. Moot today: nothing cancels a
-            #   generate call, and a dead rollout worker fails the run.
+            #   and a caller that dies never releases. Only `Rollouter.cancel_group` (the
+            #   adaptive buffer's too-old groups) cancels a generate call; a dead rollout
+            #   worker fails the run.
             generator = await generator_router.reserve.call_one(
                 request_id, routing_session_id=routing_session_id
             )
@@ -1347,6 +1350,7 @@ class Controller(Configurable):
         release_session_fn: ReleaseSessionFn,
     ) -> None:
         """Generate + score one group at a time; a failed group becomes an empty group + a failure metric.
+        A group the buffer cancels (too old to train) is stopped on its rollout worker, and its slot freed.
 
         Staleness is bounded by the buffer's active-slot budget. Raw rollouts are recorded before any drop,
         so dropped groups stay inspectable on disk.
@@ -1363,16 +1367,25 @@ class Controller(Configurable):
             if work is None:  # group_buffer closed/shutdown signal
                 logger.info("Buffer closed; rollout loop stopping")
                 return
+
+            # A task of its own, so the buffer can cancel this group (too old to ever train) without
+            # cancelling this loop.
+            generation_task = asyncio.create_task(
+                self._rollouter.run_group_rollouts(
+                    generate_fn=generate_fn,
+                    release_session_fn=release_session_fn,
+                    sample=work.sample,
+                    group_id=work.group_id,
+                    group_size=self.config.async_loop.num_samples_per_prompt,
+                    sampling=self._sampling,
+                ),
+                name=f"rollout_group_{work.group_id}",
+            )
+            group_buffer.track_generation(work, generation_task)
+            group: RolloutGroup | None = None
             try:
                 with sl.log_trace_span("rollout_group"):
-                    group = await self._rollouter.run_group_rollouts(
-                        generate_fn=generate_fn,
-                        release_session_fn=release_session_fn,
-                        sample=work.sample,
-                        group_id=work.group_id,
-                        group_size=self.config.async_loop.num_samples_per_prompt,
-                        sampling=self._sampling,
-                    )
+                    group = await generation_task
                 group.metrics += compute_rollout_metrics(
                     prefix="rollout", rollouts=group.rollouts
                 )
@@ -1382,6 +1395,24 @@ class Controller(Configurable):
                     is_validation=False,
                     rollout_groups=[group],
                 )
+            except asyncio.CancelledError:
+                if asyncio.current_task().cancelling():
+                    # Shutdown cancelled this loop: stop waiting for the group too, then exit.
+                    generation_task.cancel()
+                    await asyncio.wait([generation_task])
+                    raise
+                if not work.cancelled:
+                    # Not the buffer's cancel: propagate it.
+                    raise
+                # The buffer cancelled the group: it became too old to train while generating. That only
+                # stopped the wait here, so stop its rollouts on the rollout worker too.
+                logger.info(
+                    f"rollout group {work.group_id} cancelled: past max_offpolicy_steps"
+                )
+                # TODO: a generate call already on a generator still finishes there, after the
+                # `release_groups` below, and its session can hold KV again until eviction. Release the
+                # group again once its calls end, or abort them (generators have no abort path yet).
+                await self._rollouter.cancel_group(work.group_id)
             except Exception:
                 logger.exception(f"rollout group {work.group_id} failed; dropping")
                 group = RolloutGroup(
@@ -1391,10 +1422,13 @@ class Controller(Configurable):
                 )
             # The group makes no more generation calls, so its cache salts can go.
             await self.generator_router.release_groups.call_one([work.group_id])
-            await group_buffer.finalize_work(group)
+            if group is None:
+                await group_buffer.release_cancelled(work.group_id)
+            else:
+                await group_buffer.finalize_work(group)
 
             # Drop both refs (work.rollout_group is the group too): held groups made every full GC slow.
-            del group, work
+            del group, work, generation_task
 
     async def _batcher_loop(
         self,
