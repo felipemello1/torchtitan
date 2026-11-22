@@ -200,7 +200,9 @@ class ReleaseSessionFn(Protocol):
         """
 
 
-# TODO: let users add a status, change what is trainable, without editing this file
+# TODO: let users add a status, change what is trainable, without editing this file. Scoring ERROR_TIMEOUT
+#   as a fail in validation only (now it gets no reward there either) also needs `make_scored_group` to
+#   tell validation groups apart.
 class RolloutStatus(StrEnum):
     """How a rollout ended. Used to debug and decide if a rollout is trainable."""
 
@@ -217,8 +219,9 @@ class RolloutStatus(StrEnum):
     """The completion couldn't be parsed, e.g. a malformed tool call."""
 
     ERROR_TIMEOUT = "error_timeout"
-    """A deadline passed, e.g. the policy ran a command that never ends. Counts as the policy's
-    failure."""
+    """A deadline passed, e.g. the policy ran a command that never ends or reasoned for hours.
+    Not scored or trained: a long cut-off rollout at reward 0 would outweigh its finished
+    siblings in the token-mean loss."""
 
     ERROR_UNKNOWN = "error_unknown"
     """The env can't tell how the rollout ended, e.g. a stop it doesn't map. Not trained, so a
@@ -264,6 +267,7 @@ class RolloutStatus(StrEnum):
         outside the policy says nothing about the policy."""
         return self not in (
             RolloutStatus.ERROR_INFRA,
+            RolloutStatus.ERROR_TIMEOUT,
             RolloutStatus.ERROR_UNKNOWN,
             RolloutStatus.FIRST_PROMPT_TOO_LONG,
         )
