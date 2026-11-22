@@ -1342,6 +1342,24 @@ def test_cuda_graph_decode_capture_sizes_cover_draft_tokens():
     assert cfg.cudagraph_capture_sizes[-1] == 256
 
 
+def test_full_mode_with_drafts_replays_piecewise_graphs_for_prefill():
+    # vLLM's GDN builder graphs only uniform verify steps, so steps with prefill replay
+    # breakable piecewise graphs. vLLM makes its attention op a graph break only if the
+    # variable is set before it imports the op, so it goes in the process environment.
+    cfg = VLLMCudaGraphConfig(mode="FULL").get_vllm_compilation_config(
+        max_num_seqs=64,
+        max_model_len=4096,
+        expert_sequence_parallel_size=1,
+        enable_sequence_parallel=False,
+        num_speculative_tokens=3,
+    )
+    assert cfg.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
+    assert VLLMEngine.Config(num_speculative_tokens=3).process_env == {
+        "VLLM_USE_BREAKABLE_CUDAGRAPH": "1"
+    }
+    assert VLLMEngine.Config().process_env == {}
+
+
 def test_cuda_graph_full_mode_extends_capture_sizes_to_chunk():
     # FULL also graphs prefill, so sizes extend to the chunked-prefill chunk
     # (max_num_batched_tokens) on a coarser ladder past 1024.
