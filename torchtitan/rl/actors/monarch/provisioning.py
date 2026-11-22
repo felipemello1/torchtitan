@@ -206,7 +206,7 @@ def spawn_proc_mesh(
     host_meshes: HostMeshes | None = None,
     *,
     num_generators: int = 1,
-    generator_env: dict[str, str] | None = None,
+    generator_env: dict[str, str],
 ) -> tuple[ProcMesh, list[ProcMesh]]:
     """Spawn the trainer and generator proc meshes.
 
@@ -225,7 +225,6 @@ def spawn_proc_mesh(
     Returns:
         The ``(trainer_mesh, generator_meshes)`` proc meshes.
     """
-    generator_env = generator_env or {}
     total_generator_gpus = num_generators * per_generator_world_size
     total_gpus = trainer_world_size + total_generator_gpus
     logger.info(
