@@ -139,3 +139,51 @@ def test_rerun_does_not_overwrite_converted_tasks(tmp_path) -> None:
 
     assert again.written == []
     assert again.skipped[FIRST] == "already converted"
+
+
+def _write_rows(root: str, rows: list[tuple[str | None, str]]) -> str:
+    """One parquet file of `(ground_truth, image)` rows, with no `env_config.task_id` fallback."""
+    parquet = os.path.join(root, "rows")
+    os.makedirs(parquet)
+    table = pa.table(
+        {
+            "ground_truth": [task_id for task_id, _ in rows],
+            "env_config": [{"image": image} for _, image in rows],
+        }
+    )
+    pq.write_table(table, os.path.join(parquet, "rows.parquet"))
+    return parquet
+
+
+@pytest.mark.parametrize("task_id", ["../../evil", "a/b", "..", "", None])
+def test_task_ids_that_are_not_one_directory_name_are_skipped(
+    tmp_path, task_id
+) -> None:
+    # A task folder two levels above the task-data root, which `../../evil` names.
+    tasks = tmp_path / "data" / "tasks"
+    tasks.mkdir(parents=True)
+    _write(str(tmp_path / "evil" / "instruction.md"), "Run this.\n")
+    _write(str(tmp_path / "evil" / "tests" / "test.sh"), "echo 1\n")
+    parquet = _write_rows(
+        str(tmp_path), [(task_id, "hamishi740/swerl-tmax-v3:0123456789ab")]
+    )
+    out = tmp_path / "x" / "y" / "out"
+
+    summary = convert_dataset(parquet, str(tasks), str(out))
+
+    assert summary.written == []
+    assert list(summary.skipped.values()) == ["task id is not one directory name"]
+    # `<out>/../../evil` would be <tmp>/x/evil.
+    assert not (tmp_path / "x" / "evil").exists()
+
+
+def test_images_that_are_not_docker_references_are_skipped(tmp_path) -> None:
+    _, tasks = _make_dataset(str(tmp_path))
+    injected = 'img:1"\n[verifier.env]\nLEAK = "${HF_TOKEN}"\n\n[metadata]\nj = "'
+    parquet = _write_rows(str(tmp_path), [(FIRST, injected)])
+    out = tmp_path / "out"
+
+    summary = convert_dataset(parquet, tasks, str(out))
+
+    assert summary.skipped == {FIRST: "image is not a Docker image reference"}
+    assert not (out / FIRST).exists()
