@@ -60,14 +60,22 @@ def test_apply_env_defaults_rejects_legacy_or_conflicting_allocator(canonical) -
         assert dict(os.environ) == explicit
 
 
-def test_apply_env_defaults_creates_private_node_cache_root(tmp_path) -> None:
+# None: no root yet. 0o755: a root that Triton's makedirs created under umask 022.
+@pytest.mark.parametrize("existing_mode", [None, 0o755])
+def test_apply_env_defaults_accepts_private_node_cache_root(
+    tmp_path, existing_mode
+) -> None:
     root = tmp_path / "cache"
+    if existing_mode is not None:
+        root.mkdir()
+        root.chmod(existing_mode)
+
     with patch.dict(os.environ, {NODE_CACHE_ROOT_ENV: str(root)}, clear=True):
         apply_env_defaults()
         # A second process on the node finds the root already there.
         apply_env_defaults()
 
-    assert stat.S_IMODE(root.stat().st_mode) == 0o700
+    assert stat.S_IMODE(root.stat().st_mode) == (existing_mode or 0o700)
 
 
 @pytest.mark.parametrize("unsafe", ["group_writable", "symlink", "other_owner"])

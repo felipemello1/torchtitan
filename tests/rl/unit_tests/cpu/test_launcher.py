@@ -15,6 +15,7 @@ from unittest.mock import patch
 import pytest
 
 from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.rl._env import _NODE_CACHE_SUBDIRS, NODE_CACHE_ROOT_ENV
 from torchtitan.rl.actors.monarch import system as monarch_system
 from torchtitan.rl.actors.monarch.launcher import submit
 from torchtitan.rl.actors.monarch.launcher.base import (
@@ -30,13 +31,7 @@ from torchtitan.rl.actors.monarch.provisioning import _check_gpus_per_host, Host
 from torchtitan.rl.actors.monarch.system import MonarchActorSystem
 from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
 
-_NODE_CACHE_ENV = (
-    "TORCHTITAN_RL_NODE_CACHE_ROOT",
-    "TRITON_CACHE_DIR",
-    "TORCHINDUCTOR_CACHE_DIR",
-    "VLLM_CACHE_ROOT",
-    "FLASHINFER_WORKSPACE_BASE",
-)
+_NODE_CACHE_ENV = (NODE_CACHE_ROOT_ENV, *_NODE_CACHE_SUBDIRS)
 
 
 class FakeLauncher(MonarchLauncher):
@@ -456,12 +451,13 @@ def test_slurm_submit_builds_the_job(tmp_path, slurm_job):
     assert slurm_job["env"]["FROM_PLAN"] == "1"
 
 
-def test_slurm_submit_defaults_node_local_jit_caches(tmp_path, slurm_job, monkeypatch):
+def test_slurm_submit_defaults_node_local_jit_caches(tmp_path, slurm_job):
     from torch._inductor.runtime.cache_dir_utils import default_cache_dir
 
-    monkeypatch.setenv("VLLM_CACHE_ROOT", "/from/shell")
+    # Assign directly: the fixture's patch.dict restores these. monkeypatch's undo runs after it and would delete them.
+    os.environ["VLLM_CACHE_ROOT"] = "/from/shell"
     # The recipe load imports Inductor, which writes torch's shared /tmp default.
-    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", default_cache_dir())
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = default_cache_dir()
     plan = replace(_slurm_plan(tmp_path), env={"TRITON_CACHE_DIR": "/from/launcher"})
 
     SlurmLauncher.Config().build().submit(plan)

@@ -45,6 +45,8 @@ def set_node_cache_env() -> None:
         TORCHINDUCTOR_CACHE_DIR          /tmp/torchtitan-1000/inductor, also over torch's own default
         VLLM_CACHE_ROOT                  /tmp/torchtitan-1000/vllm
     """
+    # Imported here: train.py imports this module before torch, to set env defaults first.
+    # TODO: private torch API. Drop it and the check below once importing torch stops setting TORCHINDUCTOR_CACHE_DIR.
     from torch._inductor.runtime.cache_dir_utils import default_cache_dir
 
     # Importing Inductor writes torch's shared /tmp default into the environment; treat it as unset.
