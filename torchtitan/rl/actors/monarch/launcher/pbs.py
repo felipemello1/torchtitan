@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 
 from monarch.actor import HostMesh
 
+from torchtitan.rl._env import set_node_cache_env
 from torchtitan.rl.actors.monarch.launcher.base import (
     LaunchPlan,
     Layout,
@@ -84,12 +85,8 @@ class PBSLauncher(MonarchLauncher):
         from monarch.job import PBSJob
 
         os.environ.update(plan.env)
-        # Node-local JIT caches, as in SlurmLauncher: nodes compiling into one
-        # shared cache on a network filesystem can hang or crash.
-        cache_root = f"/tmp/torchtitan-{os.getuid()}"
-        os.environ.setdefault("TRITON_CACHE_DIR", f"{cache_root}/triton")
-        os.environ.setdefault("VLLM_CACHE_ROOT", f"{cache_root}/vllm")
-        os.environ.setdefault("FLASHINFER_WORKSPACE_BASE", f"{cache_root}/flashinfer")
+        # Node-local JIT caches; a value from launcher.env or the submit shell wins.
+        set_node_cache_env()
         state_dir = os.path.abspath(
             os.path.join(plan.dump_folder, "launcher", plan.job_name)
         )
