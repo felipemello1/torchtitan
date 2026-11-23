@@ -481,8 +481,8 @@ class BaseRolloutWorker(Configurable, ABC):
         self._thread_pool_lag = m.ThreadPoolLag("rollout_worker")
 
     def flush_process_metrics(self, group_id: int) -> list[m.Metric]:
-        """Return this process's lag since the previous training group and its RAM (now and peak),
-        then reset the lag trackers.
+        """Return this process's lag since the previous training group, its RAM (now and peak) and its
+        host's available memory, then reset the lag trackers.
 
             training group (group_id >= 0)    gets the metrics
             validation group (group_id < 0)   gets none: the controller never reads its metrics.
@@ -506,6 +506,10 @@ class BaseRolloutWorker(Configurable, ABC):
             *self._thread_pool_lag.flush(),
             m.Metric("rollout_worker/ram_gib", m.Max(kib["VmRSS"] / 2**20)),
             m.Metric("rollout_worker/peak_ram_gib", m.Max(kib["VmHWM"] / 2**20)),
+            m.Metric(
+                "rollout_worker/host_memory_available_gib",
+                m.Min(m.host_memory_available_gib()),
+            ),
         ]
 
     async def score_group(

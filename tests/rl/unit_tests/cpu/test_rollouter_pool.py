@@ -174,6 +174,7 @@ def test_rollout_worker_reports_its_metrics() -> None:
     assert second_metrics["rollout_worker/thread_pool_lag_ms/max"] >= 250.0
     assert second_metrics["rollout_worker/ram_gib/max"] > 0.0
     assert second_metrics["rollout_worker/peak_ram_gib/max"] > 0.0
+    assert second_metrics["rollout_worker/host_memory_available_gib/min"] > 0.0
 
 
 class _BlockingWorker:
