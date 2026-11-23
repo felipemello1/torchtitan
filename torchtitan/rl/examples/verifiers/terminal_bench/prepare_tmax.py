@@ -146,10 +146,10 @@ def convert_task(
     os.makedirs(out)
     with open(os.path.join(out, "task.toml"), "w") as f:
         f.write(task_toml(task_id, image, cpus, memory_mb, workdir))
+    # TODO: a pre-extracted `--task-data` folder skips the tarball's `filter="data"`, so a symlink in
+    # `instruction.md` or `tests/` copies a host file into the task. Reject tasks that contain links;
+    # not done here because the tarball, the documented input, is already filtered.
     shutil.copy(instruction, os.path.join(out, "instruction.md"))
-    # TODO: A pre-extracted `--task-data` folder is not filtered like the tarball (`filter="data"`):
-    # a symlink under `tests/` copies a host file into the task, and the sandbox then receives it.
-    # Reject tasks that contain links.
     shutil.copytree(tests, os.path.join(out, "tests"))
     return None
 

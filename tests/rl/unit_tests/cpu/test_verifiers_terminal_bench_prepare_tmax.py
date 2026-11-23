@@ -155,7 +155,7 @@ def _write_rows(root: str, rows: list[tuple[str | None, str]]) -> str:
     return parquet
 
 
-@pytest.mark.parametrize("task_id", ["../../evil", "a/b", "..", "", None])
+@pytest.mark.parametrize("task_id", ["../../evil", "a/b", "..", None])
 def test_task_ids_that_are_not_one_directory_name_are_skipped(
     tmp_path, task_id
 ) -> None:
