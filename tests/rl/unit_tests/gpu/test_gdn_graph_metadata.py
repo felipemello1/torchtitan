@@ -24,10 +24,7 @@ from torchtitan.rl.generator.vllm.worker import (
     TorchTitanCudagraphDispatcher,
     TorchTitanGPUModelRunner,
 )
-from vllm.compilation.breakable_cudagraph import (
-    BreakableCUDAGraphCapture,
-    eager_break_during_capture,
-)
+from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
 from vllm.config import (
     CompilationConfig,
     CompilationMode,
@@ -766,9 +763,6 @@ def test_speculative_step_replays_in_breakable_graph(monkeypatch) -> None:
     eager_layer = _qwen3_5_gdn_layer(num_speculative_tokens=3, num_slots=13)
     graph_layer = _qwen3_5_gdn_layer(num_speculative_tokens=3, num_slots=13)
     graph_layer.kv_cache = tuple(state.clone() for state in eager_layer.kv_cache)
-    graph_layer._forward_speculative_eager = eager_break_during_capture(
-        graph_layer._forward_speculative
-    )
     static_tokens = tuple(torch.zeros_like(tensor) for tensor in tokens)
 
     no_metadata = ForwardContext(
@@ -810,7 +804,6 @@ def _qwen3_5_gdn_layer(num_speculative_tokens: int, num_slots: int) -> gdn.VLLMI
     torch.nn.Module.__init__(layer)
     layer.prefix = "gdn"
     layer.num_speculative_tokens = num_speculative_tokens
-    layer._forward_speculative_eager = layer._forward_speculative
     layer.local_num_k_heads = layer.local_num_v_heads = _HEADS
     layer.head_k_dim = layer.head_v_dim = _HEAD_DIM
     conv_rows = 3 + num_speculative_tokens
