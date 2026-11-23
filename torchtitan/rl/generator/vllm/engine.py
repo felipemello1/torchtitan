@@ -223,7 +223,7 @@ class VLLMEngine(GenerationEngine):
                                                      prefix-cache hits are coarser
 
         Both ratios come from an offline trainer rescoring of generated tokens (Qwen3.8-27B,
-        GB300, temperature 1, 32k-100k-token contexts). Its absolute values sit above a live
+        GB300, temperature 1, 27k-78k-token contexts). Its absolute values sit above a live
         run's, so read your run's own step-1 `loss/mismatch_kl/mean` as the fp8 floor.
         """
 
