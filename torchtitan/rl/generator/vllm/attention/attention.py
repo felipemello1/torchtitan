@@ -328,6 +328,9 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
             )
             # vLLM's loader sets these scales to 1.0 after the model's `to_empty`
             # (Attention.process_weights_after_loading); weight syncs skip them (non-persistent).
+            # TODO: FA4 copies each stride-0 descale to a contiguous tensor: 3 copy kernels per
+            # call, ~5 us per layer (GB300). A per-layer (num_kv_heads,) scale expanded on dim 0
+            # passes FA4's layout check without copies.
             descales = (
                 layer._q_scale.expand(descale_shape),
                 layer._k_scale.expand(descale_shape),
