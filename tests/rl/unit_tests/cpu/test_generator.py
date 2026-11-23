@@ -17,6 +17,8 @@ import concurrent.futures
 import copy
 import inspect
 import json
+import logging
+import math
 import os
 import sys
 from contextlib import nullcontext
@@ -106,12 +108,18 @@ class _FakeRenderer:
 class _FakeLLMEngine:
     def __init__(self):
         self.add_requests = []
+        self.abort_request_calls = []
         self.reset_prefix_cache_calls = []
         self.reset_encoder_cache_calls = 0
         self.renderer = _FakeRenderer()
+        # The running requests, by vLLM's internal id.
+        self.output_processor = SimpleNamespace(request_states={})
 
     def add_request(self, *args, **kwargs):
         self.add_requests.append((args, kwargs))
+
+    def abort_request(self, request_ids, internal=False):
+        self.abort_request_calls.append((request_ids, internal))
 
     def has_unfinished_requests(self):
         return False
@@ -123,7 +131,7 @@ class _FakeLLMEngine:
         self.reset_encoder_cache_calls += 1
 
 
-def _sample(*, token_ids=(10, 11), finish_reason="stop"):
+def _sample(*, token_ids=(10, 11), finish_reason="stop", cumulative_logprob=None):
     # What vLLM returns with flat_logprobs=True and logprobs=0: one logprob (-0.1) per generated token.
     logprobs = FlatLogprobs()
     for tok in token_ids:
@@ -132,6 +140,9 @@ def _sample(*, token_ids=(10, 11), finish_reason="stop"):
         token_ids=list(token_ids),
         logprobs=logprobs,
         finish_reason=finish_reason,
+        cumulative_logprob=(
+            -0.1 * len(token_ids) if cumulative_logprob is None else cumulative_logprob
+        ),
     )
 
 
@@ -165,6 +176,8 @@ def _vllm_engine(*, reset_kv_cache_on_model_state_dict_load=False, model=None):
     )
     engine._get_model = lambda: model
     engine._session_kv_holder = None
+    engine._is_tp_rank_0 = True
+    engine._generator_name = "generator_0"
     engine._vision_processor = None
     engine._pixel_values_lru_cache = LRUCache(
         1 << 20, getsizeof=lambda pixel_values: pixel_values.nbytes
@@ -630,6 +643,41 @@ def test_step_returns_finished_requests_without_grad():
     assert finished.token_logprobs == [-0.1, -0.1]
     assert finished.finish_reason == "stop"
     assert finished.metrics_inputs.num_generation_tokens == 4
+
+
+def test_step_aborts_requests_whose_summed_logprob_is_not_finite(caplog):
+    engine = _vllm_engine()
+
+    def running_request(request_id, cumulative_logprob, num_tokens):
+        return SimpleNamespace(
+            request_id=f"{request_id}-suffix",
+            external_req_id=request_id,
+            logprobs_processor=SimpleNamespace(cumulative_logprob=cumulative_logprob),
+            detokenizer=SimpleNamespace(num_output_tokens=lambda: num_tokens),
+        )
+
+    # r0 runs on with a finite sum, r1 with a NaN one; r2 finished in the step that made its sum -inf.
+    engine._engine.output_processor.request_states = {
+        "r0-suffix": running_request("r0", -3.2, num_tokens=32),
+        "r1-suffix": running_request("r1", math.nan, num_tokens=900),
+    }
+    engine._engine.step = lambda: [
+        _request_output(
+            request_id="r2", outputs=[_sample(cumulative_logprob=-math.inf)]
+        )
+    ]
+
+    with caplog.at_level(logging.WARNING, logger=vllm_engine_module.__name__):
+        finished = engine.step()
+
+    # vLLM takes its internal ids; the replies carry ours.
+    assert engine._engine.abort_request_calls == [(["r1-suffix"], True)]
+    assert [
+        (request.request_id, request.finish_reason, request.token_ids)
+        for request in finished
+    ] == [("r2", "abort", []), ("r1", "abort", [])]
+    assert "generator_0: aborted request r1 after 900 generated tokens" in caplog.text
+    assert "aborted request r2 after 2 generated tokens" in caplog.text
 
 
 def test_step_rejects_more_than_one_sample_per_request():
