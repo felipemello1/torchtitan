@@ -62,10 +62,11 @@ def paged_varlen_attention_out(
         # fp8 calls FA4's private `_flash_attn_fwd` with the arguments torch's FA4 bridge passes
         # (torch/nn/attention/_fa4.py). FA4's public `flash_attn_varlen_func` takes descales
         # but has no `out=` to write into vLLM's output buffer.
-        # TODO: FA4's SwapAB decode kernel takes only fp16/bf16 (SwapABPolicy.rejection in
-        # flash_attn/cute/config.py), so fp8 decode runs FA4's standard kernel. On GB300 that is
-        # 1.5x faster than bf16 SwapAB on unique contexts, but 1.2x slower when requests share
-        # prefix pages, which SwapAB reuses from L2. An fp8 SwapAB kernel in FA4 would win both.
+        # TODO: FA4 4.0.0b40's SwapAB decode kernel takes only fp16/bf16 (SwapABPolicy.rejection
+        # in flash_attn/cute/config.py), so fp8 decode (and MTP verify rows) run FA4's standard
+        # kernel, 1.2x slower than bf16 SwapAB when requests share prefix pages (GB300). An FA4
+        # with fp8 SwapAB picks it here unchanged: 1.7x faster than bf16 SwapAB on that load.
+        # Upstream FA4 PR to file.
         from flash_attn.cute.interface import _flash_attn_fwd, TensorwiseScales
 
         window_left, window_right = window_size

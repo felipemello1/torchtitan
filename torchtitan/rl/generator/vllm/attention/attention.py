@@ -387,6 +387,7 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
                 key_cache,
                 value_cache,
                 attn_metadata,
+                descales=descales,
             )
         if (
             current_flash_attention_impl() == "FA4"
@@ -442,6 +443,7 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
         attn_metadata: FlashAttentionMetadata,
+        descales: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Attention of a verify step, every row ``n`` query tokens, on FA4's decode kernel.
 
@@ -452,6 +454,8 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
             FA4 decode, 4 x heads        keys 0 .. L-4             every token
             here, fp32, causal           keys L-3 .. L-1           token j: the first j of them
             merge                        logsumexp of the two parts
+
+        With fp8 ``descales`` (q, k, v), the decode call applies them and the tail dequantizes.
         """
         num_rows = attn_metadata.seq_lens.shape[0]
         num_tokens, num_heads, head_dim = query.shape
@@ -467,7 +471,7 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
             num_rows, query_len, num_kv_heads, num_queries_per_kv, head_dim
         ).transpose(1, 2)
         num_shared_keys = (attn_metadata.seq_lens - (query_len - 1)).clamp_(min=0)
-        shared_out = query.new_empty(
+        shared_out = output.new_empty(
             num_rows, num_kv_heads * query_len * num_queries_per_kv, head_dim_v
         )
         _, shared_lse = paged_varlen_attention_out(
@@ -486,6 +490,7 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
             window_size=(-1, 0),
             enable_gqa=True,
             return_lse=True,
+            descales=descales,
         )
         # [rows, KV heads, tokens, query heads per KV head]
         shared_lse = shared_lse.view(
@@ -505,11 +510,17 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
         )
         pages = attn_metadata.block_table.gather(1, positions // page_size).long()
         offsets = positions % page_size
+        tail_queries = query_by_kv_head.float()
         tail_keys = key_cache[pages, offsets].float()
         tail_values = value_cache[pages, offsets].float()
-        tail_scores = torch.einsum(
-            "rkjgd,rikd->rkjgi", query_by_kv_head.float(), tail_keys
-        ).mul_(self.scale)
+        if descales is not None:
+            query_descale, key_descale, value_descale = descales
+            tail_queries = tail_queries * query_descale[:, :, None, None, None]
+            tail_keys = tail_keys * key_descale[:, None, :, None]
+            tail_values = tail_values * value_descale[:, None, :, None]
+        tail_scores = torch.einsum("rkjgd,rikd->rkjgi", tail_queries, tail_keys).mul_(
+            self.scale
+        )
         key_index = torch.arange(query_len - 1, device=query.device)
         token_index = torch.arange(query_len, device=query.device)
         is_future = key_index[None, :] >= token_index[:, None]
