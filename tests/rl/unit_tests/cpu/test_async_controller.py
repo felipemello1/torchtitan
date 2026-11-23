@@ -1316,7 +1316,10 @@ def test_validate_rolls_out_each_prompt_n_times(
     controller.config = SimpleNamespace(
         async_loop=SimpleNamespace(
             validation=ValidationConfig(
-                steps=2, num_samples_per_prompt=num_samples_per_prompt
+                steps=2,
+                num_samples_per_prompt=num_samples_per_prompt,
+                top_p=0.95,
+                top_k=20,
             )
         )
     )
@@ -1341,7 +1344,15 @@ def test_validate_rolls_out_each_prompt_n_times(
 
     calls = run_group_rollouts.call_args_list
     assert [call.kwargs["group_size"] for call in calls] == [num_samples_per_prompt] * 2
-    expected_sampling = SamplingConfig(temperature=1.0, seed=7, stop_token_ids=[1])
+    # Validation's own temperature, top_p and top_k; the trainer never scores these tokens.
+    expected_sampling = SamplingConfig(
+        temperature=1.0,
+        top_p=0.95,
+        top_k=20,
+        seed=7,
+        stop_token_ids=[1],
+        scored_by_trainer=False,
+    )
     assert [call.kwargs["sampling"] for call in calls] == [expected_sampling] * 2
     aggregated = m.MetricsProcessor._aggregate_metrics(metrics)
     assert aggregated["validation_reward/_mean"] == expected_mean
@@ -1356,6 +1367,10 @@ def test_validation_config_rejects_bad_sampling() -> None:
         ValidationConfig(num_samples_per_prompt=0)
     with pytest.raises(ValueError, match="greedy"):
         ValidationConfig(temperature=0.0, num_samples_per_prompt=4)
+    with pytest.raises(ValueError, match="top_p"):
+        ValidationConfig(top_p=0.0)
+    with pytest.raises(ValueError, match="top_k"):
+        ValidationConfig(top_k=0)
 
 
 def test_fixed_buffer_ignores_the_adaptive_hooks() -> None:

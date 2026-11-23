@@ -350,12 +350,15 @@ def test_build_sampling_params_matches_contract():
     params = _build_sampling_params(
         SamplingConfig(
             temperature=0.3,
+            top_p=0.95,
+            top_k=20,
             max_tokens=64,
             seed=44,
             stop_token_ids=[99],
+            scored_by_trainer=False,
         )
     )
-    assert params.temperature == 0.3 and params.top_p == 1.0
+    assert params.temperature == 0.3 and params.top_p == 0.95 and params.top_k == 20
     assert params.max_tokens == 64
     assert params.n == 1
     assert params.logprobs == 0
@@ -718,9 +721,13 @@ def test_reset_kv_cache_on_model_state_dict_load_controls_cache_reset(
     assert fake.reset_encoder_cache_calls == int(reset_kv_cache and serves_images)
 
 
-def test_sampling_config_rejects_top_p_below_one():
-    with pytest.raises(ValueError, match="top_p must be 1.0, got 0.95"):
+def test_sampling_config_filters_only_requests_the_trainer_does_not_score():
+    with pytest.raises(ValueError, match="got top_p=0.95, top_k=-1"):
         SamplingConfig(top_p=0.95)
+    with pytest.raises(ValueError, match="got top_p=1.0, top_k=20"):
+        SamplingConfig(top_k=20)
+
+    SamplingConfig(top_p=0.95, top_k=20, scored_by_trainer=False)
 
 
 # --- vLLM metric timing math (the `_prepare_generation_request_metrics` helper) ---

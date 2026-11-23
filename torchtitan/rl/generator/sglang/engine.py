@@ -666,6 +666,7 @@ class SGLangEngine(GenerationEngine):
         params = SamplingParams(
             temperature=sampling.temperature,
             top_p=sampling.top_p,
+            top_k=sampling.top_k,
             max_new_tokens=min(
                 sampling.max_tokens, max(self._max_context_length - prompt_length, 0)
             ),
