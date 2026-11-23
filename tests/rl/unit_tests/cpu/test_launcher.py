@@ -10,10 +10,12 @@ import shlex
 import sys
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
 from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.rl._env import _NODE_CACHE_SUBDIRS, NODE_CACHE_ROOT_ENV
 from torchtitan.rl.actors.monarch import system as monarch_system
 from torchtitan.rl.actors.monarch.launcher import submit
 from torchtitan.rl.actors.monarch.launcher.base import (
@@ -28,6 +30,8 @@ from torchtitan.rl.actors.monarch.launcher.slurm import SlurmLauncher
 from torchtitan.rl.actors.monarch.provisioning import _check_gpus_per_host, HostMeshes
 from torchtitan.rl.actors.monarch.system import MonarchActorSystem
 from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
+
+_NODE_CACHE_ENV = (NODE_CACHE_ROOT_ENV, *_NODE_CACHE_SUBDIRS)
 
 
 class FakeLauncher(MonarchLauncher):
@@ -397,11 +401,12 @@ def slurm_job(monkeypatch):
 
     monkeypatch.setattr(monarch.job, "SlurmJob", FakeSlurmJob)
     monkeypatch.delenv("SBATCH_EXPORT", raising=False)
-    # submit sets these in os.environ; monkeypatch restores them afterwards.
-    for name in ("TRITON_CACHE_DIR", "VLLM_CACHE_ROOT", "FLASHINFER_WORKSPACE_BASE"):
-        monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(sys, "executable", "/venv/python")
-    return calls
+    # submit writes the plan's env and the cache defaults into os.environ; restore it afterwards.
+    with patch.dict(os.environ):
+        for name in _NODE_CACHE_ENV:
+            os.environ.pop(name, None)
+        yield calls
 
 
 def _slurm_plan(tmp_path):
@@ -446,18 +451,24 @@ def test_slurm_submit_builds_the_job(tmp_path, slurm_job):
     assert slurm_job["env"]["FROM_PLAN"] == "1"
 
 
-def test_slurm_submit_defaults_node_local_jit_caches(tmp_path, slurm_job, monkeypatch):
-    monkeypatch.setenv("VLLM_CACHE_ROOT", "/from/shell")
+def test_slurm_submit_defaults_node_local_jit_caches(tmp_path, slurm_job):
+    from torch._inductor.runtime.cache_dir_utils import default_cache_dir
+
+    # Assign directly: the fixture's patch.dict restores these. monkeypatch's undo runs after it and would delete them.
+    os.environ["VLLM_CACHE_ROOT"] = "/from/shell"
+    # The recipe load imports Inductor, which writes torch's shared /tmp default.
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = default_cache_dir()
     plan = replace(_slurm_plan(tmp_path), env={"TRITON_CACHE_DIR": "/from/launcher"})
 
     SlurmLauncher.Config().build().submit(plan)
 
     env = slurm_job["env"]
+    root = f"/tmp/torchtitan-{os.getuid()}"
+    assert env["TORCHTITAN_RL_NODE_CACHE_ROOT"] == root
     assert env["TRITON_CACHE_DIR"] == "/from/launcher"
     assert env["VLLM_CACHE_ROOT"] == "/from/shell"
-    assert env["FLASHINFER_WORKSPACE_BASE"] == (
-        f"/tmp/torchtitan-{os.getuid()}/flashinfer"
-    )
+    assert env["TORCHINDUCTOR_CACHE_DIR"] == f"{root}/inductor"
+    assert env["FLASHINFER_WORKSPACE_BASE"] == f"{root}/flashinfer"
 
 
 def test_slurm_submit_writes_job_state_per_job(tmp_path, slurm_job):
@@ -553,10 +564,12 @@ def pbs_job(monkeypatch):
             self._pbs_job_id = "7.pbs"
 
     monkeypatch.setattr(monarch.job, "PBSJob", FakePBSJob, raising=False)
-    for name in ("TRITON_CACHE_DIR", "VLLM_CACHE_ROOT", "FLASHINFER_WORKSPACE_BASE"):
-        monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(sys, "executable", "/venv/python")
-    return calls
+    # submit writes the plan's env and the cache defaults into os.environ; restore it afterwards.
+    with patch.dict(os.environ):
+        for name in _NODE_CACHE_ENV:
+            os.environ.pop(name, None)
+        yield calls
 
 
 def test_pbs_submit_builds_the_job(tmp_path, pbs_job, monkeypatch):
@@ -592,6 +605,9 @@ def test_pbs_submit_builds_the_job(tmp_path, pbs_job, monkeypatch):
     state_path = tmp_path / "launcher" / "j-abcdef" / "job_state.pkl"
     assert pbs_job["env"]["TORCHTITAN_RL_PBS_JOB_STATE"] == str(state_path)
     assert state_path.read_text() == "state"
+    assert pbs_job["env"]["TORCHTITAN_RL_NODE_CACHE_ROOT"] == (
+        f"/tmp/torchtitan-{os.getuid()}"
+    )
 
 
 def test_pbs_acquire_hosts(monkeypatch):

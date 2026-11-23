@@ -7,11 +7,13 @@
 from __future__ import annotations
 
 import os
+import re
+import stat
 from unittest.mock import patch
 
 import pytest
 
-from torchtitan.rl._env import apply_env_defaults, RL_ENV_DEFAULTS
+from torchtitan.rl._env import apply_env_defaults, NODE_CACHE_ROOT_ENV, RL_ENV_DEFAULTS
 
 
 def test_apply_env_defaults() -> None:
@@ -56,3 +58,44 @@ def test_apply_env_defaults_rejects_legacy_or_conflicting_allocator(canonical) -
         with pytest.raises(ValueError, match="Use PYTORCH_ALLOC_CONF"):
             apply_env_defaults()
         assert dict(os.environ) == explicit
+
+
+# None: no root yet. 0o755: a root that Triton's makedirs created under umask 022.
+@pytest.mark.parametrize("existing_mode", [None, 0o755])
+def test_apply_env_defaults_accepts_private_node_cache_root(
+    tmp_path, existing_mode
+) -> None:
+    root = tmp_path / "cache"
+    if existing_mode is not None:
+        root.mkdir()
+        root.chmod(existing_mode)
+
+    with patch.dict(os.environ, {NODE_CACHE_ROOT_ENV: str(root)}, clear=True):
+        apply_env_defaults()
+        # A second process on the node finds the root already there.
+        apply_env_defaults()
+
+    assert stat.S_IMODE(root.stat().st_mode) == (existing_mode or 0o700)
+
+
+@pytest.mark.parametrize("unsafe", ["group_writable", "symlink", "other_owner"])
+def test_apply_env_defaults_rejects_node_cache_root_others_can_write(
+    tmp_path, monkeypatch, unsafe
+) -> None:
+    root = tmp_path / "cache"
+    if unsafe == "symlink":
+        private = tmp_path / "private"
+        private.mkdir(mode=0o700)
+        root.symlink_to(private)
+    else:
+        root.mkdir(mode=0o700)
+
+    if unsafe == "group_writable":
+        root.chmod(0o775)
+    if unsafe == "other_owner":
+        # A test can't chown; pretend the dir belongs to another user.
+        monkeypatch.setattr(os, "geteuid", lambda: root.stat().st_uid + 1)
+
+    with patch.dict(os.environ, {NODE_CACHE_ROOT_ENV: str(root)}, clear=True):
+        with pytest.raises(RuntimeError, match=re.escape(str(root))):
+            apply_env_defaults()

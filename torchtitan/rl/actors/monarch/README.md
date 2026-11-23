@@ -72,9 +72,11 @@ Before you submit, set up the environment, model and dataset per the
 them at the same paths (see the
 [`SlurmLauncher` docstring for more details](./launcher/slurm.py)). Submit from
 the repository root, in the shell where the venv is active and `PYTHONPATH` is
-set. JIT caches (Triton, vLLM, FlashInfer) default to node-local
-`/tmp/torchtitan-<uid>`; set them in `launcher.env` or the submit shell to
-override.
+set. JIT caches (Triton, TorchInductor, vLLM, FlashInfer) default to node-local
+`/tmp/torchtitan-<uid>`, which each node creates private (mode 0700). A job fails
+if that path exists and another user owns it or can write to it. To override, set
+`TORCHTITAN_RL_NODE_CACHE_ROOT`, or each cache variable, in `launcher.env` or the
+submit shell.
 
 From a login node, this runs a complete example on two 4-GPU nodes: the trainer
 on node 0, and four 1-GPU generators sharing node 1 (set `gpus_per_node` in the
@@ -124,6 +126,14 @@ fixed).
 The launcher's `env` values are part of the config, which the controller may log
 and save (`print_config`, `save_config_file`), so don't put secrets there; set them
 in the submit shell, which the job inherits.
+
+RL jobs open ports that accept connections without authentication: the
+`torch.distributed` store and Gloo in every job, and the Monarch workers that the
+SLURM and PBS launchers start. Monarch and `torch.distributed` unpickle what they
+receive, as PyTorch's
+[SECURITY.md](https://github.com/pytorch/pytorch/blob/main/SECURITY.md#using-distributed-features)
+says for all of `torch.distributed`. A host that can reach these ports can run code
+as the job user, so run on a network that only trusted hosts can reach.
 
 ## Outside this package
 
