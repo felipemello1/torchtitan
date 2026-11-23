@@ -381,7 +381,12 @@ class VLLMEngine(GenerationEngine):
             import flash_attn.cute
 
             # Once per generator process: a FA4 copy earlier on PYTHONPATH replaces the venv's.
-            logger.info(f"fp8 KV cache: flash_attn.cute from {flash_attn.cute.__file__}")
+            logger.info(
+                f"fp8 KV cache: flash_attn.cute from {flash_attn.cute.__file__}"
+            )
+            # TODO: with this check, fp8 verify rows run the decode + fp32-tail path (`_verify_rows_as_decode`)
+            # only when V's head dim differs from K's. A PR keeps one fp8 verify path: this check (once FA4 ships
+            # query_len_in_heads, TODO at rl/generator/attention/attention.py:75-79) or the tail with drafts.
             if config.num_speculative_tokens > 0 and not fa4_takes_query_len_in_heads():
                 # Without it, fp8 verify rows fall back to a slower path (decode call + fp32 tail), on which
                 # MTP drafts were never measured: fail at start instead.
