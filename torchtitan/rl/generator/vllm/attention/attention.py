@@ -482,6 +482,8 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
             num_rows + 1, device=query.device, dtype=torch.int32
         )
         # query_len_in_heads runs only on SwapAB, which a DiffKV layer's V head dim can refuse.
+        # TODO: two reorder copies (q, out) cost ~9 us per layer (26 rows, GB300). bf16 rows
+        # could take this call once torch's varlen API passes query_len_in_heads.
         if (
             descales is not None
             and head_dim_v == head_dim
