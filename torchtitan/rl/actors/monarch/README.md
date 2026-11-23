@@ -127,6 +127,14 @@ The launcher's `env` values are part of the config, which the controller may log
 and save (`print_config`, `save_config_file`), so don't put secrets there; set them
 in the submit shell, which the job inherits.
 
+RL jobs open ports that accept connections without authentication: the
+`torch.distributed` store and Gloo in every job, and the Monarch workers that the
+SLURM and PBS launchers start. Monarch and `torch.distributed` unpickle what they
+receive, as PyTorch's
+[SECURITY.md](https://github.com/pytorch/pytorch/blob/main/SECURITY.md#using-distributed-features)
+says for all of `torch.distributed`. A host that can reach these ports can run code
+as the job user, so run on a network that only trusted hosts can reach.
+
 ## Outside this package
 
 No module outside this package imports Monarch or this package, except the
