@@ -285,9 +285,9 @@ def _generator_worker(
 @pytest.mark.multi_gpu
 @pytest.mark.parametrize(
     "connector, roles, save_decode_cache, hold_sessions, block_size, tp, dp, ep, async_scheduling, prefix_match_unit",
-    # TODO: add a kv_cache_dtype="fp8" variant of "cpu-hybrid-tail". It would be the one CI test
-    # of the vLLM backend's fp8 wiring and of fp8 blocks reloaded from CPU. Not added yet: it
-    # needs 2 SM100-family GPUs, and FA4's fp8 forward runs only there.
+    # TODO: add a kv_cache_dtype="fp8" variant of "cpu-hybrid-tail": the one CI test of the vLLM
+    # backend's fp8 wiring and of fp8 blocks reloaded from CPU. Not added: unchecked on 2 SM100
+    # GPUs, and this file is not in the B200 RL workflow, the only RL CI lane with SM100 GPUs.
     [
         pytest.param(
             "SimpleCPUOffloadConnector",

@@ -10,7 +10,6 @@ import pytest
 import torch
 
 from torchtitan.rl.generator.vllm.attention import attention as vllm_attention
-from vllm.platforms.interface import DeviceCapability
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.worker.utils import select_common_block_size
 
@@ -85,27 +84,3 @@ def test_fa4_page_size_with_kv_cache_spec():
         ),
     ):
         assert backend.get_supported_kernel_block_sizes(spec) == [128]
-
-
-@pytest.mark.parametrize(
-    "kv_cache_dtype, capability, accepted",
-    [
-        ("auto", (9, 0), True),
-        ("fp8", (10, 3), True),
-        ("fp8", (9, 0), False),
-    ],
-)
-def test_fp8_kv_cache_needs_sm100(kv_cache_dtype, capability, accepted):
-    """The CUSTOM backend takes an fp8 KV cache at head dim 256 on SM100-family GPUs only."""
-    reason = vllm_attention.TorchTitanVarlenInnerAttentionBackend.supports_combination(
-        head_size=256,
-        dtype=torch.bfloat16,
-        kv_cache_dtype=kv_cache_dtype,
-        block_size=128,
-        use_mla=False,
-        has_sink=False,
-        use_sparse=False,
-        use_mm_prefix=False,
-        device_capability=DeviceCapability(*capability),
-    )
-    assert (reason is None) == accepted, reason

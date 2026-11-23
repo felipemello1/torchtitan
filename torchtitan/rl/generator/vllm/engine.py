@@ -176,14 +176,19 @@ class VLLMEngine(GenerationEngine):
             "fp8"    e4m3 with scale 1; the query is quantized to e4m3 too, and attention
                      runs FA4's fp8 forward (SM100 family only)
 
-        Pick "fp8" when the KV cache fills or contexts are long and mostly unique: twice the
-        tokens fit, and decode reads half the bytes. Keep "auto" when many requests share long
-        prompts, where fp8 decode can be slower (see `paged_varlen_attention_out`), or when the
-        generator must stay as close to the trainer as possible.
-        Cost on Qwen3.8-27B, GB300, temperature 1, fp8 vs auto: `loss/mismatch_kl/mean` at
-        policy age 0 3.7e-3 vs 1.0e-3; tokens outside an IcePop ratio mask of (0.2, 5)
-        5.5e-4 vs 1.1e-4. A hybrid model's KV block grows (896 -> 1,664 tokens), so
-        prefix-cache hits land on coarser boundaries.
+        fp8 vs auto:
+
+            KV cache full, or long unique contexts   fp8: 2x tokens fit, decode reads half the bytes
+            many requests sharing long prompts       auto: fp8 decode can be slower
+                                                     (see `paged_varlen_attention_out`)
+            k3 KL vs the trainer at policy age 0     fp8: ~3.5x auto's (`loss/mismatch_kl/mean`)
+            tokens outside IcePop's (0.2, 5) mask    fp8: ~5x auto's
+            a hybrid model's KV block                fp8: grows (896 -> 1,664 tokens), so
+                                                     prefix-cache hits are coarser
+
+        Both ratios come from an offline trainer rescoring of generated tokens (Qwen3.8-27B,
+        GB300, temperature 1, 32k-100k-token contexts). Its absolute values sit above a live
+        run's, so read your run's own step-1 `loss/mismatch_kl/mean` as the fp8 floor.
         """
 
         kv_transfer_config: KVTransferConfig | None = None
