@@ -150,6 +150,8 @@ def _enable_breakable_cuda_graphs() -> None:
     from vllm.model_executor.layers.attention import attention as vllm_attention
 
     attention_op = vllm_attention.unified_attention_with_output
+    # The wrapper that `eager_break_during_capture` returns is defined in breakable_cudagraph.py.
+    # If vLLM moves it, this check raises on a wrapped op.
     if attention_op.__code__.co_filename != breakable_cudagraph.__file__:
         raise RuntimeError(
             "num_speculative_tokens > 0 with cuda_graph.mode='FULL' needs vLLM's attention "

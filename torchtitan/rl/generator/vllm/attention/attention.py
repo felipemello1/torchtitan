@@ -160,14 +160,17 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
         self.enable_gqa = self.num_heads > self.num_kv_heads
 
         # Query tokens of a verify row (the token plus its MTP drafts), when FA4's SwapAB
-        # decode kernel can take them as query heads (_verify_rows_as_decode): SM100/SM103
-        # and at most 32 query heads per KV head (SwapABPolicy, flash_attn/cute/config.py).
+        # decode kernel can take them as query heads (_verify_rows_as_decode): SM100/SM103,
+        # K head dim 64/96/128/256, at most 32 query heads per KV head (SwapABPolicy,
+        # flash_attn/cute/config.py). If SwapAB still refuses (a DiffKV layer's V head dim),
+        # FA4's standard kernel runs the rows, slower.
         speculative_config = get_current_vllm_config().speculative_config
         self.verify_query_len = None
         if speculative_config is not None:
             verify_query_len = 1 + speculative_config.num_speculative_tokens
             if (
                 torch.cuda.get_device_capability() in ((10, 0), (10, 3))
+                and self.head_size in (64, 96, 128, 256)
                 and self.num_queries_per_kv * verify_query_len <= 32
             ):
                 self.verify_query_len = verify_query_len
