@@ -82,9 +82,13 @@ def paged_varlen_attention_out(
             causal=window_size == (-1, 0),
             window_size_left=None if window_left == -1 else window_left,
             window_size_right=None if window_right == -1 else window_right,
-            # 0: FA4 picks the KV splits; 1: no splits, deterministic. Batch-invariant mode
-            # never gets here: VLLMEngine rejects it with an fp8 KV cache.
-            num_splits=1 if torch.are_deterministic_algorithms_enabled() else 0,
+            # 0: FA4 picks the KV splits; 1: no splits, deterministic.
+            num_splits=(
+                1
+                if is_in_batch_invariant_mode()
+                or torch.are_deterministic_algorithms_enabled()
+                else 0
+            ),
             return_lse=return_lse,
             out=out,
             scales=TensorwiseScales(*descales),

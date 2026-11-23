@@ -114,10 +114,10 @@ class TorchTitanVarlenInnerAttentionBackend(_FA4PageSize, FlashAttentionBackend)
         use_mm_prefix: bool,
         device_capability: DeviceCapability,
     ) -> str | None:
-        # vLLM checks an fp8 KV cache against its own FlashAttention build, which has no fp8
-        # kernel at head dim 256. This backend runs fp8 on FA4's fp8 forward, which needs SM100.
-        # TODO: drop this fp8 rule once vLLM asks the backend's own kernel whether it takes fp8;
-        # `FlashAttentionBackend.supports_combination` asks vLLM's FlashAttention build.
+        # The parent's fp8 check is about vLLM's own FlashAttention kernel, which has no fp8
+        # kernel at head dim 256. This backend runs FA4's fp8 forward, which needs SM100.
+        # TODO: stop hiding fp8 from the parent's check if this backend stops subclassing
+        # FlashAttentionBackend (kept for its metadata builder); keep the SM100 check.
         if kv_cache_dtype is not None and is_quantized_kv_cache(kv_cache_dtype):
             if device_capability.major != 10:
                 return (
@@ -203,9 +203,9 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
         *args,
         **kwargs,
     ) -> None:
-        # FlashAttentionImpl.__init__ applies the fp8 rule that
-        # TorchTitanVarlenInnerAttentionBackend.supports_combination replaces, so pass "auto".
-        # TODO: drop together with that rule (see its TODO).
+        # FlashAttentionImpl.__init__ applies the parent backend's fp8 check, which
+        # TorchTitanVarlenInnerAttentionBackend.supports_combination bypasses, so pass "auto".
+        # TODO: drop together with that bypass (see its TODO).
         super().__init__(
             num_heads,
             head_size,
@@ -530,9 +530,9 @@ class VLLMInnerAttention(InnerAttention):
                 scale=scale,
                 num_kv_heads=num_kv_heads,
                 cache_config=cache_config,
-                # TODO: an fp8 KV cache keeps vLLM's default scales of 1.0. Calibrated per-layer
-                # k/v scales could cut its e4m3 rounding error (trainer-vs-generator k3 KL
-                # 3.7e-3 vs 1.0e-3 in bf16, Qwen3.8-27B on GB300). Nothing loads them yet.
+                # TODO: an fp8 KV cache keeps vLLM's default scales of 1.0, so q, K and V values
+                # above 448 clip and values below 2^-6 lose precision. Calibrated per-layer scales
+                # would fix only those (not FA4's e4m3 rounding of P); the gain is not measured.
                 quant_config=None,
                 per_layer_sliding_window=config.sliding_window_size,
                 prefix=f"model.layers.{layer_id}.attention.inner_attention",
