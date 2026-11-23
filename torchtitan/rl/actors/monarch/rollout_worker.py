@@ -109,7 +109,7 @@ class RolloutWorkerActor(Actor):
         # "Rollout worker metrics" in `torchtitan/rl/observability/metrics/README.md`.
         #   Since its previous training group: event_loop_lag_ms, event_loop_lag_ms_per_s,
         #   executor_queue_wait_ms, num_executor_jobs_in_flight, gc_pause_ms.
-        #   Read now: rss_gib, pss_gib.
+        #   Read now: rss_gib, pss_gib, host_memory_available_gib.
         # The controller ignores the metrics of validation groups (negative ids), so what is measured
         # during validation goes with this worker's next training group.
         if group_id >= 0:
@@ -119,13 +119,17 @@ class RolloutWorkerActor(Actor):
                 *self._gc_pause.flush(),
                 m.Metric(
                     "rollout_worker/rss_gib",
-                    m.Max(_read_proc_kib("/proc/self/status", "VmRSS") / 2**20),
+                    m.Max(m.read_proc_kib("/proc/self/status", "VmRSS") / 2**20),
                 ),
                 # Reading Pss walks the page tables on the event loop: ~0.6 ms per training group with
                 # 64 KiB pages, more with 4 KiB pages.
                 m.Metric(
                     "rollout_worker/pss_gib",
-                    m.Max(_read_proc_kib("/proc/self/smaps_rollup", "Pss") / 2**20),
+                    m.Max(m.read_proc_kib("/proc/self/smaps_rollup", "Pss") / 2**20),
+                ),
+                m.Metric(
+                    "rollout_worker/host_memory_available_gib",
+                    m.Min(m.host_memory_available_gib()),
                 ),
             ]
         return group
@@ -148,15 +152,3 @@ class RolloutWorkerActor(Actor):
     @concurrent_endpoint
     async def sync_log_step(self, step: int) -> None:
         sl.set_step(step)
-
-
-def _read_proc_kib(path: str, field: str) -> int:
-    """Return the kB value of one field of a Linux /proc file.
-
-    Example: the line "VmRSS:  1745628 kB" in /proc/self/status -> 1745628.
-    """
-    with open(path) as proc_file:
-        for line in proc_file:
-            if line.startswith(f"{field}:"):
-                return int(line.split()[1])
-    raise RuntimeError(f"{path} has no {field} line")

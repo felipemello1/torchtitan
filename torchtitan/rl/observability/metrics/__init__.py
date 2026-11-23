@@ -9,6 +9,7 @@
 from .console import log_to_console
 from .executor_queue_wait import QueueWaitThreadPoolExecutor
 from .gc_pause import GcPause
+from .host_memory import host_memory_available_gib, read_proc_kib
 from .loop_lag import EventLoopLag
 from .processor import MetricBackend, MetricsProcessor
 from .types import (
@@ -29,6 +30,7 @@ __all__ = [
     "EventLoopLag",
     "fold",
     "GcPause",
+    "host_memory_available_gib",
     "Max",
     "Mean",
     "Metric",
@@ -38,6 +40,7 @@ __all__ = [
     "Min",
     "NoReduce",
     "QueueWaitThreadPoolExecutor",
+    "read_proc_kib",
     "Std",
     "Sum",
     "SummaryStats",

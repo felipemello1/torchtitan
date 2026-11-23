@@ -193,6 +193,17 @@ groups (`/max`), except for `_per_s` (`/mean`).
   host's workers, PSS is their real memory there. So this value x the workers on a host is an upper
   bound: check it against the host's free memory.
 
+## Host memory metrics
+
+W&B's system metrics cover only the host of the process that logs to W&B. Each role that can run on
+its own host reports the memory its host can still give out (/proc/meminfo `MemAvailable`, GiB):
+
+- `rollout_worker/host_memory_available_gib/min`: the rollout workers' host, the controller's.
+- `generator/host_memory_available_gib/min`: the smallest over the generators' hosts.
+- `trainer/host_memory_available_gib`: the smallest over the trainer's hosts.
+
+Falling toward 0: a host is near its limit, and the kernel may soon kill a process.
+
 ## vLLM engine metrics
 
 `VllmOtelStatLogger` exports engine-level rollout metrics through
