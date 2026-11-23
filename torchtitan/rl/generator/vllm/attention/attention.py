@@ -38,7 +38,10 @@ from torchtitan.models.base.module import Module
 from torchtitan.models.base.sharding import ShardingConfig
 from torchtitan.models.common.attention import InnerAttention
 from torchtitan.models.common.decoder_sharding import dense_param_placement
-from torchtitan.rl.generator.attention.attention import paged_varlen_attention_out
+from torchtitan.rl.generator.attention.attention import (
+    fa4_takes_query_len_in_heads,
+    paged_varlen_attention_out,
+)
 from torchtitan.tools.utils import (
     activate_cuda_flash_attention_impl,
     get_cuda_flash_attention_impl,
@@ -456,6 +459,8 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
             merge                        logsumexp of the two parts
 
         With fp8 ``descales`` (q, k, v), the decode call applies them and the tail dequantizes.
+        An FA4 whose SwapAB kernel takes ``query_len_in_heads`` runs fp8 rows as one call over
+        keys 0 .. L-1 instead; the kernel hides key L-4+i from tokens before token i.
         """
         num_rows = attn_metadata.seq_lens.shape[0]
         num_tokens, num_heads, head_dim = query.shape
@@ -470,6 +475,37 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
         query_by_kv_head = query.view(
             num_rows, query_len, num_kv_heads, num_queries_per_kv, head_dim
         ).transpose(1, 2)
+        cu_seqlens_q = torch.arange(
+            num_rows + 1, device=query.device, dtype=torch.int32
+        )
+        if descales is not None and fa4_takes_query_len_in_heads():
+            out_by_kv_head = output.new_empty(
+                num_rows, num_kv_heads, query_len, num_queries_per_kv, head_dim_v
+            )
+            paged_varlen_attention_out(
+                out_by_kv_head.view(num_rows, -1, head_dim_v),
+                query_by_kv_head.reshape(num_rows, -1, head_dim),
+                key_cache,
+                value_cache,
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=1,
+                max_seqlen_k=attn_metadata.max_seq_len,
+                seqused_k=attn_metadata.seq_lens,
+                block_table=attn_metadata.block_table,
+                scale=self.scale,
+                window_size=(-1, 0),
+                enable_gqa=True,
+                return_lse=False,
+                descales=descales,
+                query_len_in_heads=query_len,
+            )
+            output.view(num_rows, query_len, num_heads, head_dim_v).copy_(
+                out_by_kv_head.transpose(1, 2).reshape(
+                    num_rows, query_len, num_heads, head_dim_v
+                )
+            )
+            return output
+
         num_shared_keys = (attn_metadata.seq_lens - (query_len - 1)).clamp_(min=0)
         shared_out = output.new_empty(
             num_rows, num_kv_heads * query_len * num_queries_per_kv, head_dim_v
@@ -479,9 +515,7 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
             query_by_kv_head.reshape(num_rows, -1, head_dim),
             key_cache,
             value_cache,
-            cu_seqlens_q=torch.arange(
-                num_rows + 1, device=query.device, dtype=torch.int32
-            ),
+            cu_seqlens_q=cu_seqlens_q,
             max_seqlen_q=1,
             max_seqlen_k=attn_metadata.max_seq_len,
             seqused_k=num_shared_keys,
