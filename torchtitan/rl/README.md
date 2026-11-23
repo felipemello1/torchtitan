@@ -49,6 +49,9 @@ Geometry3K (`rl_grpo_qwen3_5_0_8b_geometry3k`) and Muse Spark 816B-A42B on SLAKE
 | Kimi K2.7 | Not supported |
 | Kimi K3 | ✅ Supported (SM90+) |
 
+Kimi K3's HF tokenizer runs code from its model repo, so `torchtitan.rl.generate` on Kimi K3 needs
+`extra_engine_args={"trust_remote_code": True}` in the recipe's `VLLMEngine.Config`. RL training doesn't load that tokenizer.
+
 ## Architecture
 
 ![TitanRL async rollout pipeline](../../assets/images/rl_async_rollout_pipeline.png)
