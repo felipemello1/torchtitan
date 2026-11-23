@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""FA4's fp8 paged attention (``paged_varlen_attention_out`` with descales) vs bf16 FA4."""
+"""FA4's fp8 paged attention (`paged_varlen_attention_out` with descales) vs bf16 FA4."""
 
 import pytest
 import torch
@@ -35,7 +35,7 @@ def test_fp8_matches_bf16_on_the_same_e4m3_values(q_scale, k_scale, v_scale):
     device = "cuda"
     contexts = [700, 1500, 1100]
     cu_seqlens_q = torch.tensor([0, 1, 2, 302], dtype=torch.int32, device=device)
-    pages_per_seq = [(c + PAGE - 1) // PAGE for c in contexts]
+    pages_per_seq = [(context + PAGE - 1) // PAGE for context in contexts]
     block_table = torch.zeros(
         len(contexts), max(pages_per_seq), dtype=torch.int32, device=device
     )

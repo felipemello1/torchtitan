@@ -58,8 +58,10 @@ def paged_varlen_attention_out(
         The written ``out[:num_tokens]``, and the logsumexp with ``return_lse``.
     """
     if descales is not None:
-        # torch's varlen attention takes only fp16/bf16, so fp8 inputs go to FA4's forward
-        # directly, with the arguments torch's FA4 bridge passes (torch/nn/attention/_fa4.py).
+        # TODO: call torch's varlen attention once it takes fp8 inputs with descales. Until then,
+        # fp8 calls FA4's private `_flash_attn_fwd` with the arguments torch's FA4 bridge passes
+        # (torch/nn/attention/_fa4.py). FA4's public `flash_attn_varlen_func` takes descales
+        # but has no `out=` to write into vLLM's output buffer.
         # TODO: FA4's SwapAB decode kernel takes only fp16/bf16 (SwapABPolicy.rejection in
         # flash_attn/cute/config.py), so fp8 decode runs FA4's standard kernel. On GB300 that is
         # 1.5x faster than bf16 SwapAB on unique contexts, but 1.2x slower when requests share
@@ -67,9 +69,6 @@ def paged_varlen_attention_out(
         from flash_attn.cute.interface import _flash_attn_fwd, TensorwiseScales
 
         window_left, window_right = window_size
-        split_kv = not (
-            is_in_batch_invariant_mode() or torch.are_deterministic_algorithms_enabled()
-        )
         out, lse, *_ = _flash_attn_fwd(
             query,
             key_cache,
@@ -83,8 +82,9 @@ def paged_varlen_attention_out(
             causal=window_size == (-1, 0),
             window_size_left=None if window_left == -1 else window_left,
             window_size_right=None if window_right == -1 else window_right,
-            # 0: FA4 picks the KV splits; 1: no splits, deterministic.
-            num_splits=0 if split_kv else 1,
+            # 0: FA4 picks the KV splits; 1: no splits, deterministic. Batch-invariant mode
+            # never gets here: VLLMEngine rejects it with an fp8 KV cache.
+            num_splits=1 if torch.are_deterministic_algorithms_enabled() else 0,
             return_lse=return_lse,
             out=out,
             scales=TensorwiseScales(*descales),
