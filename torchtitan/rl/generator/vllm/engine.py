@@ -212,13 +212,14 @@ class VLLMEngine(GenerationEngine):
             "fp8"    e4m3 with scale 1; the query is quantized to e4m3 too, and attention
                      runs FA4's fp8 forward (SM100 family only)
 
-        fp8 vs auto, Qwen3.8-27B (hybrid attention + GDN) on one GB300:
-
-            KV tokens that fit                          5.6M vs 2.8M
-            output tok/s, 32 sessions at 27k-135k       1,043 vs 902
-            output tok/s, 26 sessions sharing prompts   857 vs 892 (see `paged_varlen_attention_out`)
-            trainer-vs-generator logprob mean abs diff  0.022 vs 0.0096 (temperature 1)
-            KV block, the prefix-cache reuse unit       1,664 vs 896 tokens
+        Pick "fp8" when the KV cache fills or contexts are long and mostly unique: twice the
+        tokens fit, and decode reads half the bytes. Keep "auto" when many requests share long
+        prompts, where fp8 decode can be slower (see `paged_varlen_attention_out`), or when the
+        generator must stay as close to the trainer as possible.
+        Cost on Qwen3.8-27B, GB300, temperature 1, fp8 vs auto: `loss/mismatch_kl/mean` at
+        policy age 0 3.7e-3 vs 1.0e-3; tokens outside an IcePop ratio mask of (0.2, 5)
+        5.5e-4 vs 1.1e-4. A hybrid model's KV block grows (896 -> 1,664 tokens), so
+        prefix-cache hits land on coarser boundaries.
         """
 
         kv_transfer_config: KVTransferConfig | None = None
@@ -348,6 +349,12 @@ class VLLMEngine(GenerationEngine):
             raise ValueError(
                 "session_kv_holder needs reset_kv_cache_on_model_state_dict_load=False: vLLM "
                 "cannot reset the prefix cache while blocks are held"
+            )
+        if debug.batch_invariant and config.kv_cache_dtype != "auto":
+            raise ValueError(
+                f"debug.batch_invariant needs kv_cache_dtype='auto', got "
+                f"{config.kv_cache_dtype!r}: fp8 attention runs FA4's fp8 forward, which the "
+                "trainer does not run, so generator logprobs can't match the trainer's bitwise"
             )
         validate_ep_token_dispatchers(
             model,
@@ -516,8 +523,8 @@ class VLLMEngine(GenerationEngine):
         engine_kwargs["watermark"] = self.config.watermark
         # TODO: fp8 grows a hybrid model's KV block (Qwen3.8-27B: 896 -> 1,664 tokens), and a
         # prefix-cache hit ends on a block boundary, so each agent turn recomputes ~400 more
-        # prompt tokens (GB300, 2,053 vs 1,679). Untested: vLLM's `prefix_match_unit` or a
-        # smaller `mamba_block_size`.
+        # prompt tokens (GB300: 2,053 vs 1,679 per turn). Not measured: whether vLLM's
+        # `prefix_match_unit` or a smaller `mamba_block_size` wins them back.
         engine_kwargs["kv_cache_dtype"] = self.config.kv_cache_dtype
         # Smaller `priority` runs first and is preempted last; we pass `EngineRequest.group_id`
         # (-1 for all validation), so older groups have higher priority (see its docstring).
