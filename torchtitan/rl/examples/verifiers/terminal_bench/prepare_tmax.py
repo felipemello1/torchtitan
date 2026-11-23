@@ -43,6 +43,7 @@ Example::
 import argparse
 import glob
 import os
+import re
 import shutil
 import tarfile
 import tempfile
@@ -50,6 +51,10 @@ from dataclasses import dataclass, field
 
 
 DEFAULT_WORKDIR = "/home/user"
+# One directory name: the id becomes `<out>/<task_id>` and part of the TOML task name.
+_TASK_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+# Docker reference characters (`registry:5000/org/name:tag@sha256:<hex>`): none can end a TOML string.
+_DOCKER_IMAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/:@-]*")
 
 
 @dataclass
@@ -128,6 +133,8 @@ def convert_task(
     """Write one Harbor task directory. Returns the reason it was skipped, or None."""
     if not image:
         return "no image in env_config"
+    if not _DOCKER_IMAGE.fullmatch(image):
+        return "image is not a Docker image reference"
     instruction = os.path.join(task_dir, "instruction.md")
     tests = os.path.join(task_dir, "tests")
     if not os.path.isfile(instruction):
@@ -139,6 +146,9 @@ def convert_task(
     os.makedirs(out)
     with open(os.path.join(out, "task.toml"), "w") as f:
         f.write(task_toml(task_id, image, cpus, memory_mb, workdir))
+    # TODO: a pre-extracted `--task-data` folder skips the tarball's `filter="data"`, so an `instruction.md`
+    # that is a symlink, or a symlink under `tests/`, copies a host file into the task. Reject tasks that
+    # contain links; not done here because the tarball, the documented input, is already filtered.
     shutil.copy(instruction, os.path.join(out, "instruction.md"))
     shutil.copytree(tests, os.path.join(out, "tests"))
     return None
@@ -175,7 +185,12 @@ def convert_dataset(
                 continue
             if limit is not None and len(summary.written) >= limit:
                 break
-            if os.path.exists(os.path.join(out, task_id)):
+
+            if not isinstance(task_id, str) or not _TASK_ID.fullmatch(task_id):
+                summary.skipped[str(task_id)] = "task id is not one directory name"
+                continue
+
+            if os.path.lexists(os.path.join(out, task_id)):
                 summary.skipped[task_id] = "already converted"
                 continue
             task_dir = find_task_dir(root, task_id)
