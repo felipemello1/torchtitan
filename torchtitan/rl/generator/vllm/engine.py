@@ -33,6 +33,7 @@ from torchtitan.components.data.multimodal.vision_processor import VisionProcess
 from torchtitan.config import DebugConfig, PrecisionConfig
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.dist_moe import DistMoeRuntime
+from torchtitan.rl.generator.attention.attention import fa4_takes_query_len_in_heads
 from torchtitan.rl.generator.engine import GenerationEngine, ModelStateDictLoadMode
 from torchtitan.rl.generator.model import validate_ep_token_dispatchers
 from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
@@ -375,6 +376,21 @@ class VLLMEngine(GenerationEngine):
                 "debug.batch_invariant=False: the target verifies 1 + k tokens per step "
                 "with kernels the trainer does not run"
             )
+
+        if config.kv_cache_dtype == "fp8":
+            import flash_attn.cute
+
+            # Once per generator process: a FA4 copy earlier on PYTHONPATH replaces the venv's.
+            logger.info(f"fp8 KV cache: flash_attn.cute from {flash_attn.cute.__file__}")
+            if config.num_speculative_tokens > 0 and not fa4_takes_query_len_in_heads():
+                # Without it, fp8 verify rows fall back to a slower path (decode call + fp32 tail), on which
+                # MTP drafts were never measured: fail at start instead.
+                raise RuntimeError(
+                    f"kv_cache_dtype='fp8' with num_speculative_tokens={config.num_speculative_tokens} "
+                    "needs an FA4 whose forward takes query_len_in_heads (fp8 SwapAB verify rows), but "
+                    f"flash_attn.cute comes from {flash_attn.cute.__file__}"
+                )
+
         if config.cuda_graph.uses_breakable_cuda_graphs(config.num_speculative_tokens):
             _enable_breakable_cuda_graphs()
         if config.num_speculative_tokens > 0 and vision_processor is not None:
