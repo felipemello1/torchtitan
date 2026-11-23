@@ -80,7 +80,7 @@ before moving to Phase 2.
 ```python
 from transformers import AutoConfig, AutoModelForCausalLM
 
-config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+config = AutoConfig.from_pretrained(model_id)
 ```
 
 Record: `model_type`, `hidden_size`, `intermediate_size`,
@@ -91,7 +91,7 @@ Record: `model_type`, `hidden_size`, `intermediate_size`,
 
 ```python
 with torch.device("meta"):
-    model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_config(config)
 ```
 
 ### 1c. Find MoE layers
@@ -660,7 +660,7 @@ experts is a true blocker requiring upstream changes.
 | MoE layer attr is `feed_forward` not `mlp` | `model.py`, `moe_replacement.py` | Handle alternative attribute name |
 | Attention projection not in ShardingConfig | `hf_sharding.py` | Add case to `_set_layer_sharding_configs` using `colwise_sharding_config()`/`_replicate_sharding_config()` |
 | Model rejects `grouped_mm` | `scripts/numerical_equivalence.py` | Skip `_experts_implementation` for this model |
-| `trust_remote_code` import error | Config loading | Try without `trust_remote_code` first |
+| `model_type` unknown to transformers | Config loading | The backend builds models from installed transformers only: upgrade transformers |
 | `num_hidden_layers=1` has no MoE layer | Test config | Set `first_k_dense_replace=0` or increase layers |
 | State dict keys missing after round-trip | `state_dict_adapter.py` | Add patterns in `_build_hf_to_titan_patterns()` / `_build_titan_to_hf_patterns()` |
 | Layer-level MoE (router/experts are siblings of dense MLP) | `moe_replacement.py` | Treat dense MLP as shared expert inside the Titan MoE; replace `layer.mlp` with full MoE block containing router + experts + shared_experts(=dense MLP) |

@@ -145,7 +145,6 @@ def generate() -> None:
     engine_kwargs = dict(
         # Model configuration
         model=model_path,
-        trust_remote_code=True,
         config_format=TORCHTITAN_CONFIG_FORMAT,
         dtype=config.precision.param_dtype,
         # Parallelism configuration

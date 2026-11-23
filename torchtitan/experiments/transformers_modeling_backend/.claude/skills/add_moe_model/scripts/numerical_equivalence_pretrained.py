@@ -40,13 +40,7 @@ def test_pretrained(model_dir: str, device: torch.device, seed: int = 42) -> dic
 
     model_name = os.path.basename(model_dir)
 
-    # Try loading without trust_remote_code first; fall back if needed
-    try:
-        config = AutoConfig.from_pretrained(model_dir)
-        trust_remote = False
-    except Exception:
-        config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
-        trust_remote = True
+    config = AutoConfig.from_pretrained(model_dir)
     config._experts_implementation = "grouped_mm"
 
     print(f"  Loading {model_name} ...", flush=True)
@@ -54,7 +48,6 @@ def test_pretrained(model_dir: str, device: torch.device, seed: int = 42) -> dic
         model_dir,
         config=config,
         dtype=torch.bfloat16,
-        trust_remote_code=trust_remote,
     )
     model = model.to(device=device).eval()
 

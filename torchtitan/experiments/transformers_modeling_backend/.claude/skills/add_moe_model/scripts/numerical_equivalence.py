@@ -248,16 +248,14 @@ def _create_hf_model(model_type: str):
         config = AutoConfig.for_model(**kwargs)
     elif model_type in _PRETRAINED_MODEL_CONFIGS:
         entry = _PRETRAINED_MODEL_CONFIGS[model_type]
-        config = AutoConfig.from_pretrained(
-            entry["hf_model_id"], trust_remote_code=True
-        )
+        config = AutoConfig.from_pretrained(entry["hf_model_id"])
         for k, v in entry["overrides"].items():
             setattr(config, k, v)
     else:
         raise ValueError(f"Unknown model type: {model_type}")
 
     config._experts_implementation = "grouped_mm"
-    model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_config(config)
     return model, config
 
 

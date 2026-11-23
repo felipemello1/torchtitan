@@ -222,7 +222,6 @@ def build_inference_engine(config: Controller.Config) -> LLMEngine:
     enable_ep = gen_config.parallelism.expert_parallel_degree > 1
     engine_kwargs = dict(
         model=config.hf_assets_path,
-        trust_remote_code=True,
         # Build the model config from torchtitan's model config via the custom
         # parser registered by register_to_vllm, instead of reading config.json.
         config_format=TORCHTITAN_CONFIG_FORMAT,
