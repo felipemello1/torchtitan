@@ -22,8 +22,11 @@ class SamplingConfig:
     """Sampling temperature. 0.0 = greedy, higher = more random."""
 
     top_p: float = 1.0
-    """Nucleus sampling threshold. Must be 1.0: the trainer scores tokens over the full vocabulary,
-    so sampling from a truncated nucleus would bias the gradient."""
+    """Nucleus sampling threshold. 1.0 for a request the trainer scores (`scored_by_trainer`): it scores
+    tokens over the full vocabulary, so sampling from a truncated nucleus would bias the gradient."""
+
+    top_k: int = -1
+    """Sample from the k most likely tokens only; -1: all tokens. -1 for a request the trainer scores."""
 
     max_tokens: int = 100
     """Maximum number of tokens to generate per completion."""
@@ -37,14 +40,19 @@ class SamplingConfig:
     generation time: these are the only ids that end a request (the engine's EOS stops
     are off)."""
 
+    scored_by_trainer: bool = True
+    """Whether the trainer scores this request's tokens. Validation requests are not scored, so
+    they may sample with top_p < 1 and top_k."""
+
     def __post_init__(self) -> None:
-        # TODO(mask-replay): to allow top_p < 1, turn on vLLM's `return_sampling_mask` (needs a vLLM
+        # TODO(mask-replay): to train on top_p < 1, turn on vLLM's `return_sampling_mask` (needs a vLLM
         # upgrade, the V2 model runner, top_k > 0 and processed logprobs), carry each token's kept
         # ids next to generator_logprobs, and take the trainer's logsumexp of logits / T over them.
-        if self.top_p < 1.0:
+        if self.scored_by_trainer and (self.top_p < 1.0 or self.top_k != -1):
             raise ValueError(
-                f"top_p must be 1.0, got {self.top_p}: the trainer computes logprobs "
-                "over the full vocabulary."
+                f"top_p must be 1.0 and top_k -1 (no filter) for a request the trainer scores, got "
+                f"top_p={self.top_p}, top_k={self.top_k}: the trainer computes logprobs over the "
+                "full vocabulary."
             )
 
 
