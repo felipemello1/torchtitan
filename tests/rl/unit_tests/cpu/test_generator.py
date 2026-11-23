@@ -18,9 +18,10 @@ import copy
 import inspect
 import json
 import os
+import sys
 from contextlib import nullcontext
 from dataclasses import replace
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -845,12 +846,24 @@ def test_batch_invariant_rejects_fp8_kv_cache(tmp_path):
         )
 
 
-def test_fp8_kv_with_drafts_rejects_an_fa4_without_query_len_in_heads(tmp_path, monkeypatch):
+def test_fp8_kv_with_drafts_rejects_an_fa4_without_query_len_in_heads(
+    tmp_path, monkeypatch
+):
+    # Fake FA4 modules: the RL CPU CI installs no FA4, and the check imports `flash_attn.cute` for its path.
+    fake_cute = ModuleType("flash_attn.cute")
+    fake_cute.__file__ = "/venv/flash_attn/cute/__init__.py"
+    fake_flash_attn = ModuleType("flash_attn")
+    fake_flash_attn.cute = fake_cute
+    monkeypatch.setitem(sys.modules, "flash_attn", fake_flash_attn)
+    monkeypatch.setitem(sys.modules, "flash_attn.cute", fake_cute)
     monkeypatch.setattr(
-        "torchtitan.rl.generator.vllm.engine.fa4_takes_query_len_in_heads", lambda: False
+        "torchtitan.rl.generator.vllm.engine.fa4_takes_query_len_in_heads",
+        lambda: False,
     )
 
-    with pytest.raises(RuntimeError, match="query_len_in_heads"):
+    with pytest.raises(
+        RuntimeError, match="query_len_in_heads.*from /venv/flash_attn/cute/__init__.py"
+    ):
         VLLMEngine.Config(kv_cache_dtype="fp8", num_speculative_tokens=3).build(
             model=_MODEL_CONFIG,
             parallelism=_PARALLELISM,

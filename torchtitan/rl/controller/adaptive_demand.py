@@ -142,7 +142,8 @@ class StallDrivenDemand:
         # Record what this step start looked like
         # TODO: with demand above the buffer's `generation_capacity`, `demand - ready` also counts slots no loop can
         # fill, so a generation-bound stall raises the demand to the age ceiling, and it then falls one group per step.
-        # Record the active groups (generating + the batch in training) minus `ready` instead; tt#222's own PR.
+        # Record `active - ready` instead: the groups generating plus the batch in training. Its own PR, a follow-up
+        # to felipemello1/torchtitan#222.
         self._unavailable.append(max(0, self.demand - ready))
         self._generating.append(generating)
         self._completed.append(completed)
