@@ -151,7 +151,8 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
             # GDNAttentionMetadataBuilder (or a subclass), which the speculative path reads.
             # TODO: a TorchTitanLinearAttentionMetadataBuilder subclass of it that stages
             # verify rows in fixed buffers would give steps with prefill FULL graphs, not
-            # piecewise ones (VLLMCudaGraphConfig): up to +13% tok/s on Qwen3.8-27B (GB300).
+            # piecewise ones (VLLMCudaGraphConfig): up to +13% tok/s at a prefill-heavy load
+            # (Qwen3.8-27B, 26 multi-turn sessions, GB300).
             # Not done yet for size: the staging and its graph-vs-eager tests, ~2 days.
             # TODO: vLLM's GDN builder has no update_block_table with drafts, so it builds
             # once per GDN cache group (3 on Qwen3.8-27B, ~1.3 ms of CPU each). A subclass

@@ -13,13 +13,13 @@ import torch
 from torchtitan.rl.generator.vllm.attention.attention import (
     TorchTitanVarlenInnerAttentionImpl,
 )
-from torchtitan.tools.utils import has_cuda_capability
 from vllm.config import set_current_vllm_config, VllmConfig
 from vllm.forward_context import ForwardContext, override_forward_context
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not has_cuda_capability(10, 0),
-    reason="FA4 decode kernel requires SM100",
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="FA4's SwapAB decode kernel runs on SM100/SM103 only",
 )
 
 
