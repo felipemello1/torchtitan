@@ -44,9 +44,12 @@ class VLLMCudaGraphConfig:
 
     - ``"NONE"``: disable compilation and CUDA graph capture.
     - ``"FULL_DECODE_ONLY"``: graph pure-decode batches; prefill / mixed
-      batches run eager. Cheap (no inductor compile).
+      batches run eager. Cheap (no inductor compile). With MTP drafts, the
+      drafter runs eagerly too.
     - ``"FULL"`` (default): graph the whole forward, prefill included, attention
-      captured too.
+      captured too. With MTP drafts, steps that carry prefill replay piecewise
+      graphs instead: attention and GDN run eagerly between graph pieces (see
+      ``get_vllm_compilation_config``).
     """
 
     capture_sizes: list[int] | None = None
@@ -73,13 +76,16 @@ class VLLMCudaGraphConfig:
         expert_sequence_parallel_size: int,
         enable_sequence_parallel: bool,
         max_num_batched_tokens: int | None = None,
+        num_speculative_tokens: int,
     ) -> CompilationConfig:
         """Build a vLLM ``CompilationConfig`` for the generator.
 
         When ``capture_sizes`` is set, those exact sizes are captured. Otherwise
         sizes come from ``_default_capture_sizes``, whose largest size is the cap.
-        The cap is ``max_num_seqs`` for ``FULL_DECODE_ONLY`` (decode batch ==
-        num_seqs). ``FULL`` also graphs prefill, whose per-step token count is
+        The cap is the largest decode step for ``FULL_DECODE_ONLY``: ``max_num_seqs``
+        tokens, or ``max_num_seqs * (1 + k)`` when each sequence verifies
+        k = ``num_speculative_tokens`` drafts (vLLM then rounds sizes up to multiples of
+        1 + k). ``FULL`` also graphs prefill, whose per-step token count is
         bounded by ``max_num_batched_tokens`` (the configured value, else
         ``_DEFAULT_MAX_NUM_BATCHED_TOKENS``), so the cap extends to it -- otherwise
         prefill chunks larger than the cap fall back to eager. A step holds at most
@@ -102,6 +108,15 @@ class VLLMCudaGraphConfig:
 
         All modes capture with ``mode=CompilationMode.NONE`` to avoid nesting
         vLLM's Inductor compile with TorchTitan local compile.
+
+        ``FULL`` with drafts (k > 0) becomes vLLM's ``FULL_AND_PIECEWISE``, on breakable
+        CUDA graphs (``uses_breakable_cuda_graphs``; ``VLLMEngine`` turns them on):
+
+            verify-only step (every row 1 + k tokens)   FULL graph
+            step with prefill, and the MTP drafter      piecewise graph, attention and GDN eager
+
+        Steps with prefill stay piecewise: vLLM's GDN metadata builder graphs only uniform
+        verify steps (TODO at ``VLLMInnerGDN.get_attn_backend``).
         """
         if self.mode == "NONE":
             return CompilationConfig(
@@ -123,7 +138,9 @@ class VLLMCudaGraphConfig:
             _max_cuda_graph_capture_size = max_num_batched_tokens
         else:
             _max_cuda_graph_capture_size = _DEFAULT_MAX_NUM_BATCHED_TOKENS
-        cap = max_num_seqs
+        # Tokens in a full decode step: one per sequence, 1 + k when verifying k drafts.
+        max_decode_tokens = max_num_seqs * (1 + num_speculative_tokens)
+        cap = max_decode_tokens
         max_step_tokens = max_num_seqs * max_model_len
         if self.mode == "FULL":
             cap = min(max(cap, _max_cuda_graph_capture_size), max_step_tokens)
@@ -140,7 +157,7 @@ class VLLMCudaGraphConfig:
                 )
             sizes = sorted(set(self.capture_sizes))
         else:
-            sizes = _default_capture_sizes(cap, max_num_seqs)
+            sizes = _default_capture_sizes(cap, max_decode_tokens)
 
         if expert_sequence_parallel_size > 1:
             removed_sizes = [
@@ -163,7 +180,11 @@ class VLLMCudaGraphConfig:
                 )
 
         return CompilationConfig(
-            cudagraph_mode=self.mode,
+            cudagraph_mode=(
+                "FULL_AND_PIECEWISE"
+                if self.uses_breakable_cuda_graphs(num_speculative_tokens)
+                else self.mode
+            ),
             mode=CompilationMode.NONE,
             cudagraph_capture_sizes=sizes,
             pass_config=PassConfig(
@@ -172,8 +193,13 @@ class VLLMCudaGraphConfig:
             ),
         )
 
+    def uses_breakable_cuda_graphs(self, num_speculative_tokens: int) -> bool:
+        """``FULL`` with MTP drafts: piecewise graphs on vLLM's breakable CUDA graphs for
+        steps with prefill (see ``get_vllm_compilation_config``)."""
+        return self.mode == "FULL" and num_speculative_tokens > 0
 
-def _default_capture_sizes(cap: int, max_num_seqs: int) -> list[int]:
+
+def _default_capture_sizes(cap: int, max_decode_tokens: int) -> list[int]:
     """CUDA graph sizes up to ``cap``. vLLM pads each step up to the next size.
 
     Up to 1024 this copies vLLM's default ladder (``VllmConfig._set_cudagraph_sizes`` in
@@ -182,21 +208,22 @@ def _default_capture_sizes(cap: int, max_num_seqs: int) -> list[int]:
 
     1 2 4
     8 16 24 ... 248     +8      vLLM's spacing: 34 sequences pad to 40, not 64
-    256 272 ... 1024    +16     goes on to max_num_seqs when it is above 1024
+    256 272 ... 1024    +16     goes on to max_decode_tokens when it is above 1024
     1536 ... 4096       +512    prefill chunks: only FULL's cap reaches these sizes
     6144 ... cap        +2048
-    max_num_seqs, cap   exact sizes: a full decode batch, the largest chunk
+    max_decode_tokens, cap   exact sizes: a full decode step, the largest chunk
     """
-    dense_limit = max(1024, max_num_seqs)
+    dense_limit = max(1024, max_decode_tokens)
     sizes = {
         *[1, 2, 4],
         *range(8, 256, 8),
         *range(256, dense_limit + 1, 16),
         *range(1536, 4097, 512),
         *range(6144, cap + 1, 2048),
-        # FULL decode graphs (GDN/KDA and FA4 decode kernels) stop at max_num_seqs. Without this
-        # size, at max_num_seqs=230 a batch of 225-230 pads to 232 and replays the mixed graph.
-        max_num_seqs,
+        # FULL decode graphs (GDN/KDA and FA4 decode kernels) stop at a full decode step.
+        # Without this size, at max_decode_tokens=230 a step of 225-230 tokens pads to 232
+        # and replays the mixed graph.
+        max_decode_tokens,
         cap,
     }
     return sorted(size for size in sizes if size <= cap)

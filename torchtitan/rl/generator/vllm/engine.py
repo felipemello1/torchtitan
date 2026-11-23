@@ -86,6 +86,7 @@ def add_extra_vllm_engine_args(
         "kv_transfer_config": "VLLMEngine.Config.kv_transfer_config",
         "seed": "Generator.Config.debug.seed",
         "watermark": "VLLMEngine.Config.watermark",
+        "speculative_config": "VLLMEngine.Config.num_speculative_tokens",
     }
     owned_keys = sorted(
         extra_engine_args.keys()
@@ -137,6 +138,27 @@ def _use_mooncake_master(address: str) -> None:
     with os.fdopen(fd, "w") as f:
         json.dump(store_config, f)
     os.environ["MOONCAKE_CONFIG_PATH"] = path
+
+
+def _enable_breakable_cuda_graphs() -> None:
+    """Turn on vLLM's breakable CUDA graphs: piecewise graphs that run attention eagerly.
+
+    vLLM makes its attention op a graph break when it imports the op, and only if this
+    variable is set then. Raises if the op was imported before.
+    """
+    os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
+    from vllm.compilation import breakable_cudagraph
+    from vllm.model_executor.layers.attention import attention as vllm_attention
+
+    attention_op = vllm_attention.unified_attention_with_output
+    # The wrapper that `eager_break_during_capture` returns is defined in breakable_cudagraph.py.
+    # If vLLM moves it, this check raises on a wrapped op.
+    if attention_op.__code__.co_filename != breakable_cudagraph.__file__:
+        raise RuntimeError(
+            "num_speculative_tokens > 0 with cuda_graph.mode='FULL' needs vLLM's attention "
+            "op to be a graph break, but vLLM imported it before VLLM_USE_BREAKABLE_CUDAGRAPH "
+            "was set: set VLLM_USE_BREAKABLE_CUDAGRAPH=1 at process start"
+        )
 
 
 class VLLMEngine(GenerationEngine):
@@ -228,7 +250,12 @@ class VLLMEngine(GenerationEngine):
                 "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False",
             }
 
-        def __post_init__(self):
+        def __post_init__(self) -> None:
+            GenerationEngine.Config.__post_init__(self)
+            if self.num_speculative_tokens < 0:
+                raise ValueError(
+                    f"num_speculative_tokens must be >= 0, got {self.num_speculative_tokens}"
+                )
             if self.kv_transfer_config is None:
                 return
             # TODO(acisseJZhong): support prefill/decode disaggregation connectors
@@ -273,6 +300,22 @@ class VLLMEngine(GenerationEngine):
                         "TorchTitan derives lookup_rpc_port for each generator; "
                         "do not set it in kv_connector_extra_config."
                     )
+
+        num_speculative_tokens: int = 0
+        """Tokens the checkpoint's MTP head drafts per decode step; 0: off. The target
+        verifies them with rejection sampling, so the output follows the target's
+        distribution and the logprobs are the target's. Example: 3 emits 1 to 4 tokens
+        per step.
+
+        - Drafts: Qwen3.5-architecture MTP heads (vLLM's `Qwen3_5MTP`); others raise.
+        - Weights: the draft shares the target's embedding and lm_head storage, so it sees
+          their updates. Its own layers (`mtp.*`) keep the checkpoint's weights, so
+          acceptance can fall as the policy drifts.
+        - With `session_kv_holder`, prefix hits keep the last block that vLLM drops by
+          default for drafts (see `_build_engine_args`).
+        - With `cuda_graph.mode="FULL"`, steps with prefill replay piecewise graphs
+          (`VLLMCudaGraphConfig.mode`).
+        - Not supported with `debug.batch_invariant` or models with a vision encoder."""
 
     def __init__(
         self,
@@ -324,6 +367,22 @@ class VLLMEngine(GenerationEngine):
                 f"debug.batch_invariant needs kv_cache_dtype='auto', got "
                 f"{config.kv_cache_dtype!r}: fp8 attention runs FA4's fp8 forward, which the "
                 "trainer does not run, so generator logprobs can't match the trainer's bitwise"
+            )
+        if config.num_speculative_tokens > 0 and debug.batch_invariant:
+            # TODO: support it once the verify step runs the trainer's kernels.
+            raise ValueError(
+                f"num_speculative_tokens={config.num_speculative_tokens} needs "
+                "debug.batch_invariant=False: the target verifies 1 + k tokens per step "
+                "with kernels the trainer does not run"
+            )
+        if config.cuda_graph.uses_breakable_cuda_graphs(config.num_speculative_tokens):
+            _enable_breakable_cuda_graphs()
+        if config.num_speculative_tokens > 0 and vision_processor is not None:
+            # TODO: vLLM's drafter reads the image token id from the target's config
+            # (SpecDecodeBaseProposer.load_model); support vision models once tested.
+            raise ValueError(
+                f"num_speculative_tokens={config.num_speculative_tokens} does not "
+                "support models with a vision encoder yet"
             )
         validate_ep_token_dispatchers(
             model,
@@ -444,6 +503,7 @@ class VLLMEngine(GenerationEngine):
         """Build the vLLM ``EngineArgs`` (see ``GenerationEngine`` for the arguments;
         ``serves_images``: the engine has a vision processor)."""
         enable_ep = parallelism.expert_parallel_degree > 1
+        attention_backend = vllm_attention_backend(model)
         engine_kwargs = dict(
             # ``model`` is the path to the HF checkpoint directory. The
             # config is sourced from TorchTitan's model config via
@@ -471,7 +531,7 @@ class VLLMEngine(GenerationEngine):
             distributed_executor_backend="external_launcher",
             gpu_memory_utilization=gpu_memory_limit,
             enforce_eager=self.config.cuda_graph.mode == "NONE",
-            attention_config=AttentionConfig(backend=vllm_attention_backend(model)),
+            attention_config=AttentionConfig(backend=attention_backend),
             # Enables RequestOutput.metrics, so generator metrics can be returned
             disable_log_stats=False,
             enable_cumem_allocator=False,
@@ -535,12 +595,34 @@ class VLLMEngine(GenerationEngine):
         # FA2 requires block_size to be a multiple of 256
         if not has_cuda_capability(9, 0):
             engine_kwargs["block_size"] = 256
+        if self.config.num_speculative_tokens > 0:
+            engine_kwargs["speculative_config"] = {
+                "method": "mtp",
+                "num_speculative_tokens": self.config.num_speculative_tokens,
+                # The draft's attention layer must take the target's page size. vLLM's
+                # own pick (FlashInfer) has no block size in common with CUSTOM's
+                # 128-token pages (FA4 on SM100).
+                "attention_backend": attention_backend,
+            }
+
+            if self.config.session_kv_holder is not None:
+                # The holder needs the next turn's hit to reach the blocks it holds, but with drafts
+                # vLLM drops each hit's last block: the draft's KV at a block's last token came from
+                # the next token, which another sequence may not share. Keeping the block can lower
+                # acceptance, never change the target's distribution.
+                # TODO: at the first vLLM pin past vllm-project/vllm#66234 (it removes the drop and this
+                # key), delete the key and the holder's check, re-run the held-hit GPU check, and build
+                # the holder test's manager with num_hash_lookahead_tokens=1. Not before: on vLLM
+                # 0.33/0.34 the key also keeps lookahead block hashes (vllm-project/vllm#61589) off, the
+                # mode tested here.
+                engine_kwargs["speculative_config"]["disable_eagle_block_drop"] = True
         vllm_compilation_config = self.config.cuda_graph.get_vllm_compilation_config(
             max_num_seqs=max_num_seqs,
             max_model_len=model.max_context_length,
             max_num_batched_tokens=max_num_batched_tokens,
             expert_sequence_parallel_size=parallelism.expert_sequence_parallel_size,
             enable_sequence_parallel=parallelism.enable_sequence_parallel,
+            num_speculative_tokens=self.config.num_speculative_tokens,
         )
         if vllm_compilation_config is not None:
             engine_kwargs["compilation_config"] = vllm_compilation_config
@@ -765,6 +847,9 @@ class VLLMEngine(GenerationEngine):
     ) -> None:
         """Fetch the model state dict into the model's weights one FSDP group at a time, and
         reset the KV cache (and, for image prompts, vLLM's encoder cache) when configured."""
+        # TODO: with num_speculative_tokens > 0, also load a trained MTP head (`mtp.*`)
+        # into the drafter, once Qwen3.5 has an MTP module and loss, as DeepSeek-V3's
+        # MTPDecoder does.
         self._get_model().model_state_dict_loader.load(fetch)
         if self._reset_kv_cache_on_model_state_dict_load:
             # Always reset running requests too: the only reason to reset is a strict
@@ -865,6 +950,9 @@ def _extract_request_metrics_inputs(
     For an `add_request` call, vLLM returns a RequestOutput carrying a single
     `RequestStateStats`.
     """
+    # TODO: with num_speculative_tokens > 0, add acceptance to the generator/* metrics
+    # (vLLM's ObservabilityConfig.per_request_spec_decode_metrics), so a run without
+    # stat_logger can spot a draft that accepts nothing. Needs new RequestMetricsInputs fields.
     stats = request_output.metrics
     if stats is None:
         return RequestMetricsInputs(
