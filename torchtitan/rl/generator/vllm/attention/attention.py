@@ -406,6 +406,8 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
         )
 
         # ======== The last n - 1 keys, causal among the row's tokens ========
+        # TODO: one Triton kernel for this tail and the merge. These ~15 small kernels per
+        # layer add 1.2 ms per Qwen3.8-27B verify step (26 rows, GB300), ~3% of the step.
         positions = shared_keys[:, None] + torch.arange(
             query_len - 1, device=query.device
         )

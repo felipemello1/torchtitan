@@ -157,6 +157,9 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
             # (VLLMCudaGraphConfig): vLLM's GDN builder graphs uniform decode batches only.
             # vLLM's runner passes the counts to any GDNAttentionMetadataBuilder subclass.
             # Not done yet for size: the staging and its graph-vs-eager tests, ~2 days.
+            # TODO: vLLM's GDN builder has no update_block_table with drafts, so it builds
+            # once per GDN cache group (3 on Qwen3.8-27B, ~1.3 ms of CPU each). A subclass
+            # with update_block_table would build once per step; ~1%, mixed steps only.
             return GDNAttentionBackend
         return TorchTitanLinearAttentionBackend
 
@@ -404,6 +407,9 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
         has_non_spec = metadata.num_prefills > 0 or metadata.num_decodes > 0
 
         # ======== Split the tokens into verify rows and the rest ========
+        # TODO: slices instead of index_select / index_copy_ when the verify rows come first
+        # (needs reorder_batch_threshold 1 + k and the builder's CPU masks): saves 8 copies
+        # per layer, ~17 ms of CPU per Qwen3.8-27B step with prefill (GB300, profiled).
         spec_inputs = non_spec_inputs = inputs
         if has_spec and has_non_spec:
             spec_inputs = tuple(
@@ -415,6 +421,9 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
             )
 
         # ======== Verify rows ========
+        # TODO: try vLLM's fused CUDA verify op (torch.ops._C.fused_gdn_decode_post_conv_mtp),
+        # which also applies the gated norm: 3.27 ms per Qwen3.8-27B verify step in stock vLLM
+        # vs 4.0 ms for this Triton kernel alone (GB300). Untested with this layer's layouts.
         out_spec = None
         if has_spec:
             mixed_qkv_spec, a_spec, b_spec = spec_inputs
