@@ -481,7 +481,12 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
         cu_seqlens_q = torch.arange(
             num_rows + 1, device=query.device, dtype=torch.int32
         )
-        if descales is not None and fa4_takes_query_len_in_heads():
+        # query_len_in_heads runs only on SwapAB, which a DiffKV layer's V head dim can refuse.
+        if (
+            descales is not None
+            and head_dim_v == head_dim
+            and fa4_takes_query_len_in_heads()
+        ):
             out_by_kv_head = output.new_empty(
                 num_rows, num_kv_heads, query_len, num_queries_per_kv, head_dim_v
             )
