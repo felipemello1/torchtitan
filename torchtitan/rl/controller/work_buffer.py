@@ -674,9 +674,8 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
                 self._warned_capacity_binds = True
                 logger.warning(
                     f"Rollout buffer: demand {self._demand.demand} groups > generation_capacity "
-                    f"{self._generation_capacity}, so the trainer can wait for batches. If "
-                    "generator/num_preemptions stays 0, the generators have room: raise "
-                    "async_loop.max_concurrent_rollout_groups."
+                    f"{self._generation_capacity} (async_loop.num_concurrent_rollout_groups), so at most "
+                    f"{self._generation_capacity} groups generate at once and the trainer can wait for batches."
                 )
             grew = self._demand.demand > self._max_active_rollout_groups
             self._max_active_rollout_groups = self._demand.demand
