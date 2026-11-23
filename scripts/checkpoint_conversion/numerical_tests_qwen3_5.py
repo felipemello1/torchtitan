@@ -235,7 +235,6 @@ def run_hf(model_path, hf_inputs, device):
         model_path,
         device_map=device,
         dtype=torch.float16,
-        trust_remote_code=True,
         low_cpu_mem_usage=True,
     )
     model.eval()

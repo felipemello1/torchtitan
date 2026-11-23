@@ -330,7 +330,6 @@ class VLLMEngine(GenerationEngine):
             # read), but vLLM still uses this path to locate the
             # tokenizer assets and the safetensors weight shards.
             model=model_path,
-            trust_remote_code=True,
             # Use the torchtitan custom config parser (registered by
             # register_to_vllm in _setup). It builds PretrainedConfig from
             # model config instead of reading config.json from disk.
