@@ -209,6 +209,20 @@ class TrainingSampleBuilder(Configurable):
                 m.Mean(1.0 if is_zero_std else 0.0),
             )
         )
+        # The same share, split by the reward every rollout got. The three sum to group_zero_std_frac.
+        shared_reward = rewards[0] if is_zero_std else None
+        zero_std_share_by_reward = {
+            "reward_1": shared_reward == 1.0,
+            "reward_0": shared_reward == 0.0,
+            "reward_other": is_zero_std and shared_reward not in (0.0, 1.0),
+        }
+        for name, in_share in zero_std_share_by_reward.items():
+            metrics.append(
+                m.Metric(
+                    f"rollout_reward/group_zero_std_{name}_frac",
+                    m.Mean(1.0 if in_share else 0.0),
+                )
+            )
 
         # TODO: a rollout at its mixed group's mean reward (0.5 in [1, 0, 0.5]) trains at advantage 0
         #   but still counts in the token mean. Only non-binary rewards hit this; consider dropping its tokens.
