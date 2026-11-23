@@ -20,6 +20,8 @@ Batch-invariant execution has two additional requirements:
 Decode and prefill update the paged convolution and SSM state pools directly.
 """
 
+import functools
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -142,20 +144,14 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
         if self.prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate GDN layer name: {self.prefix}")
         compilation_config.static_forward_context[self.prefix] = self
-        # With drafts, steps with prefill run vLLM's per-step GDN metadata, so under
-        # breakable CUDA graphs (VLLMCudaGraphConfig) this call runs eagerly between pieces.
-        self._forward_speculative_eager = eager_break_during_capture(
-            self._forward_speculative
-        )
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         if self.num_speculative_tokens:
             # vLLM's runner hands the accepted-token counts and draft masks only to
-            # its own GDN builder, which the speculative path reads.
-            # TODO: TorchTitanLinearAttentionMetadataBuilder staging verify rows in fixed
-            # buffers would give steps with prefill FULL graphs instead of piecewise ones
-            # (VLLMCudaGraphConfig): vLLM's GDN builder graphs uniform decode batches only.
-            # vLLM's runner passes the counts to any GDNAttentionMetadataBuilder subclass.
+            # GDNAttentionMetadataBuilder (or a subclass), which the speculative path reads.
+            # TODO: a TorchTitanLinearAttentionMetadataBuilder subclass of it that stages
+            # verify rows in fixed buffers would give steps with prefill FULL graphs, not
+            # piecewise ones (VLLMCudaGraphConfig): up to +13% tok/s on Qwen3.8-27B (GB300).
             # Not done yet for size: the staging and its graph-vs-eager tests, ~2 days.
             # TODO: vLLM's GDN builder has no update_block_table with drafts, so it builds
             # once per GDN cache group (3 on Qwen3.8-27B, ~1.3 ms of CPU each). A subclass
@@ -355,6 +351,13 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
             )
             output = torch.cat([output, padding])
         return output
+
+    @functools.cached_property
+    def _forward_speculative_eager(self) -> Callable[..., None]:
+        """``_forward_speculative`` as a graph break under vLLM's breakable CUDA graphs
+        (VLLMCudaGraphConfig): steps with prefill read per-step metadata, so it runs eagerly
+        between graph pieces. Wrapped on first use, after ``VLLMEngine`` sets the variable."""
+        return eager_break_during_capture(self._forward_speculative)
 
     def _forward_speculative(
         self,

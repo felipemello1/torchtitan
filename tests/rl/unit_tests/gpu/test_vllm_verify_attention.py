@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -12,10 +13,9 @@ import torch
 from torchtitan.rl.generator.vllm.attention.attention import (
     TorchTitanVarlenInnerAttentionImpl,
 )
-from torchtitan.tools.utils import (
-    activate_cuda_flash_attention_impl,
-    has_cuda_capability,
-)
+from torchtitan.tools.utils import has_cuda_capability
+from vllm.config import set_current_vllm_config, VllmConfig
+from vllm.forward_context import ForwardContext, override_forward_context
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or not has_cuda_capability(10, 0),
@@ -23,68 +23,110 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_verify_rows_as_decode_match_causal_attention():
-    """Each verify token attends causally to its row's keys; a padded row (seq_len 0) is ignored."""
-    activate_cuda_flash_attention_impl()
+@pytest.mark.parametrize("max_seq_len", [131072, 262144])
+@pytest.mark.parametrize(
+    "query_lens, seq_lens, is_verify_step",
+    [
+        # Rows of 1 + 3 tokens; the 30k row gets KV splits; a padded row (seq_len 0).
+        ([4, 4, 4, 4, 4, 4], [4, 130, 1000, 257, 30_000, 0], True),
+        # A 1-token row: FA4's varlen call.
+        ([4, 4, 1], [130, 30_000, 257], False),
+    ],
+    ids=["verify", "mixed"],
+)
+def test_forward_matches_causal_attention(
+    query_lens, seq_lens, is_verify_step, max_seq_len
+):
+    """Each query token attends causally to its row's keys, through the impl's dispatch.
+
+    vLLM passes max_model_len as max_seq_len when it captures FULL graphs.
+    """
     torch.manual_seed(0)
     device = torch.device("cuda")
-    query_len, num_heads, num_kv_heads, head_dim, page_size = 4, 24, 4, 256, 128
-    # Shortest row: 4 keys, one shared by all tokens. Others cross page boundaries.
-    seq_lens = [4, 130, 1000, 257, 0]
+    num_heads, num_kv_heads, head_dim, page_size = 24, 4, 256, 128
+    config = VllmConfig()
+    config.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    with set_current_vllm_config(config):
+        impl = TorchTitanVarlenInnerAttentionImpl(
+            num_heads=num_heads,
+            head_size=head_dim,
+            scale=head_dim**-0.5,
+            num_kv_heads=num_kv_heads,
+            alibi_slopes=None,
+            sliding_window=None,
+            kv_cache_dtype="auto",
+        )
+    assert impl.verify_query_len == 4
+
+    # The engine's cache: [pages, KV heads, page, K | V], with pages in random order.
     num_pages = [-(-length // page_size) for length in seq_lens]
-    key_cache = torch.randn(
+    kv_cache = torch.randn(
         sum(num_pages) + 1,
-        page_size,
         num_kv_heads,
-        head_dim,
+        page_size,
+        2 * head_dim,
         dtype=torch.bfloat16,
         device=device,
     )
-    value_cache = torch.randn_like(key_cache)
-    page_order = torch.randperm(key_cache.shape[0])
+    key_cache, value_cache = kv_cache.transpose(1, 2).split(head_dim, dim=-1)
+    page_order = torch.randperm(kv_cache.shape[0])
     block_table = torch.zeros(len(seq_lens), max(num_pages), dtype=torch.int32)
     start = 0
     for row, count in enumerate(num_pages):
         block_table[row, :count] = page_order[start : start + count]
         start += count
+    query_start_loc = torch.tensor([0, *query_lens]).cumsum(0).int()
+    num_tokens = int(query_start_loc[-1])
     query = torch.randn(
-        len(seq_lens) * query_len,
-        num_heads,
-        head_dim,
-        dtype=torch.bfloat16,
-        device=device,
+        num_tokens, num_heads, head_dim, dtype=torch.bfloat16, device=device
     )
     metadata = SimpleNamespace(
+        num_actual_tokens=num_tokens,
+        query_start_loc=query_start_loc.to(device),
+        max_query_len=max(query_lens),
         seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
-        max_seq_len=query_len,
+        max_seq_len=max_seq_len,
         block_table=block_table.to(device),
+        use_cascade=False,
+        causal=True,
     )
-    impl = TorchTitanVarlenInnerAttentionImpl.__new__(
-        TorchTitanVarlenInnerAttentionImpl
+    layer = SimpleNamespace(layer_name="attn", kv_cache=kv_cache)
+    context = ForwardContext(
+        no_compile_layers={"attn": layer},
+        attn_metadata={"attn": metadata},
+        slot_mapping={},
     )
-    impl.scale = head_dim**-0.5
     output = torch.zeros_like(query)
 
-    impl._verify_rows_as_decode(output, query, key_cache, value_cache, metadata)
+    with (
+        override_forward_context(context),
+        patch.object(
+            impl, "_verify_rows_as_decode", wraps=impl._verify_rows_as_decode
+        ) as verify_rows_as_decode,
+    ):
+        impl.forward(layer, query, None, None, kv_cache, metadata, output=output)
+    assert verify_rows_as_decode.called == is_verify_step
 
-    groups = num_heads // num_kv_heads
-    for row, num_keys in enumerate(seq_lens[:-1]):
+    for row, (num_queries, num_keys) in enumerate(zip(query_lens, seq_lens)):
+        if num_keys == 0:
+            continue
         pages = block_table[row, : num_pages[row]].long()
         keys = key_cache[pages].flatten(0, 1)[:num_keys].float()
         values = value_cache[pages].flatten(0, 1)[:num_keys].float()
-        row_query = query[row * query_len : (row + 1) * query_len].float()
-        # [heads, tokens, keys]; token j sees keys 0 .. num_keys - query_len + j.
+        rows = slice(int(query_start_loc[row]), int(query_start_loc[row + 1]))
+        # [heads, tokens, keys]; token j sees keys 0 .. num_keys - num_queries + j.
         scores = impl.scale * torch.einsum(
-            "thd,khd->htk", row_query, keys.repeat_interleave(groups, dim=1)
+            "thd,khd->htk",
+            query[rows].float(),
+            keys.repeat_interleave(impl.num_queries_per_kv, dim=1),
         )
         is_visible = torch.ones(
-            query_len, num_keys, dtype=torch.bool, device=device
-        ).tril(num_keys - query_len)
+            num_queries, num_keys, dtype=torch.bool, device=device
+        ).tril(num_keys - num_queries)
         scores = scores.masked_fill(~is_visible, float("-inf"))
         expected = torch.einsum(
             "htk,khd->thd",
             scores.softmax(dim=-1),
-            values.repeat_interleave(groups, dim=1),
+            values.repeat_interleave(impl.num_queries_per_kv, dim=1),
         )
-        actual = output[row * query_len : (row + 1) * query_len].float()
-        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(output[rows].float(), expected, atol=2e-3, rtol=2e-2)
