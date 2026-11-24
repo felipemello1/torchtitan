@@ -212,6 +212,9 @@ class VLLMEngine(GenerationEngine):
         cuda_graph: VLLMCudaGraphConfig = field(default_factory=VLLMCudaGraphConfig)
         """CUDA graph capture settings for the vLLM engine."""
 
+        # TODO: with the session KV holder, compare vllm.session_kv.lost_prefix_tokens at two
+        # watermarks and give that cost in the "Lower it" advice below. Not done: it needs one
+        # GPU run per watermark.
         watermark: float = 0.1
         """vLLM's ``EngineArgs.watermark``: the fraction of KV cache blocks that must stay
         free after admitting a waiting or preempted request. vLLM's default is 0.0.
@@ -219,7 +222,9 @@ class VLLMEngine(GenerationEngine):
         0.1 admits only while KV usage stays <= 90%, so running requests have 10% of the
         blocks to grow into before vLLM preempts one. Raise it when
         ``generator/num_preemptions`` is high.
-        Lower it when KV usage sits near ``1 - watermark`` while requests wait.
+        Lower it when KV usage sits near ``1 - watermark`` while requests wait. With the session
+        KV holder, free blocks above the watermark also cache idle sessions: check that lost
+        prefix tokens don't rise.
 
         Example, 10,000 blocks, 500 free, a waiting request needs 100 (400 free after):
 
@@ -638,6 +643,9 @@ class VLLMEngine(GenerationEngine):
         #   previous completion, cannot reuse anything past the previous prompt.
         # - None: every full block boundary, as before v0.29. Blocks are still freed
         #   when the request moves past them; hashed ones stay reusable until evicted.
+        # TODO: with CPU offload, a session reuses only its latest boundary's GDN states, yet GDN
+        # states held a median 450 of 1,482 CPU blocks in load tests (vllm.cpu_kv.gdn_state_blocks).
+        # If most are older boundaries, evict a session's older states when it stores a newer one.
         engine_kwargs["prefix_cache_retention_interval"] = None
         if self.config.kv_transfer_config is not None:
             extra = self.config.kv_transfer_config.kv_connector_extra_config
