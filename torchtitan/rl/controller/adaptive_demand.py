@@ -70,7 +70,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class StallDrivenDemand:
-    """Demand = ceil(ready_batches x P) + quantile of the unavailable count + 1, smoothed per step, under a ceiling.
+    """Demand = ceil(ready_batches x P) + quantile of the unavailable count + 1. It moves up part of the gap or down
+    one group per step, under a ceiling.
 
     Args:
         num_prompts_per_train_step: P, groups the trainer consumes per step.
@@ -80,12 +81,13 @@ class StallDrivenDemand:
             stalling: demand is capped at the mean-age ceiling for this age. None: the ceiling is applied at
             `max_offpolicy_steps`, if given; with neither there is no ceiling.
         lookback_steps: how many of the most recent step starts the quantile is taken over; older values are forgotten.
-        stall_probability: the share of step starts allowed to find fewer than `ready_batches` batches ready (a stall,
-            with 1.0); the quantile is taken at 1 - stall_probability. This is what the rule aims for when nothing
-            else limits the demand. It cannot be met when the age ceiling or the generators' capacity caps the demand
-            below what the workload needs, and it assumes some finished groups are trainable.
-        ready_batches: batches of P the demand aims to have ready at each step start. 1.0 is just enough to train;
-            1.5 keeps half a batch spare, so fewer steps wait for generation.
+        stall_probability: the share of step starts allowed to find fewer than `ready_batches` batches ready; with
+            1.0, that is a stall. The quantile is taken at 1 - stall_probability. This is what the rule aims for when
+            nothing else limits the demand. It cannot be met when the age ceiling or the generators' capacity caps
+            the demand below what the workload needs, and it assumes some finished groups are trainable.
+        ready_batches: batches of P the demand aims to have ready at each step start. 1.0 is just enough to train.
+            1.5 keeps half a batch spare, so fewer steps wait while generation keeps up; the buffer then holds more
+            groups, and they train older.
         start_batches: demand at the first step, in batches of P; the rule learns the rest from the run itself.
         damping_factor: how much of the gap between the current demand and `demand_needed` is closed per step going
             up, or coming down to the mean-age ceiling; otherwise demand comes down one group per step. 0.5 moves
@@ -232,7 +234,13 @@ class StallDrivenDemand:
 
     def load_state_dict(self, state_dict: dict[str, object]) -> None:
         """Restore what `state_dict` returned; each history keeps its last `lookback_steps` values. The next
-        `observe` records nothing and keeps the restored demand."""
+        `observe` records nothing and keeps the restored demand.
+
+        Example:
+            resumed = StallDrivenDemand(num_prompts_per_train_step=8)
+            resumed.load_state_dict(demand.state_dict())  # demand 29, history [24], as in `state_dict`'s example
+            resumed.observe(step=2, ready=0, generating=0, completed=0, trainable=0)  # -> 29, nothing recorded
+        """
         self.demand = state_dict["demand"]
         self.state = state_dict["state"]
         self._unavailable = deque(state_dict["unavailable"], maxlen=self.lookback_steps)
