@@ -185,6 +185,26 @@ Counters are cumulative; derive throughput and prefix-cache hit rate from their
 rates in the backend. Histogram values use milliseconds. Gauges report the
 latest scheduler state observed by the logger.
 
+With `VLLMEngine.Config.session_kv_holder`, the logger also exports what the holder keeps:
+
+- `vllm.session_kv.held_blocks` (gauge): distinct GPU blocks held for idle and running sessions.
+- `vllm.session_kv.evicted_sessions` (counter): sessions released under GPU pressure.
+- `vllm.session_kv.reusable_prefix_tokens`, `vllm.session_kv.lost_prefix_tokens` (counters, with
+  `SimpleCPUOffloadConnector`): full blocks of a session's last turn that its next prompt continues, and
+  the part of them the GPU and CPU caches did not serve at admission. Lost / prompt tokens is the share of
+  prompt tokens recomputed although computed before.
+
+With `SimpleCPUOffloadConnector`, it exports what the CPU KV cache stores and fails to serve:
+
+- `vllm.cpu_kv.gpu_evicted_blocks{cpu_copy=yes|no}` (counter): hashed GPU blocks reused, by whether
+  the CPU cache held a copy.
+- `vllm.cpu_kv.broken_chain_requests{cause=hole|no_state}`, `vllm.cpu_kv.broken_chain_tokens{cause}`
+  (counters): prompts whose prefix hit stopped before attention blocks the CPU cache still held. `hole`:
+  the next block was on neither the CPU nor the GPU. `no_state`: the next block was on the CPU, so its GDN
+  state was missing. A next block still on the GPU counts toward neither cause.
+- `vllm.cpu_kv.stored_blocks` (counter): blocks copied to the CPU cache.
+- `vllm.cpu_kv.gdn_state_blocks` (gauge): CPU cache blocks of GDN state groups (vLLM `MambaSpec`).
+
 #### Prefix-cache hit rate
 
 The logger exports prefix-cache hits and queries as separate monotonic counters.

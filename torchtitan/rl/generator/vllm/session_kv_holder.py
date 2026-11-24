@@ -8,9 +8,9 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_utils import BlockHash
@@ -65,8 +65,9 @@ class VLLMSessionKVHolder(Configurable):
 
     Args:
         scheduler: The vLLM v1 scheduler of this rank's in-process engine.
-        offload_connector: Optional connector with ``get_pending_save_ids()`` and
-            ``release_session_cache(released_hashes, active_hashes)``.
+        offload_connector: Optional connector with ``get_pending_save_ids()``,
+            ``release_session_cache(released_hashes, active_hashes)`` and
+            ``pop_cached_tokens(request_id)``.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -120,6 +121,13 @@ class VLLMSessionKVHolder(Configurable):
         # Plain ints, so other threads (e.g. a logging endpoint) can read them safely.
         self.num_sessions = 0
         self.num_evicted = 0
+        # Distinct held blocks: GRPO siblings hold their shared prompt blocks once each.
+        self.num_held_blocks = 0
+        self._held_block_refs: Counter[int] = Counter()
+        # Lost-prefix accounting (with an offload connector only): see `_count_lost_prefix`.
+        self.num_reusable_prefix_tokens = 0
+        self.num_lost_prefix_tokens = 0
+        self._last_turns: dict[str, _LastTurn] = {}
         # CPU release hints (with an offload connector only).
         self._offload_connector = offload_connector
         self._cpu_sessions: dict[str, tuple[int, set[BlockHash]]] = {}
@@ -145,11 +153,20 @@ class VLLMSessionKVHolder(Configurable):
             if internal_id not in self._scheduler.requests:
                 if self._offload_connector is not None:
                     self._cpu_sessions[session_id][1].update(request.block_hashes)
+                    self._last_turns[session_id] = _LastTurn(
+                        group_id=group_id,
+                        num_block_hashes=len(request.block_hashes),
+                        last_block_hash=(
+                            request.block_hashes[-1] if request.block_hashes else None
+                        ),
+                    )
                 del self._live[internal_id]
                 if session_id in self._held:
                     self._held.move_to_end(session_id)
             elif not held and request.num_computed_tokens >= request.num_prompt_tokens:
                 self._live[internal_id] = (request, session_id, group_id, True)
+                if self._offload_connector is not None:
+                    self._count_lost_prefix(request, session_id)
                 self._hold(request, session_id, group_id)
 
         if self._offload_connector is not None:
@@ -205,6 +222,11 @@ class VLLMSessionKVHolder(Configurable):
         # blocks in the same order.
         for session_id in sorted(released):
             self._release(session_id)
+        self._last_turns = {
+            session_id: last_turn
+            for session_id, last_turn in self._last_turns.items()
+            if session_id not in released and last_turn.group_id not in group_ids
+        }
         # A request still before its prefill must not re-hold a released session.
         dropped_groups = set(group_ids)
         for internal_id, (request, session_id, group_id, held) in list(
@@ -274,6 +296,8 @@ class VLLMSessionKVHolder(Configurable):
         self._block_pool.touch(blocks)
         self._release(session_id)
         self._held[session_id] = blocks
+        self._held_block_refs.update(block.block_id for block in blocks)
+        self.num_held_blocks = len(self._held_block_refs)
         self._session_groups[session_id] = group_id
         self._group_sessions.setdefault(group_id, set()).add(session_id)
         self.num_sessions += 1
@@ -285,4 +309,59 @@ class VLLMSessionKVHolder(Configurable):
             self._group_sessions.get(group_id, set()).discard(session_id)
         if blocks is not None:
             self.num_sessions -= 1
+            for block in blocks:
+                self._held_block_refs[block.block_id] -= 1
+                if self._held_block_refs[block.block_id] == 0:
+                    del self._held_block_refs[block.block_id]
+            self.num_held_blocks = len(self._held_block_refs)
             self._block_pool.free_blocks(reversed(blocks))
+
+    def _count_lost_prefix(self, request: Request, session_id: str) -> None:
+        """Count prefix tokens this turn recomputes although the session's last turn computed them.
+
+        Cached tokens come from the connector's admission record (GPU + CPU hit). Every full block
+        of the last turn counts as reusable: `VLLMEngine` keeps a GDN state at every boundary
+        (`prefix_cache_retention_interval=None`).
+
+        Example, 1,664-token blocks: the last turn ended at 63,000 tokens (37 full blocks); this
+        prompt has 63,464 tokens and continues it; 54,912 tokens (33 blocks) were cached:
+
+            reusable = min(37, (63,464 - 1) // 1,664 = 38) x 1,664 = 61,568
+            lost     = 61,568 - 54,912 = 6,656 (4 blocks)
+
+        A prompt that doesn't continue the last turn (a compacted history) counts nothing.
+        """
+        # TODO: without a KV connector, take the cached tokens from the finished request's
+        # num_cached_tokens, which VLLMEngine reads at finish, so lost prefix needs no offload.
+        num_cached_tokens = self._offload_connector.pop_cached_tokens(
+            request.request_id
+        )
+        last_turn = self._last_turns.get(session_id)
+        if num_cached_tokens is None or last_turn is None:
+            return
+
+        num_last_hashes = last_turn.num_block_hashes
+        continues_last_turn = (
+            num_last_hashes > 0
+            and len(request.block_hashes) >= num_last_hashes
+            and request.block_hashes[num_last_hashes - 1] == last_turn.last_block_hash
+        )
+        if not continues_last_turn:
+            return
+
+        hash_block_size = self._scheduler.hash_block_size
+        block_size = self._scheduler.block_size
+        num_reusable_hashes = min(
+            num_last_hashes, (request.num_prompt_tokens - 1) // hash_block_size
+        )
+        reusable = num_reusable_hashes * hash_block_size // block_size * block_size
+        self.num_reusable_prefix_tokens += reusable
+        self.num_lost_prefix_tokens += max(0, reusable - num_cached_tokens)
+
+
+class _LastTurn(NamedTuple):
+    """What lost-prefix accounting needs from a session's last request that left vLLM."""
+
+    group_id: int
+    num_block_hashes: int
+    last_block_hash: BlockHash | None
