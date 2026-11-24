@@ -951,7 +951,7 @@ def _run_with_generator_watcher(
     num_concurrent_rollout_groups=1,
     group_buffer=None,
     start_step=0,
-    group_buffer_resume_state=None,
+    resume_state=None,
 ) -> Controller:
     """Run Controller.run with stub loops: `watcher` waits on the engine loops, `trainer_loop` trains, the rest block."""
     controller = object.__new__(Controller)
@@ -968,8 +968,7 @@ def _run_with_generator_watcher(
             group_buffer=group_buffer
             or SimpleNamespace(
                 build=lambda **kwargs: SimpleNamespace(
-                    close=AsyncMock(side_effect=on_close),
-                    load_state_dict=lambda state_dict: None,
+                    close=AsyncMock(side_effect=on_close)
                 )
             ),
             validation=validation or ValidationConfig(),
@@ -979,7 +978,7 @@ def _run_with_generator_watcher(
         ),
     )
     controller.start_step = start_step
-    controller._group_buffer_resume_state = group_buffer_resume_state or {}
+    controller._resume_state = resume_state
     controller._validation_tasks = []
     controller._model_state_dict_pull_tasks = []
     controller._has_pending_validation = False
@@ -1541,7 +1540,7 @@ def test_adaptive_buffer_resumes_its_demand_from_the_trainer_checkpoint() -> Non
             for step_buffer in (buffer, resumed)
         ] == [75, 75]
 
-        # Nothing saved (a fresh start, or a checkpoint without the buffer's state): 3 batches of 8
+        # The fixed buffer's checkpoint state, {}: the start demand, 3 batches of 8
         fresh = _adaptive_buffer(num_prompts=8, max_offpolicy_steps=10)
         fresh.load_state_dict({})
         assert _buffer_metric(fresh, "rollout_buffer/available_active_slots") == 24
@@ -2174,7 +2173,7 @@ def test_run_builds_the_adaptive_buffer_with_one_generating_group_per_rollout_lo
         num_concurrent_rollout_groups=3,
         group_buffer=AdaptiveRolloutGroupWorkBuffer.Config(max_offpolicy_steps=8),
         start_step=5,
-        group_buffer_resume_state=saved_demand.state_dict(),
+        resume_state={"step": 5, "group_buffer": saved_demand.state_dict()},
     )
     buffer = controller._group_buffer
     assert isinstance(buffer, AdaptiveRolloutGroupWorkBuffer)

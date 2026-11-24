@@ -28,6 +28,7 @@ RolloutGroupWorkBuffer
 | active slots = (target_offpolicy_steps + 1) * num_prompts_per_train_step, or the adaptive buffer's demand           |
 |                                                                                                                     |
 | caller            group_buffer call                                            state / active slot                  |
+| run()             load_state_dict(resume_state["group_buffer"])                adaptive: demand + slot cap restored |
 | _data_input_loop  add_work(RolloutGroupWork)                                   WAITING; slot acquired               |
 | _rollout_loop[N]  claim_next()                                                 WAITING -> CLAIMED                   |
 | _rollout_loop[N]  finalize_work(RolloutGroup)                                  CLAIMED -> FINALIZED                 |
@@ -36,6 +37,7 @@ RolloutGroupWorkBuffer
 | _rollout_loop[N]  release_cancelled(group_id)                                  cancelled group stopped; slot freed  |
 | _batcher_loop     release_active_groups(1, "untrainable_group")                slot released                        |
 | _trainer_loop     record_step_start(trainer_policy_version)                    adaptive: demand updated             |
+| _trainer_loop     state_dict() -> optim_step(resume_state=...)                 saved in the trainer checkpoint      |
 | _trainer_loop     release_active_groups(num_prompts_per_train_step, "trained")  slots released after state dict pull |
 +---------------------------------------------------------------------------------------------------------------------+
                                                   |
@@ -954,17 +956,15 @@ class Controller(Configurable):
                 await actor_system.initialize_torchstore()
 
         # Resume: __init__ ran CheckpointManager.load(); read back the restored
-        # policy version and rollouter state.
+        # policy version and the controller's resume state (rollouter and group buffer).
         self.start_step, resume_state = await asyncio.gather(
             self.trainer.rank0.get_policy_version.call_one(),
             self.trainer.rank0.get_resume_state.call_one(),
         )
-        # run() restores the group buffer from this once it builds it
-        self._group_buffer_resume_state: dict[str, object] = {}
+        # run() restores the group buffer from it, once it builds the buffer
+        self._resume_state: dict[str, object] | None = resume_state
         if resume_state is not None:
             self._rollouter.load_state_dict(resume_state)
-            # A checkpoint without the buffer's state (an older one) starts the buffer as a fresh run does.
-            self._group_buffer_resume_state = resume_state.get("group_buffer", {})
             logger.info("Restored RL dataloader state")
             # TODO: Replay cached finished rollouts instead of regenerating all
             # pending prompts after resume.
@@ -1182,7 +1182,8 @@ class Controller(Configurable):
                 window_size=window_size,
             )
         # Before the data input loop starts, so a resumed demand caps the first admissions.
-        self._group_buffer.load_state_dict(self._group_buffer_resume_state)
+        if self._resume_state is not None:
+            self._group_buffer.load_state_dict(self._resume_state["group_buffer"])
 
         # training_batch_queue
         training_batch_queue: asyncio.Queue[
@@ -1645,7 +1646,8 @@ class Controller(Configurable):
                     self._rollouter.commit_training_sample_ids(
                         [*self._group_buffer.pop_dropped_group_ids(), *packed.group_ids]
                     )
-                    # The buffer's state as of this step's start, which is what the next step start reads.
+                    # One dict: the rollouter's keys and "group_buffer", the buffer's state as of this step's start,
+                    # which is what the next step start reads.
                     optimizer_result = self._get_rank_0_value(
                         await self.trainer.all_ranks.optim_step.call(
                             resume_state={

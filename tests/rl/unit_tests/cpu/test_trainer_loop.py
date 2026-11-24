@@ -189,7 +189,8 @@ def _run(controller: Controller, *, num_training_steps: int) -> None:
 
 def test_push_then_pull_then_release_after_each_optimizer_step() -> None:
     events: list[str] = []
-    _run(_controller(events), num_training_steps=2)
+    controller = _controller(events)
+    _run(controller, num_training_steps=2)
 
     assert events == [
         "fwd_bwd 1",
@@ -207,15 +208,9 @@ def test_push_then_pull_then_release_after_each_optimizer_step() -> None:
         "pull 2",
         "release 5 trained",
     ]
-
-
-def test_each_optimizer_step_saves_the_buffer_state_with_the_rollouter_state() -> None:
-    controller = _controller([])
-    _run(controller, num_training_steps=1)
-
-    assert controller.saved_resume_states == [
-        {"step": 0, "group_buffer": {"demand": 29}}
-    ]
+    # Each optimizer step saves the buffer's state next to the rollouter's keys
+    saved_state = {"step": 0, "group_buffer": {"demand": 29}}
+    assert controller.saved_resume_states == [saved_state, saved_state]
 
 
 def test_each_step_logs_the_curriculum_metrics() -> None:
