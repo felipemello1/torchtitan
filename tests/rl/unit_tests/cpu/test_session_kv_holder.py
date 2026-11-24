@@ -467,3 +467,78 @@ def test_a_waiting_turn_gets_room_when_held_sessions_fill_the_pool(manager, queu
         holder.after_step()
     else:
         pytest.fail("held sessions stalled the engine: the waiting turn never fit")
+
+
+def test_held_blocks_count_a_shared_prompt_once(manager):
+    requests = {}
+    holder = _holder(manager, requests)
+    _finished_turn(manager, holder, requests, "a", list(range(50)))
+    num_held_by_a = holder.num_held_blocks
+    # GRPO sibling "b" has the same prompt, so it holds the same cached blocks.
+    _finished_turn(manager, holder, requests, "b", list(range(50)))
+    assert num_held_by_a > 0 and holder.num_held_blocks == num_held_by_a
+
+    holder.release(session_ids=["a"])
+    assert holder.num_held_blocks == num_held_by_a
+    holder.release(session_ids=["b"])
+    assert holder.num_held_blocks == 0
+
+
+def test_lost_prefix_counts_history_the_next_turn_recomputes(manager):
+    cached_at_admission = {}
+    connector = Mock()
+    connector.get_pending_save_ids.return_value = set()
+    connector.pop_cached_tokens.side_effect = lambda request_id: (
+        cached_at_admission.pop(request_id, None)
+    )
+    requests = {}
+    scheduler = _scheduler(
+        manager,
+        requests=requests,
+        running=(),
+        waiting=(),
+        skipped_waiting=(),
+        block_size=BLOCK,
+        hash_block_size=BLOCK,
+    )
+    holder = VLLMSessionKVHolder.Config().build(
+        scheduler=scheduler, offload_connector=connector
+    )
+    holder.free_floor_blocks = 0
+
+    def finished_turn(request_id, tokens, num_cached_tokens, decode_tokens=0):
+        cached_at_admission[request_id] = num_cached_tokens
+        request = _request(request_id, tokens)
+        requests[request_id] = request
+        holder.track(request_id, session_id="s", group_id=0)
+        _prefill(manager, request)
+        holder.after_step()
+        for t in range(decode_tokens):
+            _schedule(manager, request, 1, sample=100 + t)
+        manager.free(request)
+        del requests[request_id]
+        holder.after_step()
+        return request
+
+    def reusable_and_lost():
+        return holder.num_reusable_prefix_tokens, holder.num_lost_prefix_tokens
+
+    # Turn 1 ends at 71 tokens (4 full blocks). A first turn has no history to lose.
+    turn1 = finished_turn("t1", list(range(50)), 0, decode_tokens=20)
+    assert reusable_and_lost() == (0, 0)
+
+    # Turn 2 (74 tokens) continues it: all 4 blocks reusable, 3 of them hit at admission.
+    finished_turn("t2", list(turn1.all_token_ids) + [5, 6, 7], 48)
+    assert reusable_and_lost() == (64, 16)
+
+    # A compacted history doesn't continue turn 2: nothing reusable, nothing lost.
+    finished_turn("t3", list(range(500, 600)), 0)
+    assert reusable_and_lost() == (64, 16)
+    assert not cached_at_admission
+
+    # GPU pressure drops the hold first; the group release must still forget the session.
+    holder.free_floor_blocks = manager.block_pool.get_num_free_blocks() + 1
+    holder.after_step()
+    assert holder.num_sessions == 0
+    holder.release(group_ids=[0])
+    assert not holder._last_turns
