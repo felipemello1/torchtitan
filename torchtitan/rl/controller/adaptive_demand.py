@@ -167,7 +167,9 @@ class StallDrivenDemand:
             history=list(self._unavailable),
             probability=1 - self.stall_probability,
         )
-        demand_needed = math.ceil(self.ready_batches * P) + unavailable_upper_bound + 1
+        # Rounded first: in floats 1.1 * 50 is 55.00000000000001, whose ceil is one group too many
+        ready_groups = math.ceil(round(self.ready_batches * P, 9))
+        demand_needed = ready_groups + unavailable_upper_bound + 1
 
         # At most one group down per step, so a large shelf cannot stop admission; the ceiling below can cut faster
         demand_needed = max(demand_needed, self.demand - 1)

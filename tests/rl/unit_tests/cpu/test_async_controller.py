@@ -1507,6 +1507,15 @@ def test_adaptive_buffer_aims_for_ready_batches_at_a_step_start() -> None:
     with pytest.raises(ValueError, match="ready_batches must be >= 1, got 0.5"):
         AdaptiveRolloutGroupWorkBuffer.Config(ready_batches=0.5)
 
+    # 1.1 x 50 = 55 groups, though the float product is 55.00000000000001 (a plain ceil gives 56):
+    # needed 55 + 50 + 1 = 106, half the gap up from 50: 78
+    demand = StallDrivenDemand(
+        num_prompts_per_train_step=50, ready_batches=1.1, start_batches=1
+    )
+    assert (
+        demand.observe(step=1, ready=0, generating=50, completed=0, trainable=0) == 78
+    )
+
 
 def test_adaptive_buffer_resumes_its_demand_from_the_trainer_checkpoint() -> None:
     """A buffer restored through the trainer checkpoint's `MirroredState` skips the step start right after the
