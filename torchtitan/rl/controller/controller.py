@@ -1246,6 +1246,10 @@ class Controller(Configurable):
         try:
             # TODO: on resume, restart the validation that was still running when the previous run
             # stopped. The checkpoint doesn't record it, so it is lost unless the start step is due.
+            # It happens when checkpoints come more often than a validation lasts (every 2 steps, a validation
+            # over several steps): a requeue mid-validation resumes at a step that is not due, and
+            # `keep_latest_k` can purge the validated weights. Fix: save the last validation step that ended in
+            # the resume state, and validate a missed due step at the resume step.
             self._maybe_start_validation(step=self.start_step)
             done, _ = await asyncio.wait(
                 [trainer_task, *background_tasks], return_when=asyncio.FIRST_COMPLETED
