@@ -52,8 +52,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# How long `Rollouter.close` waits for in-flight `run_group` calls before stopping their workers anyway.
-# Drains took under 0.3 s once the generators closed; 30 s only covers a group stuck in a slow env step.
+# How long `Rollouter.close` waits for in-flight `run_group` calls before stopping their workers anyway,
+# and `Rollouter.cancel_group` for a cancelled group to end. Drains took under 0.3 s once the generators
+# closed; 30 s only covers a group stuck in a slow env step.
 _RUN_GROUP_DRAIN_TIMEOUT_S = 30.0
 
 
@@ -98,6 +99,8 @@ class Rollouter(Configurable):
           - Group execution, coarse: override `_run_group_rollouts` for your own
             orchestration. The worker then becomes optional -- but override
             `setup_async` too, or the worker pool is still spawned unused.
+            Override `cancel_group` too: the base one stops the group on its
+            rollout worker.
           - Group execution, fine: keep the stock orchestration and point `worker`
             at a `MessageEnvRolloutWorker.Config` subclass, overriding only what you need
             (`make_env_group`, `score_group`, `run_group`). A worker whose env isn't a
@@ -256,6 +259,9 @@ class Rollouter(Configurable):
                 for call in pending:
                     call.cancel()
                 await asyncio.gather(*pending, return_exceptions=True)
+
+        # TODO: also wait for the generate calls of groups that `cancel_group` stopped. Their worker no longer
+        # waits for them, so a generator router that answers after the workers stop may make the job exit 130.
         if actor_system is not None:
             await actor_system.stop_rollout_workers()
 
@@ -321,7 +327,9 @@ class Rollouter(Configurable):
             raise RuntimeError("rollout worker pool is not initialized")
 
         # `choose` (see ActorSystem's call convention) sends the call to the `run_group`
-        # endpoint of one worker in the pool.
+        # endpoint of one worker in the pool, when called.
+        # Keep this send before the first await of `run_group_rollouts`: a buffer cancel that lands earlier then stops
+        # the task before the send, so `cancel_group` finds every group that was sent.
         call = asyncio.ensure_future(
             self._worker_actors.run_group.choose(
                 generate_fn=generate_fn,
@@ -336,6 +344,28 @@ class Rollouter(Configurable):
         call.add_done_callback(self._on_run_group_call_done)
         # Shield `call` from the controller's end-of-training cancel, so `close` can still wait for it.
         return await asyncio.shield(call)
+
+    async def cancel_group(self, group_id: int) -> None:
+        """Stop a training group's `run_group` on its rollout worker; return once it ended there.
+
+            cancel the caller of `run_group_rollouts`   the worker keeps running the group (Monarch
+                                                        runs a call to the end)
+            then `cancel_group(group_id)`               the worker cancels it; this returns once it ended
+            the worker errors, or takes longer than     logged, not raised; the group may keep running
+                `_RUN_GROUP_DRAIN_TIMEOUT_S`
+
+        Every rollout worker gets the call; only the one running the group cancels it.
+        """
+        if self._worker_actors is None:
+            raise RuntimeError("rollout worker pool is not initialized")
+        try:
+            async with asyncio.timeout(_RUN_GROUP_DRAIN_TIMEOUT_S):
+                await self._worker_actors.cancel_group.call(group_id)
+        except Exception:
+            # Logged, not raised: the caller's rollout loop must keep serving groups.
+            logger.exception(
+                "cancel_group(%d) failed; the group may keep running", group_id
+            )
 
     def _on_run_group_call_done(self, call: asyncio.Future[RolloutGroup]) -> None:
         self._inflight_run_group_calls.discard(call)
