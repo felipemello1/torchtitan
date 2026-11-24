@@ -489,6 +489,8 @@ class VLLMEngine(GenerationEngine):
         self._is_tp_rank_0 = rank % tp_degree == 0
         self._generator_name = generator_name
         stat_loggers = None
+        # Set by the factory `_build_stat_loggers` returns, when vLLM calls it.
+        self._otel_stat_logger: VllmOtelStatLogger | None = None
         if self._is_tp_rank_0:
             stat_loggers = self._build_stat_loggers(
                 StatLoggerContext(
@@ -507,16 +509,21 @@ class VLLMEngine(GenerationEngine):
         )
         # Every rank holds the same blocks in its own scheduler; only the engine loop thread
         # touches them.
+        scheduler = self._engine.engine_core.engine_core.scheduler
+        offload_connector = (
+            scheduler.connector
+            if config.kv_transfer_config is not None
+            and config.kv_transfer_config.kv_connector == "SimpleCPUOffloadConnector"
+            else None
+        )
         self._session_kv_holder: VLLMSessionKVHolder | None = None
         if config.session_kv_holder is not None:
-            scheduler = self._engine.engine_core.engine_core.scheduler
             self._session_kv_holder = config.session_kv_holder.build(
-                scheduler=scheduler,
-                offload_connector=scheduler.connector
-                if config.kv_transfer_config is not None
-                and config.kv_transfer_config.kv_connector
-                == "SimpleCPUOffloadConnector"
-                else None,
+                scheduler=scheduler, offload_connector=offload_connector
+            )
+        if self._otel_stat_logger is not None:
+            self._otel_stat_logger.observe_kv_reuse(
+                holder=self._session_kv_holder, connector=offload_connector
             )
 
     @staticmethod
@@ -708,11 +715,12 @@ class VLLMEngine(GenerationEngine):
             return None
 
         def build_stat_logger(vllm_config, engine_index):
-            return stat_logger_config.build(
+            self._otel_stat_logger = stat_logger_config.build(
                 vllm_config=vllm_config,
                 engine_index=engine_index,
                 context=context,
             )
+            return self._otel_stat_logger
 
         return [build_stat_logger]
 

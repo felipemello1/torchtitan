@@ -30,7 +30,7 @@ from vllm.v1.metrics.loggers import StatLoggerBase
 from torchtitan.config import Configurable
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Callable, Iterable
 
     from opentelemetry.metrics import CallbackOptions, Meter, Observation
     from vllm.config import VllmConfig
@@ -38,6 +38,11 @@ if TYPE_CHECKING:
         IterationStats,
         MultiModalCacheStats,
         SchedulerStats,
+    )
+
+    from torchtitan.rl.generator.vllm.session_kv_holder import VLLMSessionKVHolder
+    from torchtitan.rl.generator.vllm.simple_cpu_offload import (
+        SimpleCPUOffloadConnector,
     )
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -277,6 +282,9 @@ class VllmOtelStatLogger(Configurable, StatLoggerBase):
             self._create_counters(meter)
             self._create_histograms(meter)
             self._create_gauges(meter, Observation)
+            # Kept for `observe_kv_reuse`, which runs once the engine has built its scheduler.
+            self._meter = meter
+            self._observation_cls = Observation
             self._enabled = True
         except Exception as e:
             logger.warning("VllmOtelStatLogger disabled: metrics setup failed: %s", e)
@@ -357,6 +365,90 @@ class VllmOtelStatLogger(Configurable, StatLoggerBase):
         meter.create_observable_gauge(
             "vllm.num_waiting_requests", callbacks=[waiting_cb], unit="request"
         )
+
+    def observe_kv_reuse(
+        self,
+        *,
+        holder: VLLMSessionKVHolder | None,
+        connector: SimpleCPUOffloadConnector | None,
+    ) -> None:
+        """Export what the session KV holder keeps and what the CPU KV cache stores and fails to serve.
+
+        Both keep plain ints (or dicts of ints) on the engine thread; the exporter thread reads
+        them in these callbacks. Names and meanings: observability/metrics/README.md.
+
+        Example:
+
+            logger.observe_kv_reuse(holder=holder, connector=None)
+            # an engine with the holder and no CPU offload: exports only
+            # vllm.session_kv.held_blocks and vllm.session_kv.evicted_sessions
+        """
+        if not self._enabled:
+            return
+        meter, observation_cls = self._meter, self._observation_cls
+
+        # Each returns the OTel callback list of one instrument.
+        def read(value: Callable[[], int]) -> list:
+            return [lambda _options: (observation_cls(value()),)]
+
+        def read_by(counts: dict[str, int], attribute: str) -> list:
+            return [
+                lambda _options: [
+                    observation_cls(count, {attribute: key})
+                    for key, count in counts.items()
+                ]
+            ]
+
+        if holder is not None:
+            meter.create_observable_gauge(
+                "vllm.session_kv.held_blocks",
+                callbacks=read(lambda: holder.num_held_blocks),
+                unit="block",
+            )
+            meter.create_observable_counter(
+                "vllm.session_kv.evicted_sessions",
+                callbacks=read(lambda: holder.num_evicted),
+                unit="session",
+            )
+        # The holder counts lost prefix only with the connector's admission record.
+        if holder is not None and connector is not None:
+            meter.create_observable_counter(
+                "vllm.session_kv.reusable_prefix_tokens",
+                callbacks=read(lambda: holder.num_reusable_prefix_tokens),
+                unit="token",
+            )
+            meter.create_observable_counter(
+                "vllm.session_kv.lost_prefix_tokens",
+                callbacks=read(lambda: holder.num_lost_prefix_tokens),
+                unit="token",
+            )
+
+        if connector is not None:
+            meter.create_observable_counter(
+                "vllm.cpu_kv.gpu_evicted_blocks",
+                callbacks=read_by(connector.gpu_evicted_blocks, "cpu_copy"),
+                unit="block",
+            )
+            meter.create_observable_counter(
+                "vllm.cpu_kv.broken_chain_requests",
+                callbacks=read_by(connector.broken_chain_requests, "cause"),
+                unit="request",
+            )
+            meter.create_observable_counter(
+                "vllm.cpu_kv.broken_chain_tokens",
+                callbacks=read_by(connector.broken_chain_tokens, "cause"),
+                unit="token",
+            )
+            meter.create_observable_counter(
+                "vllm.cpu_kv.stored_blocks",
+                callbacks=read(lambda: connector.num_stored_blocks),
+                unit="block",
+            )
+            meter.create_observable_gauge(
+                "vllm.cpu_kv.gdn_state_blocks",
+                callbacks=read(lambda: connector.num_cpu_gdn_state_blocks),
+                unit="block",
+            )
 
     def record(
         self,
