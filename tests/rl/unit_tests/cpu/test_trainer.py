@@ -540,6 +540,7 @@ def test_optim_step_advances_profiler_and_reports_aux_loss_metrics() -> None:
                 dp_replicate=1,
                 dp_shard=1,
                 get_optional_mesh=lambda _: None,
+                world_mesh=None,
             ),
             num_completed_steps=4,
             ntokens_seen=12,
@@ -574,6 +575,10 @@ def test_optim_step_advances_profiler_and_reports_aux_loss_metrics() -> None:
                 return_value={"aux_loss/mean": 0.5},
             ),
             patch(
+                "torchtitan.rl.trainer.trainer.host_memory_available_gib",
+                return_value=700.0,
+            ),
+            patch(
                 "torchtitan.rl.trainer.trainer.compute_training_performance_metrics",
                 return_value={
                     "tokens_per_second": 10.0,
@@ -604,6 +609,7 @@ def test_optim_step_advances_profiler_and_reports_aux_loss_metrics() -> None:
             "trainer/memory/max_reserved_percent": 6.0,
             "trainer/memory/num_alloc_retries": 0.0,
             "trainer/memory/num_ooms": 0.0,
+            "trainer/host_memory_available_gib": 700.0,
             "trainer/mfu_percent": 50.0,
             "aux_loss/mean": 0.5,
         }

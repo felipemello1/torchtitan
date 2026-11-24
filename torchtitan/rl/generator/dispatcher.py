@@ -272,6 +272,13 @@ class RequestDispatcher:
                         metric_type(inflight_requests_at_completion),
                     )
                 )
+            # Rank 0's host, also for requests a peer DP replica finished.
+            metrics.append(
+                m.Metric(
+                    "generator/host_memory_available_gib",
+                    m.Min(m.host_memory_available_gib()),
+                )
+            )
 
             generation.reply.set_result(
                 Completion(

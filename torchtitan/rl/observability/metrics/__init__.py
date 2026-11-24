@@ -7,6 +7,7 @@
 """Typed metrics for torchtitan RL. Check README.md for details."""
 
 from .console import log_to_console
+from .host_memory import host_memory_available_gib
 from .loop_lag import EventLoopLag, ThreadPoolLag
 from .processor import MetricBackend, MetricsProcessor
 from .types import (
@@ -26,6 +27,7 @@ from .types import (
 __all__ = [
     "EventLoopLag",
     "fold",
+    "host_memory_available_gib",
     "Max",
     "Mean",
     "Metric",
