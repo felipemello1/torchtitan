@@ -1491,6 +1491,20 @@ def test_stall_driven_demand_starts_at_three_batches_and_moves_half_the_gap() ->
     assert demand.state == "age-limited"
 
 
+def test_adaptive_buffer_aims_for_ready_batches_at_a_step_start() -> None:
+    async def run() -> None:
+        buffer = AdaptiveRolloutGroupWorkBuffer.Config(ready_batches=1.5).build(
+            num_prompts_per_train_step=8, generation_capacity=64
+        )
+        # nothing ready: unavailable 24, needed ceil(1.5 x 8) + 24 + 1 = 37 (1 batch: 33), half the gap up: 24 + 7
+        await buffer.record_step_start(trainer_policy_version=0)
+        assert _buffer_metric(buffer, "rollout_buffer/demand_target_groups") == 31
+
+    asyncio.run(run())
+    with pytest.raises(ValueError, match="ready_batches must be >= 1, got 0.5"):
+        AdaptiveRolloutGroupWorkBuffer.Config(ready_batches=0.5)
+
+
 def test_stall_driven_demand_moves_down_one_group_per_step() -> None:
     for damping_factor in (0.5, 1.0):
         demand = StallDrivenDemand(
