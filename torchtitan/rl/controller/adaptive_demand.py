@@ -116,6 +116,8 @@ class StallDrivenDemand:
     _generating: deque = field(init=False)
     _completed: deque = field(init=False)
     _trainable: deque = field(init=False)
+    # Set by `load_state_dict`: the next `observe` follows a restart
+    _next_observe_follows_resume: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
         self.demand = self.start_batches * self.num_prompts_per_train_step
@@ -143,6 +145,11 @@ class StallDrivenDemand:
             trainable: Of those, groups with a learning signal.
         """
         P = self.num_prompts_per_train_step
+
+        # Not recorded: after a resume nothing is ready only because the restart lost the groups in flight
+        if self._next_observe_follows_resume:
+            self._next_observe_follows_resume = False
+            return self.demand
 
         # Record what this step start looked like
         # TODO: with demand above the buffer's `generation_capacity`, `demand - ready` also counts slots no loop can
@@ -215,13 +222,15 @@ class StallDrivenDemand:
         }
 
     def load_state_dict(self, state_dict: dict[str, object]) -> None:
-        """Restore what `state_dict` returned; each history keeps its last `lookback_steps` values."""
+        """Restore what `state_dict` returned; each history keeps its last `lookback_steps` values. The next
+        `observe` records nothing and keeps the restored demand."""
         self.demand = state_dict["demand"]
         self.state = state_dict["state"]
         self._unavailable = deque(state_dict["unavailable"], maxlen=self.lookback_steps)
         self._generating = deque(state_dict["generating"], maxlen=self.lookback_steps)
         self._completed = deque(state_dict["completed"], maxlen=self.lookback_steps)
         self._trainable = deque(state_dict["trainable"], maxlen=self.lookback_steps)
+        self._next_observe_follows_resume = True
 
 
 def estimate_next_unavailable_upper_bound(

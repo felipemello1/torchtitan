@@ -709,7 +709,7 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
 
         Example:
             buffer.load_state_dict({"demand": 150, "state": "ok", "unavailable": [130, 128], ...})
-            # active-slot cap 150; the next `record_step_start` reads that history
+            # active-slot cap 150; the first `record_step_start` keeps it, the later ones read that history
             buffer.load_state_dict({})
             # nothing saved (a fresh start, or a checkpoint without the buffer's state): cap start_batches x P
         """
