@@ -18,9 +18,10 @@ import copy
 import inspect
 import json
 import os
+import sys
 from contextlib import nullcontext
 from dataclasses import replace
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -835,6 +836,45 @@ def test_batch_invariant_rejects_fp8_kv_cache(tmp_path):
             checkpointer=None,
             dist_moe_runtime=None,
             debug=DebugConfig(batch_invariant=True),
+            reset_kv_cache_on_model_state_dict_load=True,
+            model_state_dict_load_mode="cpu_prefetch",
+            vision_processor=None,
+            mooncake_master_address=None,
+            rank=0,
+            generator_name="generator",
+            output_dir=str(tmp_path),
+        )
+
+
+def test_fp8_kv_with_drafts_rejects_an_fa4_without_query_len_in_heads(
+    tmp_path, monkeypatch
+):
+    # Fake FA4 modules: the RL CPU CI installs no FA4, and the check imports `flash_attn.cute` for its path.
+    fake_cute = ModuleType("flash_attn.cute")
+    fake_cute.__file__ = "/venv/flash_attn/cute/__init__.py"
+    fake_flash_attn = ModuleType("flash_attn")
+    fake_flash_attn.cute = fake_cute
+    monkeypatch.setitem(sys.modules, "flash_attn", fake_flash_attn)
+    monkeypatch.setitem(sys.modules, "flash_attn.cute", fake_cute)
+    monkeypatch.setattr(
+        "torchtitan.rl.generator.vllm.engine.fa4_takes_query_len_in_heads",
+        lambda: False,
+    )
+
+    with pytest.raises(
+        RuntimeError, match="query_len_in_heads.*from /venv/flash_attn/cute/__init__.py"
+    ):
+        VLLMEngine.Config(kv_cache_dtype="fp8", num_speculative_tokens=3).build(
+            model=_MODEL_CONFIG,
+            parallelism=_PARALLELISM,
+            model_path="unused",
+            max_num_seqs=8,
+            precision=PrecisionConfig(),
+            gpu_memory_limit=0.9,
+            max_num_batched_tokens=None,
+            checkpointer=None,
+            dist_moe_runtime=None,
+            debug=DebugConfig(),
             reset_kv_cache_on_model_state_dict_load=True,
             model_state_dict_load_mode="cpu_prefetch",
             vision_processor=None,
