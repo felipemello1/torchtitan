@@ -147,7 +147,9 @@ def test_extract_step_stats_populated_converts_seconds_to_ms():
     )
     iteration = SimpleNamespace(
         num_generation_tokens=12,
-        prompt_token_stats=SimpleNamespace(total=100, cached_tokens=30),
+        prompt_token_stats=SimpleNamespace(
+            total=100, cached_tokens=30, external_kv_transfer=20
+        ),
         num_preempted_reqs=1,
         time_to_first_tokens_iter=[0.012],
         inter_token_latencies_iter=[0.01, 0.02],
@@ -166,6 +168,7 @@ def test_extract_step_stats_populated_converts_seconds_to_ms():
     assert step.num_generation_tokens == 12
     assert step.num_prompt_tokens == 100
     assert step.num_cached_prompt_tokens == 30
+    assert step.num_external_prompt_tokens == 20
     assert step.num_preempted_reqs == 1
     assert step.ttft_ms == pytest.approx([12.0])
     assert step.itl_ms == pytest.approx([10.0, 20.0])
@@ -331,7 +334,9 @@ def test_jsonl_export_writes_recorded_metrics(
     )
     iteration = SimpleNamespace(
         num_generation_tokens=12,
-        prompt_token_stats=SimpleNamespace(total=100, cached_tokens=30),
+        prompt_token_stats=SimpleNamespace(
+            total=100, cached_tokens=30, external_kv_transfer=20
+        ),
         num_preempted_reqs=1,
         time_to_first_tokens_iter=[0.012],
         inter_token_latencies_iter=[0.01, 0.02],
@@ -360,6 +365,7 @@ def test_jsonl_export_writes_recorded_metrics(
         "vllm.generation_tokens": 12,
         "vllm.prompt_tokens": 100,
         "vllm.cached_prompt_tokens": 30,
+        "vllm.external_prompt_tokens": 20,
         "vllm.preempted_requests": 1,
         "vllm.finished_requests": 1,
         "vllm.prefix_cache_queries": 10,
