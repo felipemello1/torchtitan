@@ -33,6 +33,7 @@ from torchtitan.rl.examples.verifiers.generation_server import (
     GROUP_ID_SAMPLING_PARAM,
     VerifiersGenerationMetadata,
 )
+from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout.data import IterableRolloutDataLoader
 from torchtitan.rl.rollout.rollouter import (
     BaseRolloutWorker,
@@ -368,6 +369,14 @@ class VerifiersRolloutWorker(BaseRolloutWorker):
                 group_id=group_id,
                 rollout_id=rollout_id,
             )
+
+            # The env's own metrics, e.g. a grader's `resolved`: one `verifiers/env/<name>` mean over rollouts.
+            if turns:
+                turns[-1].metrics.extend(
+                    m.Metric(f"verifiers/env/{name}", m.Mean(value))
+                    for name, value in trace.metrics.items()
+                    if value is not None
+                )
 
             # ======== Status, reward and logs ========
             status = self.rollout_status(
