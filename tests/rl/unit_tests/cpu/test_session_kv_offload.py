@@ -139,6 +139,36 @@ def test_gpu_block_reuse_counts_hashed_blocks_by_cpu_copy():
     assert connector.gpu_evicted_blocks == {"yes": 1, "no": 1}
 
 
+def test_drop_session_cache_waits_for_a_gpu_block_being_saved():
+    cpu_pool = BlockPool(4, True, 16)
+    _cache(cpu_pool, [b"a", b"kept"])
+    gpu_pool = BlockPool(5, True, 16)
+    _cache(gpu_pool, [b"a", b"b"])
+    (gpu_b,) = gpu_pool.get_cached_block(b"b", [0])
+    connector = _connector(
+        cpu_pool,
+        _store_event_to_blocks={0: SimpleNamespace(gpu_block_ids=[gpu_b.block_id])},
+        _pending_finished_stores=[],
+    )
+    connector.bind_gpu_block_pool(gpu_pool)
+
+    # b's GPU block is being saved, so it keeps its hash until the save registers the CPU copy.
+    assert not connector.drop_session_cache({b"a", b"b"})
+    assert gpu_pool.get_cached_block(b"a", [0]) is None
+    assert gpu_pool.get_cached_block(b"b", [0]) == [gpu_b]
+    assert cpu_pool.get_cached_block(b"a", [0]) is None
+    assert cpu_pool.get_cached_block(b"kept", [0]) is not None
+    # Dropped blocks are not the allocator's reuse.
+    assert connector.gpu_evicted_blocks == {"yes": 0, "no": 0}
+
+    # The save completes with b's CPU copy; the next call drops both copies of b.
+    connector.scheduler_manager._store_event_to_blocks.clear()
+    _cache(cpu_pool, [b"b"])
+    assert connector.drop_session_cache({b"a", b"b"})
+    assert gpu_pool.get_cached_block(b"b", [0]) is None
+    assert cpu_pool.get_cached_block(b"b", [0]) is None
+
+
 def test_gpu_block_reuse_counter_refuses_vllm_kv_cache_metrics():
     gpu_pool = BlockPool(5, True, 16, metrics_collector=KVCacheMetricsCollector())
     with pytest.raises(ValueError, match="kv_cache_metrics"):
