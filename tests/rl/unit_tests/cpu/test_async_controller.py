@@ -13,7 +13,7 @@ import itertools
 import json
 import logging
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import numpy as np
 import pytest
@@ -52,6 +52,7 @@ from torchtitan.rl.rollout.types import (
 )
 
 from torchtitan.rl.trainer.batcher import Batcher
+from torchtitan.rl.trainer.trainer import MirroredState
 from torchtitan.rl.trainer.training_sample_builder import (
     TrainingSample,
     TrainingSampleGroup,
@@ -948,6 +949,7 @@ def _run_with_generator_watcher(
     num_concurrent_rollout_groups=1,
     group_buffer=None,
     start_step=0,
+    restored_buffer_state=None,
 ) -> Controller:
     """Run Controller.run with stub loops: `watcher` waits on the engine loops, `trainer_loop` trains, the rest block."""
     controller = object.__new__(Controller)
@@ -974,6 +976,7 @@ def _run_with_generator_watcher(
         ),
     )
     controller.start_step = start_step
+    controller._restored_buffer_state = restored_buffer_state
     controller._validation_tasks = []
     controller._model_state_dict_pull_tasks = []
     controller._has_pending_validation = False
@@ -1486,6 +1489,116 @@ def test_adaptive_buffer_aims_for_ready_batches_at_a_step_start() -> None:
     asyncio.run(run())
     with pytest.raises(ValueError, match="ready_batches must be >= 1, got 0.5"):
         AdaptiveRolloutGroupWorkBuffer.Config(ready_batches=0.5)
+
+    # 1.1 x 50 = 55 groups, though the float product is 55.00000000000001 (a plain ceil gives 56):
+    # needed 55 + 50 + 1 = 106, half the gap up from 50: 78
+    demand = StallDrivenDemand(
+        num_prompts_per_train_step=50, ready_batches=1.1, start_batches=1
+    )
+    assert (
+        demand.observe(step=1, ready=0, generating=50, completed=0, trainable=0) == 78
+    )
+
+
+def test_adaptive_buffer_resumes_its_demand_from_the_trainer_checkpoint() -> None:
+    """A buffer restored through the trainer checkpoint's `MirroredState` skips the step start right after the
+    restart, then moves its demand as if the run had not stopped."""
+
+    async def run() -> None:
+        buffer = _adaptive_buffer(num_prompts=8, max_offpolicy_steps=10)
+        for _ in range(3):
+            await buffer.record_step_start(trainer_policy_version=0)
+        saved = MirroredState()
+        saved.value = {"group_buffer": buffer.state_dict()}
+        loaded = MirroredState()
+        loaded.load_state_dict(saved.state_dict())
+
+        resumed = _adaptive_buffer(num_prompts=8, max_offpolicy_steps=10)
+        resumed.load_state_dict(loaded.loaded["group_buffer"])
+        # The restored demand, 62, caps the slots before any group is admitted
+        assert _buffer_metric(resumed, "rollout_buffer/available_active_slots") == 62
+
+        # The first step start after the restart is not recorded: its empty shelf measures the restart. Recording
+        # it (unavailable 62) would raise the demand to 75.
+        await resumed.record_step_start(trainer_policy_version=0)
+        assert _buffer_metric(resumed, "rollout_buffer/demand_target_groups") == 62
+
+        # Then it moves as the buffer that never stopped: the history [24, 29, 45] takes 62 -> 75 in both.
+        # Restoring the demand alone, with an empty history, would give 67.
+        for step_buffer in (buffer, resumed):
+            await step_buffer.record_step_start(trainer_policy_version=0)
+        assert [
+            _buffer_metric(step_buffer, "rollout_buffer/demand_target_groups")
+            for step_buffer in (buffer, resumed)
+        ] == [75, 75]
+
+        # The fixed buffer's checkpoint state, {}: the start demand, 3 batches of 8
+        fresh = _adaptive_buffer(num_prompts=8, max_offpolicy_steps=10)
+        fresh.load_state_dict({})
+        assert _buffer_metric(fresh, "rollout_buffer/available_active_slots") == 24
+
+    asyncio.run(run())
+
+
+def _setup_async_with_resume_state(resume_state, *, generator_router) -> Controller:
+    """Run Controller.setup_async with fake actors; the trainer returns `resume_state` as its restored state."""
+    trainer = MagicMock()
+    trainer.rank0.get_policy_version.call_one = AsyncMock(return_value=4)
+    trainer.rank0.get_resume_state.call_one = AsyncMock(return_value=resume_state)
+    trainer.all_ranks.push_model_state_dict.call = AsyncMock()
+    actor_system = MagicMock(
+        provision=AsyncMock(),
+        spawn_trainer=AsyncMock(return_value=trainer),
+        spawn_generator_router=AsyncMock(return_value=generator_router),
+        spawn_batcher=AsyncMock(),
+        initialize_torchstore=AsyncMock(),
+    )
+    controller = object.__new__(Controller)
+    controller.config = MagicMock(
+        max_num_seqs_per_generator_dp_rank=8,
+        num_rollout_workers=1,
+        model_state_dict_transport=None,
+    )
+    controller.config.trainer.parallelism.data_parallel_shard_degree = 1
+    controller.config.trainer.parallelism.data_parallel_replicate_degree = 1
+    controller.config.trainer.parallelism.pipeline_parallel_degree = 1
+    controller.config.rollouter.rollouts_per_worker = 8
+    controller.config.generator.engine.uses_mooncake_store = False
+    controller.tokenizer = SimpleNamespace(eos_id=0)
+    controller._sampling = SamplingConfig()
+    controller._rollouter = MagicMock(setup_async=AsyncMock())
+    controller._build_actor_system = AsyncMock(return_value=actor_system)
+    asyncio.run(controller.setup_async())
+    return controller
+
+
+def test_setup_keeps_the_buffer_state_and_refuses_a_resume_state_without_it() -> None:
+    """setup_async keeps the saved buffer state for run(). A resume state without it (a checkpoint saved before the
+    buffer saved its state) fails before any engine loop starts."""
+
+    def fake_generator_router() -> MagicMock:
+        generator_router = MagicMock()
+        generator_router.start_engine_loop.call_one = AsyncMock()
+        generator_router.pull_model_state_dict.call_one = AsyncMock()
+        return generator_router
+
+    controller = _setup_async_with_resume_state(
+        {"step": 4, "group_buffer": {"demand": 40}},
+        generator_router=fake_generator_router(),
+    )
+    assert controller._restored_buffer_state == {"demand": 40}
+    controller = _setup_async_with_resume_state(
+        None, generator_router=fake_generator_router()
+    )
+    assert controller._restored_buffer_state is None
+
+    generator_router = fake_generator_router()
+    with pytest.raises(ValueError, match="no 'group_buffer' key"):
+        _setup_async_with_resume_state(
+            {"dataloader": {}, "curriculum": {}, "step": 4},
+            generator_router=generator_router,
+        )
+    generator_router.start_engine_loop.call_one.assert_not_awaited()
 
 
 def test_stall_driven_demand_moves_down_one_group_per_step() -> None:
@@ -2104,16 +2217,21 @@ def test_batcher_passes_the_version_that_trains_each_group() -> None:
 
 
 def test_run_builds_the_adaptive_buffer_with_one_generating_group_per_rollout_loop() -> None:
-    """The adaptive buffer admits at most one generating group per rollout loop, and starts at the resumed version."""
+    """The adaptive buffer admits at most one generating group per rollout loop, and starts at the resumed version
+    and demand."""
+    saved_demand = StallDrivenDemand(num_prompts_per_train_step=1, start_batches=40)
     controller = _run_with_generator_watcher(
         _block_forever,
         trainer_loop=_train_one_step,
         num_concurrent_rollout_groups=3,
         group_buffer=AdaptiveRolloutGroupWorkBuffer.Config(max_offpolicy_steps=8),
         start_step=5,
+        restored_buffer_state=saved_demand.state_dict(),
     )
     buffer = controller._group_buffer
     assert isinstance(buffer, AdaptiveRolloutGroupWorkBuffer)
     assert _buffer_metric(buffer, "rollout_buffer/generation_capacity_groups") == 3
     # Resumed at step 5: a group claimed now is 0 versions old for the first batch, which trains at 5.
     assert buffer._generator_policy_version == buffer._consuming_policy_version == 5
+    # The saved demand, 40 groups, caps the slots; a fresh start would cap them at 3 batches, 3 groups.
+    assert _buffer_metric(buffer, "rollout_buffer/available_active_slots") == 40

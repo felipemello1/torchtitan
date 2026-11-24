@@ -70,7 +70,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class StallDrivenDemand:
-    """Demand = ceil(ready_batches x P) + quantile of the unavailable count + 1, smoothed per step, under a ceiling.
+    """Demand = ceil(ready_batches x P) + quantile of the unavailable count + 1. It moves up part of the gap or down
+    one group per step, under a ceiling.
 
     Args:
         num_prompts_per_train_step: P, groups the trainer consumes per step.
@@ -80,12 +81,13 @@ class StallDrivenDemand:
             stalling: demand is capped at the mean-age ceiling for this age. None: the ceiling is applied at
             `max_offpolicy_steps`, if given; with neither there is no ceiling.
         lookback_steps: how many of the most recent step starts the quantile is taken over; older values are forgotten.
-        stall_probability: the share of step starts allowed to find fewer than `ready_batches` batches ready (a stall,
-            with 1.0); the quantile is taken at 1 - stall_probability. This is what the rule aims for when nothing
-            else limits the demand. It cannot be met when the age ceiling or the generators' capacity caps the demand
-            below what the workload needs, and it assumes some finished groups are trainable.
-        ready_batches: batches of P the demand aims to have ready at each step start. 1.0 is just enough to train;
-            1.5 keeps half a batch spare, so fewer steps wait for generation.
+        stall_probability: the share of step starts allowed to find fewer than `ready_batches` batches ready; with
+            1.0, that is a stall. The quantile is taken at 1 - stall_probability. This is what the rule aims for when
+            nothing else limits the demand. It cannot be met when the age ceiling or the generators' capacity caps
+            the demand below what the workload needs, and it assumes some finished groups are trainable.
+        ready_batches: batches of P the demand aims to have ready at each step start. 1.0 is just enough to train.
+            1.5 keeps half a batch spare, so fewer steps wait while generation keeps up; the buffer then holds more
+            groups, and they train older.
         start_batches: demand at the first step, in batches of P; the rule learns the rest from the run itself.
         damping_factor: how much of the gap between the current demand and `demand_needed` is closed per step going
             up, or coming down to the mean-age ceiling; otherwise demand comes down one group per step. 0.5 moves
@@ -116,6 +118,8 @@ class StallDrivenDemand:
     _generating: deque = field(init=False)
     _completed: deque = field(init=False)
     _trainable: deque = field(init=False)
+    # Set by `load_state_dict`: the next `observe` follows a restart
+    _next_observe_follows_resume: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
         self.demand = self.start_batches * self.num_prompts_per_train_step
@@ -144,6 +148,16 @@ class StallDrivenDemand:
         """
         P = self.num_prompts_per_train_step
 
+        # Not recorded: after a resume nothing is ready only because the restart lost the groups in flight
+        # TODO: the 2nd and 3rd step starts after a resume may also find a short shelf, since every group was
+        # admitted at once. Skip them too if a real resume shows it.
+        if self._next_observe_follows_resume:
+            self._next_observe_follows_resume = False
+            logger.info(
+                f"step {step}: first step start after a resume, not recorded; demand stays {self.demand} groups"
+            )
+            return self.demand
+
         # Record what this step start looked like
         # TODO: with demand above the buffer's `generation_capacity`, `demand - ready` also counts slots no loop can
         # fill, so a generation-bound stall raises the demand to the age ceiling, and it then falls one group per step.
@@ -160,7 +174,9 @@ class StallDrivenDemand:
             history=list(self._unavailable),
             probability=1 - self.stall_probability,
         )
-        demand_needed = math.ceil(self.ready_batches * P) + unavailable_upper_bound + 1
+        # Rounded first: in floats 1.1 * 50 is 55.00000000000001, whose ceil is one group too many
+        ready_groups = math.ceil(round(self.ready_batches * P, 9))
+        demand_needed = ready_groups + unavailable_upper_bound + 1
 
         # At most one group down per step, so a large shelf cannot stop admission; the ceiling below can cut faster
         demand_needed = max(demand_needed, self.demand - 1)
@@ -194,6 +210,42 @@ class StallDrivenDemand:
             damping_factor=self.damping_factor,
         )
         return self.demand
+
+    def state_dict(self) -> dict[str, object]:
+        """The demand and the history `observe` reads, as plain values, so a resumed run continues from them.
+
+        Example:
+            demand = StallDrivenDemand(num_prompts_per_train_step=8)
+            demand.observe(step=1, ready=0, generating=24, completed=0, trainable=0)
+            demand.state_dict()
+            # -> {"demand": 29, "state": "ok", "unavailable": [24], "generating": [24], "completed": [0],
+            #     "trainable": [0]}
+        """
+        return {
+            "demand": self.demand,
+            "state": self.state,
+            "unavailable": list(self._unavailable),
+            "generating": list(self._generating),
+            "completed": list(self._completed),
+            "trainable": list(self._trainable),
+        }
+
+    def load_state_dict(self, state_dict: dict[str, object]) -> None:
+        """Restore what `state_dict` returned; each history keeps its last `lookback_steps` values. The next
+        `observe` records nothing and keeps the restored demand.
+
+        Example:
+            resumed = StallDrivenDemand(num_prompts_per_train_step=8)
+            resumed.load_state_dict(demand.state_dict())  # demand 29, history [24], as in `state_dict`'s example
+            resumed.observe(step=2, ready=0, generating=0, completed=0, trainable=0)  # -> 29, nothing recorded
+        """
+        self.demand = state_dict["demand"]
+        self.state = state_dict["state"]
+        self._unavailable = deque(state_dict["unavailable"], maxlen=self.lookback_steps)
+        self._generating = deque(state_dict["generating"], maxlen=self.lookback_steps)
+        self._completed = deque(state_dict["completed"], maxlen=self.lookback_steps)
+        self._trainable = deque(state_dict["trainable"], maxlen=self.lookback_steps)
+        self._next_observe_follows_resume = True
 
 
 def estimate_next_unavailable_upper_bound(
