@@ -63,6 +63,7 @@ def chunk_kernel_options(q: torch.Tensor) -> KernelOptions:
     # TODO: bring back backend="warpdrive" (packed fp16/bf16 on SM100/SM103: GDN fwd+bwd 2.3-3.9x faster on GB300)
     # once it is checked causally consistent at long packed lengths. Attention Gym's earlier "cudnn" GDN chunk kernel
     # was not (Qwen3.8-27B, 78k tokens, GB300, Flash attention: pos 562 full -1.91, prefix -10.35; fused -0.0146 both).
-    # KDA's warpdrive kernel is untested at these lengths too, so it stays fused.
+    # KDA's warpdrive kernel is untested at these lengths too, so it stays fused. File an Attention Gym issue with
+    # this repro and link it here.
     del q
     return KernelOptions(backend="fused")
