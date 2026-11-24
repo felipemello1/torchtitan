@@ -522,6 +522,8 @@ class VLLMEngine(GenerationEngine):
             else None
         )
         self._session_kv_holder: VLLMSessionKVHolder | None = None
+        # vLLM's request id for each of ours in flight (it may add a suffix), for the holder.
+        self._internal_request_ids: dict[str, str] = {}
         if config.session_kv_holder is not None:
             self._session_kv_holder = config.session_kv_holder.build(
                 scheduler=scheduler, offload_connector=offload_connector
@@ -793,6 +795,7 @@ class VLLMEngine(GenerationEngine):
                         request.routing_session_id,
                         request.group_id,
                     )
+                    self._internal_request_ids[request.request_id] = internal_request_id
             except (ValueError, VLLMClientError) as exc:
                 rejected_requests.append((request.request_id, exc))
         return rejected_requests
@@ -918,7 +921,16 @@ class VLLMEngine(GenerationEngine):
         finished_requests += self._abort_running_requests_with_non_finite_logprobs()
 
         if self._session_kv_holder is not None:
-            self._session_kv_holder.after_step()
+            # Both abort paths: the holder drops each aborted turn's cached prefix.
+            # TODO: this passes every request with finish reason "abort"; today only the two
+            # non-finite paths abort. Before a cancel or timeout path aborts through vLLM, collect the
+            # ids in the non-finite paths instead, else the holder drops the cancelled session's KV.
+            aborted_request_ids = set()
+            for request in finished_requests:
+                internal_request_id = self._internal_request_ids.pop(request.request_id)
+                if request.finish_reason == "abort":
+                    aborted_request_ids.add(internal_request_id)
+            self._session_kv_holder.after_step(aborted_request_ids)
         return finished_requests
 
     def _abort_running_requests_with_non_finite_logprobs(self) -> list[FinishedRequest]:
@@ -934,7 +946,8 @@ class VLLMEngine(GenerationEngine):
         """
         # TODO: find why logprobs turn non-finite: ~7 requests per hour with an fp8 KV cache, 3 MTP draft
         # tokens and an FA4 build with fp8 SwapAB decode (candidates: vllm-project/vllm#62800, #67717).
-        # Until then this check ends such a request at once, so no non-finite logprob leaves the engine.
+        # Until then this check ends such a request at once, so no non-finite logprob leaves the engine,
+        # and the session KV holder drops the turn's cached prefix, so the next turn doesn't read it.
         # No collective: every TP rank samples from the same full logits, so all ranks abort the same
         # requests in the same step (not tested at TP > 1).
         non_finite_states = [

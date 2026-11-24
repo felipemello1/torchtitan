@@ -13,7 +13,10 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from torchtitan.rl.generator.vllm.session_kv_holder import VLLMSessionKVHolder
+from torchtitan.rl.generator.vllm.session_kv_holder import (
+    cached_block_ids,
+    VLLMSessionKVHolder,
+)
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_manager import KVCacheManager
@@ -326,6 +329,67 @@ def test_release_waits_for_decode_and_saves_and_preserves_shared_prefix(manager)
     assert not holder.has_pending_work
     holder.release(["session-0", "unknown"], [0, 1])
     assert connector.release_session_cache.call_count == 2
+
+
+def test_aborted_turn_uncaches_its_own_prefix_and_keeps_the_shared_prompt(manager):
+    # GRPO siblings s0 and s1 share a 32-token prompt. The engine aborts s0's turn (a non-finite
+    # logprob) after the holder held its prefix.
+    requests = {}
+    holder = _holder(manager, requests)
+    shared = list(range(32))
+    first_turns = {
+        "s0": _request("s0-t0", shared + list(range(100, 118))),
+        "s1": _request("s1-t0", shared + list(range(200, 218))),
+    }
+    for session_id, request in first_turns.items():
+        requests[request.request_id] = request
+        holder.track(request.request_id, session_id=session_id, group_id=0)
+        _prefill(manager, request)
+    holder.after_step()
+    for request in first_turns.values():
+        manager.free(request)
+        del requests[request.request_id]
+    holder.after_step(aborted_request_ids={"s0-t0"})
+    assert holder.num_sessions == 1
+
+    s0_only_hashes = set(first_turns["s0"].block_hashes) - set(
+        first_turns["s1"].block_hashes
+    )
+    assert s0_only_hashes
+    assert not cached_block_ids(manager.block_pool, s0_only_hashes)
+    # s1 first: s0's recompute would cache the shared prompt again.
+    s1_next = _request("s1-t1", list(first_turns["s1"].all_token_ids) + [5, 6, 7])
+    assert _prefill(manager, s1_next) == 48
+    s0_next = _request("s0-t1", list(first_turns["s0"].all_token_ids) + [5, 6, 7])
+    assert _prefill(manager, s0_next) <= len(shared)
+
+
+def test_aborted_turn_drop_retries_while_a_cpu_save_is_in_flight(manager):
+    connector = Mock()
+    connector.get_pending_save_ids.return_value = set()
+    drop_calls = []
+
+    def drop_session_cache(block_hashes):
+        drop_calls.append(set(block_hashes))
+        # The first call finds one GPU block still being saved to the CPU.
+        return len(drop_calls) > 1
+
+    connector.drop_session_cache.side_effect = drop_session_cache
+    requests = {}
+    holder = _holder(manager, requests, offload_connector=connector)
+    turn = _request("t0", list(range(50)))
+    requests["t0"] = turn
+    holder.track("t0", session_id="s", group_id=0)
+    _prefill(manager, turn)
+    holder.after_step()
+    manager.free(turn)
+    del requests["t0"]
+
+    holder.after_step(aborted_request_ids={"t0"})
+    assert holder.has_pending_work
+    holder.after_step()
+    assert not holder.has_pending_work
+    assert drop_calls == [set(turn.block_hashes)] * 2
 
 
 def test_evict_until_free_skips_a_session_with_a_running_request(manager):

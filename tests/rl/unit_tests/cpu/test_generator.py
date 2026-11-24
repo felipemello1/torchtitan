@@ -175,6 +175,7 @@ def _vllm_engine(*, reset_kv_cache_on_model_state_dict_load=False, model=None):
     )
     engine._get_model = lambda: model
     engine._session_kv_holder = None
+    engine._internal_request_ids = {}
     engine._is_tp_rank_0 = True
     engine._generator_name = "generator_0"
     engine._vision_processor = None
@@ -440,7 +441,7 @@ def test_session_kv_holder_tracks_admitted_requests_and_releases_sessions():
 
     # The holder tracks vLLM's internal request id, which carries a random suffix.
     holder.track.assert_called_once_with("r0-internal", "group=3/rollout=0", 3)
-    holder.after_step.assert_called_once_with()
+    holder.after_step.assert_called_once_with(set())
     holder.release.assert_called_once_with(["group=3/rollout=0"], [3])
 
 
@@ -711,6 +712,8 @@ def test_step_aborts_requests_whose_summed_logprob_is_not_finite(caplog):
         ).request_outputs,
         abort_request=abort_request,
     )
+    engine._session_kv_holder = Mock()
+    engine._internal_request_ids = dict(internal_ids)
 
     with caplog.at_level(logging.WARNING, logger=vllm_engine_module.__name__):
         finished_by_step = [
@@ -728,6 +731,16 @@ def test_step_aborts_requests_whose_summed_logprob_is_not_finite(caplog):
     ]
     assert aborted_internal_ids == [internal_ids["nan-running"]]
     assert list(output_processor.request_states) == [internal_ids["ok"]]
+    # Finished requests leave the id map.
+    assert engine._internal_request_ids == {"ok": internal_ids["ok"]}
+    # The holder hears of both aborts by vLLM's id, also nan-last, which vLLM itself finished.
+    assert [
+        call.args for call in engine._session_kv_holder.after_step.call_args_list
+    ] == [
+        ({internal_ids["nan-running"]},),
+        ({internal_ids["nan-last"]},),
+        (set(),),
+    ]
     assert (
         "generator_0: aborted request nan-running after 1 generated tokens"
         in caplog.text

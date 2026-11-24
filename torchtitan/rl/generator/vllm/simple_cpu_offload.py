@@ -28,6 +28,8 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 
+from torchtitan.rl.generator.vllm.session_kv_holder import cached_block_ids
+
 if TYPE_CHECKING:
     from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -248,6 +250,37 @@ class SimpleCPUOffloadConnector(VllmSimpleCPUOffloadConnector):
         for block in ordered_blocks:
             pool.free_block_queue.remove(block)
         pool.free_block_queue.prepend_n(ordered_blocks)
+
+    def drop_session_cache(self, block_hashes: set[BlockHash]) -> bool:
+        """Uncache every GPU and CPU copy of `block_hashes`; return whether all are gone.
+
+        A GPU block still being saved keeps its hash: vLLM registers the CPU copy under it when the
+        save completes. The caller calls again after a step:
+
+            GPU blocks 7 (h2), 9 (h3, saving)  ->  7 uncached, CPU copies of h2, h3 dropped: False
+            next step, 9's save done           ->  9 uncached, its new CPU copy dropped: True
+        """
+        manager = self.scheduler_manager
+        # TODO: reads the manager's private save state, as `get_pending_save_ids` does
+        # (vllm-project/vllm#51428).
+        saving = {
+            block_id
+            for transfer in [
+                *manager._store_event_to_blocks.values(),
+                *manager._pending_finished_stores,
+            ]
+            for block_id in transfer.gpu_block_ids
+        }
+        gpu_pool = self._gpu_block_pool
+        gpu_block_ids = cached_block_ids(gpu_pool, block_hashes)
+        # Not the allocator reusing blocks: keep these out of `gpu_evicted_blocks`.
+        counter, gpu_pool.metrics_collector = gpu_pool.metrics_collector, None
+        gpu_pool.evict_blocks(gpu_block_ids - saving)
+        gpu_pool.metrics_collector = counter
+
+        cpu_pool = manager.cpu_block_pool
+        cpu_pool.evict_blocks(cached_block_ids(cpu_pool, block_hashes))
+        return not gpu_block_ids & saving
 
 
 class _CPUCopyEvictionCounter(KVCacheMetricsCollector):
