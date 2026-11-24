@@ -266,6 +266,7 @@ def test_idle_dp_forward_does_not_skip_queued_output_drain():
     engine._engine = SimpleNamespace(
         dp_group=object(),
         has_unfinished_requests_dp=coordinate,
+        output_processor=SimpleNamespace(request_states={}),
         engine_core=SimpleNamespace(
             engine_core=SimpleNamespace(
                 scheduler=SimpleNamespace(has_requests=lambda: False),

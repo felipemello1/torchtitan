@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import tempfile
 from collections.abc import Callable, Iterable
@@ -484,8 +485,11 @@ class VLLMEngine(GenerationEngine):
             generator_name=generator_name,
         )
         tp_degree = parallelism.tensor_parallel_degree
+        # TP rank 0 logs what all ranks do alike, e.g. an abort, once.
+        self._is_tp_rank_0 = rank % tp_degree == 0
+        self._generator_name = generator_name
         stat_loggers = None
-        if rank % tp_degree == 0:
+        if self._is_tp_rank_0:
             stat_loggers = self._build_stat_loggers(
                 StatLoggerContext(
                     rank=rank,
@@ -868,7 +872,7 @@ class VLLMEngine(GenerationEngine):
         )
 
     def step(self) -> list[FinishedRequest]:
-        """Run one engine step, a TP collective, and return the requests it finished."""
+        """Run one engine step, a TP collective, and return the requests it finished or aborted."""
         if self._coordinate_kv_offload and self._engine.dp_group is not None:
             core = self._engine.engine_core.engine_core
             # Idle DP replicas must still join the EP forward. Include KV-only
@@ -881,9 +885,80 @@ class VLLMEngine(GenerationEngine):
             # still have queued async outputs and KV completions to drain.
         with torch.no_grad():
             request_outputs = self._engine.step()
+
+        finished_requests = []
+        for request_output in request_outputs:
+            completion_output = request_output.outputs[0]
+            # A request can finish in the step that gave it its non-finite logprob.
+            if math.isfinite(completion_output.cumulative_logprob):
+                finished_requests.append(_finished_request(request_output))
+            else:
+                finished_requests.append(
+                    self._aborted_request(
+                        request_output.request_id,
+                        num_tokens=len(completion_output.token_ids),
+                    )
+                )
+        finished_requests += self._abort_running_requests_with_non_finite_logprobs()
+
         if self._session_kv_holder is not None:
             self._session_kv_holder.after_step()
-        return [_finished_request(request_output) for request_output in request_outputs]
+        return finished_requests
+
+    def _abort_running_requests_with_non_finite_logprobs(self) -> list[FinishedRequest]:
+        """Abort each running request whose summed logprob is NaN or -inf, and return it with finish
+        reason "abort".
+
+        Example: a request whose logits turned NaN samples token 0 at a NaN logprob on every step
+        until its context fills, for hours. NaN stays in the running sum, so it is caught at once:
+
+            running sums:  {"g3/r1-a9f": -812.4, "g7/r0-c21": nan}
+            -> vLLM drops "g7/r0-c21"; returns FinishedRequest(request_id="g7/r0", token_ids=[],
+               finish_reason="abort"), which the caller's `generate` returns
+        """
+        # TODO: find why logprobs turn non-finite: ~7 requests per hour with an fp8 KV cache, 3 MTP draft
+        # tokens and an FA4 build with fp8 SwapAB decode (candidates: vllm-project/vllm#62800, #67717).
+        # Until then this check ends such a request at once, so no non-finite logprob leaves the engine.
+        # No collective: every TP rank samples from the same full logits, so all ranks abort the same
+        # requests in the same step (not tested at TP > 1).
+        non_finite_states = [
+            state
+            for state in self._engine.output_processor.request_states.values()
+            # `logprobs=0` (`_build_sampling_params`) starts every sum at 0.0, never None.
+            if not math.isfinite(state.logprobs_processor.cumulative_logprob)
+        ]
+        if not non_finite_states:
+            return []
+
+        # vLLM's in-process abort sends no output: the returned requests answer the waiting calls.
+        # It takes vLLM's internal ids (ours plus a random suffix); the replies use ours.
+        self._engine.abort_request(
+            [state.request_id for state in non_finite_states], internal=True
+        )
+        return [
+            self._aborted_request(
+                state.external_req_id, num_tokens=state.detokenizer.num_output_tokens()
+            )
+            for state in non_finite_states
+        ]
+
+    def _aborted_request(self, request_id: str, *, num_tokens: int) -> FinishedRequest:
+        """Log the abort of a request whose summed logprob is not finite, and return it with finish
+        reason "abort" and no tokens: none of them can train."""
+        if self._is_tp_rank_0:
+            logger.warning(
+                f"{self._generator_name}: aborted request {request_id} after {num_tokens} generated "
+                "tokens: its summed logprob is not finite (NaN or -inf)"
+            )
+        return FinishedRequest(
+            request_id=request_id,
+            token_ids=[],
+            token_logprobs=[],
+            finish_reason="abort",
+            metrics_inputs=RequestMetricsInputs(
+                num_cached_tokens=None, has_stats=False
+            ),
+        )
 
     def release_sessions(self, session_ids: list[str], group_ids: list[int]) -> None:
         if not session_ids and not group_ids:
