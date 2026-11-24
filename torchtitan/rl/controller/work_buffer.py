@@ -279,6 +279,14 @@ class RolloutGroupWorkBuffer(Configurable):
             trainer_policy_version: Version of the weights that will train the batch being waited for.
         """
 
+    def state_dict(self) -> dict[str, object]:
+        """State the controller saves in each checkpoint. This buffer has none: its slots come from its arguments."""
+        return {}
+
+    def load_state_dict(self, state_dict: dict[str, object]) -> None:
+        """Restore what `state_dict` returned, before the data input loop starts. This buffer ignores it; the
+        adaptive buffer restores its demand."""
+
     def pop_dropped_group_ids(self) -> list[int]:
         """Trainer loop, at the optimizer step: groups dropped since the last call, so the dataloader
         stops replaying them. This buffer drops nothing; the adaptive buffer drops groups too old to train.
@@ -691,6 +699,25 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
             self._max_active_rollout_groups = self._demand.demand
             if grew:
                 self._condition.notify_all()
+
+    def state_dict(self) -> dict[str, object]:
+        """The demand rule's state (`StallDrivenDemand.state_dict`). Only `record_step_start` changes it."""
+        return self._demand.state_dict()
+
+    def load_state_dict(self, state_dict: dict[str, object]) -> None:
+        """Restore the demand rule and make its demand the active-slot cap. Call it before the data input loop starts.
+
+        Example:
+            buffer.load_state_dict({"demand": 150, "state": "ok", "unavailable": [130, 128], ...})
+            # active-slot cap 150; the next `record_step_start` reads that history
+            buffer.load_state_dict({})
+            # nothing saved (a fresh start, or a checkpoint without the buffer's state): cap start_batches x P
+        """
+        if not state_dict:
+            return
+        self._demand.load_state_dict(state_dict)
+        self._max_active_rollout_groups = self._demand.demand
+        logger.info(f"Rollout buffer: resumed at demand {self._demand.demand} groups")
 
     def metrics(self) -> list[m.Metric]:
         generating = sum(
