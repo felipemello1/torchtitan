@@ -1510,8 +1510,8 @@ def test_adaptive_buffer_aims_for_ready_batches_at_a_step_start() -> None:
 
 
 def test_adaptive_buffer_resumes_its_demand_from_the_trainer_checkpoint() -> None:
-    """A buffer restored through the trainer checkpoint's `MirroredState` moves its demand as if the run had not
-    stopped."""
+    """A buffer restored through the trainer checkpoint's `MirroredState` skips the step start right after the
+    restart, then moves its demand as if the run had not stopped."""
 
     async def run() -> None:
         buffer = _adaptive_buffer(num_prompts=8, max_offpolicy_steps=10)
@@ -1527,8 +1527,13 @@ def test_adaptive_buffer_resumes_its_demand_from_the_trainer_checkpoint() -> Non
         # The restored demand, 62, caps the slots before any group is admitted
         assert _buffer_metric(resumed, "rollout_buffer/available_active_slots") == 62
 
-        # The next step start reads the restored history [24, 29, 45]: demand 62 -> 75 in both, as in the buffer
-        # that never stopped. Restoring the demand alone, with an empty history, would give 67.
+        # The first step start after the restart is not recorded: its empty shelf measures the restart. Recording
+        # it (unavailable 62) would raise the demand to 75.
+        await resumed.record_step_start(trainer_policy_version=0)
+        assert _buffer_metric(resumed, "rollout_buffer/demand_target_groups") == 62
+
+        # Then it moves as the buffer that never stopped: the history [24, 29, 45] takes 62 -> 75 in both.
+        # Restoring the demand alone, with an empty history, would give 67.
         for step_buffer in (buffer, resumed):
             await step_buffer.record_step_start(trainer_policy_version=0)
         assert [
