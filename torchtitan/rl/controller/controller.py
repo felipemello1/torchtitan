@@ -961,10 +961,16 @@ class Controller(Configurable):
             self.trainer.rank0.get_policy_version.call_one(),
             self.trainer.rank0.get_resume_state.call_one(),
         )
-        # run() restores the group buffer from it, once it builds the buffer
-        self._resume_state: dict[str, object] | None = resume_state
+        # run() restores the group buffer from this, once it builds the buffer
+        self._restored_buffer_state: dict[str, object] | None = None
         if resume_state is not None:
+            if "group_buffer" not in resume_state:
+                raise ValueError(
+                    "The checkpoint's resume state has no 'group_buffer' key, so the group buffer cannot resume; "
+                    f"its keys: {sorted(resume_state)}"
+                )
             self._rollouter.load_state_dict(resume_state)
+            self._restored_buffer_state = resume_state["group_buffer"]
             logger.info("Restored RL dataloader state")
             # TODO: Replay cached finished rollouts instead of regenerating all
             # pending prompts after resume.
@@ -1182,8 +1188,8 @@ class Controller(Configurable):
                 window_size=window_size,
             )
         # Before the data input loop starts, so a resumed demand caps the first admissions.
-        if self._resume_state is not None:
-            self._group_buffer.load_state_dict(self._resume_state["group_buffer"])
+        if self._restored_buffer_state is not None:
+            self._group_buffer.load_state_dict(self._restored_buffer_state)
 
         # training_batch_queue
         training_batch_queue: asyncio.Queue[
@@ -1244,12 +1250,9 @@ class Controller(Configurable):
             generator_task,
         ]
         try:
-            # TODO: on resume, restart the validation that was still running when the previous run
-            # stopped. The checkpoint doesn't record it, so it is lost unless the start step is due.
-            # It happens when checkpoints come more often than a validation lasts (every 2 steps, a validation
-            # over several steps): a requeue mid-validation resumes at a step that is not due, and
-            # `keep_latest_k` can purge the validated weights. Fix: save the last validation step that ended in
-            # the resume state, and validate a missed due step at the resume step.
+            # TODO: on resume, restart the validation still running when the run stopped. The checkpoint doesn't
+            # record it, so it is lost unless the resume step is due, e.g. a requeue mid-validation with checkpoints
+            # every 2 steps. Save the last validation step that ended in the resume state; validate a missed one.
             self._maybe_start_validation(step=self.start_step)
             done, _ = await asyncio.wait(
                 [trainer_task, *background_tasks], return_when=asyncio.FIRST_COMPLETED

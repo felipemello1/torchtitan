@@ -13,7 +13,7 @@ import itertools
 import json
 import logging
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import numpy as np
 import pytest
@@ -951,7 +951,7 @@ def _run_with_generator_watcher(
     num_concurrent_rollout_groups=1,
     group_buffer=None,
     start_step=0,
-    resume_state=None,
+    restored_buffer_state=None,
 ) -> Controller:
     """Run Controller.run with stub loops: `watcher` waits on the engine loops, `trainer_loop` trains, the rest block."""
     controller = object.__new__(Controller)
@@ -978,7 +978,7 @@ def _run_with_generator_watcher(
         ),
     )
     controller.start_step = start_step
-    controller._resume_state = resume_state
+    controller._restored_buffer_state = restored_buffer_state
     controller._validation_tasks = []
     controller._model_state_dict_pull_tasks = []
     controller._has_pending_validation = False
@@ -1555,6 +1555,67 @@ def test_adaptive_buffer_resumes_its_demand_from_the_trainer_checkpoint() -> Non
         assert _buffer_metric(fresh, "rollout_buffer/available_active_slots") == 24
 
     asyncio.run(run())
+
+
+def _setup_async_with_resume_state(resume_state, *, generator_router) -> Controller:
+    """Run Controller.setup_async with fake actors; the trainer returns `resume_state` as its restored state."""
+    trainer = MagicMock()
+    trainer.rank0.get_policy_version.call_one = AsyncMock(return_value=4)
+    trainer.rank0.get_resume_state.call_one = AsyncMock(return_value=resume_state)
+    trainer.all_ranks.push_model_state_dict.call = AsyncMock()
+    actor_system = MagicMock(
+        provision=AsyncMock(),
+        spawn_trainer=AsyncMock(return_value=trainer),
+        spawn_generator_router=AsyncMock(return_value=generator_router),
+        spawn_batcher=AsyncMock(),
+        initialize_torchstore=AsyncMock(),
+    )
+    controller = object.__new__(Controller)
+    controller.config = MagicMock(
+        max_num_seqs_per_generator_dp_rank=8,
+        num_rollout_workers=1,
+        model_state_dict_transport=None,
+    )
+    controller.config.trainer.parallelism.data_parallel_shard_degree = 1
+    controller.config.trainer.parallelism.data_parallel_replicate_degree = 1
+    controller.config.trainer.parallelism.pipeline_parallel_degree = 1
+    controller.config.rollouter.rollouts_per_worker = 8
+    controller.config.generator.engine.uses_mooncake_store = False
+    controller.tokenizer = SimpleNamespace(eos_id=0)
+    controller._sampling = SamplingConfig()
+    controller._rollouter = MagicMock(setup_async=AsyncMock())
+    controller._build_actor_system = AsyncMock(return_value=actor_system)
+    asyncio.run(controller.setup_async())
+    return controller
+
+
+def test_setup_keeps_the_buffer_state_and_refuses_a_resume_state_without_it() -> None:
+    """setup_async keeps the saved buffer state for run(). A resume state without it (a checkpoint saved before the
+    buffer saved its state) fails before any engine loop starts."""
+
+    def fake_generator_router() -> MagicMock:
+        generator_router = MagicMock()
+        generator_router.start_engine_loop.call_one = AsyncMock()
+        generator_router.pull_model_state_dict.call_one = AsyncMock()
+        return generator_router
+
+    controller = _setup_async_with_resume_state(
+        {"step": 4, "group_buffer": {"demand": 40}},
+        generator_router=fake_generator_router(),
+    )
+    assert controller._restored_buffer_state == {"demand": 40}
+    controller = _setup_async_with_resume_state(
+        None, generator_router=fake_generator_router()
+    )
+    assert controller._restored_buffer_state is None
+
+    generator_router = fake_generator_router()
+    with pytest.raises(ValueError, match="no 'group_buffer' key"):
+        _setup_async_with_resume_state(
+            {"dataloader": {}, "curriculum": {}, "step": 4},
+            generator_router=generator_router,
+        )
+    generator_router.start_engine_loop.call_one.assert_not_awaited()
 
 
 def test_stall_driven_demand_moves_down_one_group_per_step() -> None:
@@ -2182,7 +2243,7 @@ def test_run_builds_the_adaptive_buffer_with_one_generating_group_per_rollout_lo
         num_concurrent_rollout_groups=3,
         group_buffer=AdaptiveRolloutGroupWorkBuffer.Config(max_offpolicy_steps=8),
         start_step=5,
-        resume_state={"step": 5, "group_buffer": saved_demand.state_dict()},
+        restored_buffer_state=saved_demand.state_dict(),
     )
     buffer = controller._group_buffer
     assert isinstance(buffer, AdaptiveRolloutGroupWorkBuffer)

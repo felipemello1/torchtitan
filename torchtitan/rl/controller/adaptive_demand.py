@@ -149,10 +149,8 @@ class StallDrivenDemand:
         P = self.num_prompts_per_train_step
 
         # Not recorded: after a resume nothing is ready only because the restart lost the groups in flight
-        # TODO: the 2nd and 3rd step starts after a resume may also find a short shelf: every group was admitted at
-        # once (a fresh start found 0, 8, then 10 groups ready, against ~25 later). A CPU replay of that at a steady
-        # demand of 112 peaks at 132 with this one skip, and stays at 112 with three. Skip more step starts if a real
-        # resume shows the short shelf.
+        # TODO: the 2nd and 3rd step starts after a resume may also find a short shelf, since every group was
+        # admitted at once. Skip them too if a real resume shows it.
         if self._next_observe_follows_resume:
             self._next_observe_follows_resume = False
             logger.info(
