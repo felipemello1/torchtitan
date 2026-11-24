@@ -414,6 +414,8 @@ def test_calls_cancelled_on_the_queue_are_skipped(runner) -> None:
     message, load = _message(_request()), _load(5)
     for call in (message, load):
         call.reply.cancel()
+    # Set as `load_model_state_dict` sets it for this hot-swap load.
+    engine_loop._rank0_hot_swap_load_queued = True
     pending_engine_requests: list[EngineRequest] = []
     pending_load_messages: list[ModelStateDictLoadMessage] = []
     decision = _decide(
@@ -427,6 +429,8 @@ def test_calls_cancelled_on_the_queue_are_skipped(runner) -> None:
     assert decision.action is LoopAction.STEP and decision.requests_per_dp_rank == [[]]
     assert pending_engine_requests == [] and pending_load_messages == []
     assert engine_loop._request_dispatcher._rank0_outstanding_generations == {}
+    # The cancelled load still clears it, or every later burst would stop after one step.
+    assert not engine_loop._rank0_hot_swap_load_queued
 
 
 def test_duplicate_request_id_is_fatal(runner) -> None:
@@ -721,6 +725,7 @@ def engine_thread(monkeypatch):
     """Returns a function that builds an engine loop around `engine`, with its engine loop thread
     running; stops those threads afterwards."""
     # Rank 0 is the only rank, so the decision broadcast and the load's all-reduce are no-ops.
+    monkeypatch.setattr(engine_loop_module.dist, "get_world_size", lambda group: 1)
     monkeypatch.setattr(
         engine_loop_module.dist, "broadcast_object_list", lambda *a, **k: None
     )
@@ -1183,6 +1188,57 @@ def test_draining_load_applies_after_admitted_requests_and_before_held_back_ones
     asyncio.run(run())
 
 
+@pytest.mark.parametrize(
+    ("num_ranks", "first_stop_flags_sent"), [(1, []), (2, [0, 0, 1, 0])]
+)
+def test_hot_swap_load_ends_the_burst_after_the_current_engine_step(
+    engine_thread, monkeypatch, num_ranks: int, first_stop_flags_sent: list[int]
+) -> None:
+    # With 2 ranks, rank 0 broadcasts its stop check after every engine step.
+    stop_flags_sent: list[int] = []
+    monkeypatch.setattr(
+        engine_loop_module.dist, "get_world_size", lambda group: num_ranks
+    )
+    monkeypatch.setattr(
+        engine_loop_module.dist,
+        "broadcast",
+        lambda tensor, **kwargs: stop_flags_sent.append(int(tensor.item())),
+    )
+    events: list[str] = []
+    gate = _StepGate()
+
+    def step_hook() -> None:
+        events.append("step")
+        if events.count("step") == 3:
+            gate()
+
+    engine = _HeldEngine(step_hook)
+    engine.load_model_state_dict = lambda fetch: events.append("load")
+
+    async def run() -> None:
+        engine_loop = engine_thread(engine)
+        engine_loop.start()
+        first = _generate(engine_loop, "r0")
+
+        # Queue the load while the third engine step runs.
+        assert await asyncio.to_thread(gate.entered.wait, _TIMEOUT_S)
+        load = asyncio.create_task(engine_loop.load_model_state_dict(4, drain=False))
+        await asyncio.sleep(0)  # the load is on the queue
+        events.append("load queued")
+        gate.release()
+        await asyncio.wait_for(load, _TIMEOUT_S)
+
+        engine.finish.set()
+        await asyncio.wait_for(first, _TIMEOUT_S)
+        await asyncio.wait_for(engine_loop.close(), _TIMEOUT_S)
+
+    asyncio.run(run())
+    # No engine step runs between queueing the load and applying it.
+    assert events[:5] == ["step", "step", "step", "load queued", "load"]
+    # With 2 ranks, rank 0 sends stop after the third step only; the load resets it for the fourth.
+    assert stop_flags_sent[:4] == first_stop_flags_sent
+
+
 def test_loads_queued_during_a_load_are_applied_together_after_it(
     engine_thread, monkeypatch
 ) -> None:
@@ -1438,13 +1494,21 @@ def test_follower_applies_broadcast_decisions_on_the_engine_thread(
     monkeypatch.setattr(
         engine_loop_module.dist, "broadcast_object_list", broadcast_object_list
     )
-    reads: list[threading.Thread] = []
+    monkeypatch.setattr(engine_loop_module.dist, "get_world_size", lambda group: 2)
+    stop_flags = iter([0, 1])
 
-    async def load_pre_hook():
-        reads.append(threading.current_thread())
+    def broadcast(tensor, **kwargs):
+        # A follower receives rank 0's stop check after every engine step.
+        tensor.fill_(next(stop_flags))
+
+    monkeypatch.setattr(engine_loop_module.dist, "broadcast", broadcast)
+    loads: list[threading.Thread] = []
 
     async def run() -> None:
-        engine = _loading_engine(monkeypatch, load_pre_hook)
+        engine = _HeldEngine()
+        engine.load_model_state_dict = lambda fetch: loads.append(
+            threading.current_thread()
+        )
         stepped: list[list[str]] = []
         engine.step_hook = lambda: stepped.append(list(engine.running))
         # TP rank 1 of a DP=1, TP=2 generator.
@@ -1455,9 +1519,10 @@ def test_follower_applies_broadcast_decisions_on_the_engine_thread(
 
         # The broadcast CLOSE ends the loop; a follower's close only waits for that.
         await asyncio.wait_for(engine_loop.close(), _TIMEOUT_S)
-        assert stepped == [["r0"]]
+        # r0 never finishes, so the burst stops after the second step, as rank 0 broadcast.
+        assert stepped == [["r0"], ["r0"]]
         assert engine.threads == {engine_loop.engine_thread.thread}
-        assert reads == [engine_loop.engine_thread.thread]
+        assert loads == [engine_loop.engine_thread.thread]
         assert engine_loop.policy_version == 4
         # Every rank releases the sessions rank 0 decided, before acting on the decision.
         assert engine.released_sessions == [([], []), (["s0"], [3])]

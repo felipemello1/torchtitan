@@ -160,7 +160,8 @@ class Generator(Configurable):
         max_engine_steps_between_decisions: int = 16
         """Controls how many `engine.step()` calls the `engine_loop` performs before processing a new decision.
         Every generation call is queued for execution by the `engine_loop`. A higher value enables buffering
-        of more requests to avoid a prefill between every engine decode step, which is inefficient."""
+        of more requests to avoid a prefill between every engine decode step, which is inefficient.
+        A queued hot-swap model state dict load ends a burst early."""
 
         reset_kv_cache_on_model_state_dict_load: bool = False
         """Reset cached and running-request KV after each model state dict load.
