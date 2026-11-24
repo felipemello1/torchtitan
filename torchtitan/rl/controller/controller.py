@@ -169,6 +169,13 @@ class ValidationConfig:
     temperature: float = 1.0
     """Sampling temperature of validation rollouts."""
 
+    top_p: float = 1.0
+    """Nucleus sampling threshold; 1.0 keeps every token. The trainer never scores validation tokens,
+    so unlike training this may filter."""
+
+    top_k: int = -1
+    """Sample from the k most likely tokens only; -1: all tokens."""
+
     num_samples_per_prompt: int = 1
     """Rollouts per validation prompt. With n > 1, `validation_reward/best_of_{n}` logs the mean
     of each prompt's best reward."""
@@ -200,6 +207,10 @@ class ValidationConfig:
             raise ValueError(
                 f"validation temperature must be non-negative, got {self.temperature}"
             )
+        if not 0 < self.top_p <= 1:
+            raise ValueError(f"validation top_p must be in (0, 1], got {self.top_p}")
+        if self.top_k != -1 and self.top_k < 1:
+            raise ValueError(f"validation top_k must be -1 or >= 1, got {self.top_k}")
         if self.num_samples_per_prompt < 1:
             raise ValueError(
                 "validation num_samples_per_prompt must be >= 1, got "
@@ -1007,7 +1018,13 @@ class Controller(Configurable):
         # in a rollouter's own limit. Do it when validation moves out of the controller.
         # Off the event loop: training runs meanwhile, and building the dataset can take seconds.
         samples = await asyncio.to_thread(self._rollouter.get_validation_samples, steps)
-        sampling = replace(self._sampling, temperature=validation.temperature)
+        sampling = replace(
+            self._sampling,
+            temperature=validation.temperature,
+            top_p=validation.top_p,
+            top_k=validation.top_k,
+            scored_by_trainer=False,
+        )
 
         rollout_groups, validation_metrics = await self._collect_validation_rollouts(
             samples=samples,

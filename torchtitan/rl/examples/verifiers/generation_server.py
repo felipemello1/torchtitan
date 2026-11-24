@@ -217,7 +217,10 @@ class GenerationServer(Configurable):
                 raise ValueError(
                     f"sampling_params.{GROUP_ID_SAMPLING_PARAM} must be an integer"
                 )
-            sampling = _parse_sampling_config(sampling_params)
+            # Validation groups have negative ids; the trainer never scores their tokens.
+            sampling = _parse_sampling_config(
+                sampling_params, scored_by_trainer=group_id >= 0
+            )
             if body.get("features") is not None:
                 raise ValueError("multimodal features are not supported")
         except (TypeError, ValueError) as error:
@@ -359,7 +362,7 @@ def _validate_token_ids(value: object, *, field_name: str) -> list[int]:
     return value
 
 
-def _parse_sampling_config(value: object):
+def _parse_sampling_config(value: object, *, scored_by_trainer: bool = True):
     """Convert Verifiers' vLLM sampling payload to TorchTitan config."""
     from torchtitan.rl.generator.types import SamplingConfig
 
@@ -382,13 +385,14 @@ def _parse_sampling_config(value: object):
     unsupported = set(value) - supported - protocol_fields
     if unsupported:
         raise ValueError(f"unsupported sampling parameters: {sorted(unsupported)}")
-    # Verifiers sends top_k=-1 and min_p=0.0 on every call. Refuse values that filter: the trainer
-    # computes logprobs over the full vocabulary. TODO(mask-replay): allow them, as for top_p < 1.
-    top_k, min_p = value.get("top_k", -1), value.get("min_p", 0.0)
-    if top_k not in (-1, 0) or min_p != 0.0:
+    # Verifiers sends top_k=-1 and min_p=0.0 on every call. A filter changes the distribution the generator
+    # samples from, but the trainer computes logprobs over the full vocabulary. `SamplingConfig` refuses
+    # top_p < 1 and a top_k for a request the trainer scores; refuse a min_p that filters for every request.
+    # TODO(mask-replay): allow min_p filters, as `SamplingConfig.__post_init__` plans for top_p < 1.
+    min_p = value.get("min_p", 0.0)
+    if min_p != 0.0:
         raise ValueError(
-            "sampling_params must not filter (top_k -1 or 0, min_p 0.0), "
-            f"got top_k={top_k!r}, min_p={min_p!r}"
+            f"sampling_params.min_p must be 0.0 (no filter), got {min_p!r}"
         )
 
     # The generator stops only on these ids; the renderer client always sends them.
@@ -401,10 +405,15 @@ def _parse_sampling_config(value: object):
     missing = {"temperature", "top_p", "max_tokens"} - set(value)
     if missing:
         raise ValueError(f"sampling_params must include {sorted(missing)}")
+
+    top_k = int(value.get("top_k", -1))
     return SamplingConfig(
         temperature=float(value["temperature"]),
         top_p=float(value["top_p"]),
+        # vLLM's top_k 0 means no filter too.
+        top_k=-1 if top_k == 0 else top_k,
         max_tokens=int(value["max_tokens"]),
         seed=value.get("seed"),
         stop_token_ids=stop_token_ids,
+        scored_by_trainer=scored_by_trainer,
     )

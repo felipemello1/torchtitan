@@ -319,6 +319,8 @@ class VerifiersRolloutWorker(BaseRolloutWorker):
                 sampling=VerifiersSamplingConfig(
                     temperature=sampling.temperature,
                     top_p=sampling.top_p,
+                    # Not a Verifiers field: passed through to the generation server, like the group id.
+                    top_k=sampling.top_k,
                     max_tokens=sampling.max_tokens,
                     seed=sampling.seed,
                     **{GROUP_ID_SAMPLING_PARAM: group_id},

@@ -812,6 +812,56 @@ _GOOD_SAMPLING_PARAMS = {
 }
 
 
+def test_generation_server_lets_only_validation_requests_filter() -> None:
+    """Validation groups (negative ids) may sample with top_p < 1 and top_k; training groups may not."""
+
+    async def run_test() -> tuple[list[int], list]:
+        received = []
+
+        async def generate_fn(prompt, *, request_id, sampling_config, **kwargs):
+            received.append(sampling_config)
+            return Completion(
+                min_policy_version=0,
+                max_policy_version=0,
+                request_id=request_id,
+                token_ids=[31],
+                token_logprobs=[-0.1],
+                finish_reason="stop",
+            )
+
+        server = GenerationServer.Config(max_rollout_tokens=40960).build()
+        server.set_generate_fn(generate_fn)
+        await server.start()
+        statuses = []
+        try:
+            async with ClientSession() as session:
+                for group_id in (-1, 1):
+                    response = await session.post(
+                        f"http://{server.host}:{server.port}/inference/v1/generate",
+                        headers={"X-Session-ID": f"group={group_id}/rollout=0"},
+                        json={
+                            "token_ids": [10, 11],
+                            "sampling_params": {
+                                **_GOOD_SAMPLING_PARAMS,
+                                "top_p": 0.95,
+                                "top_k": 20,
+                                "torchtitan_group_id": group_id,
+                            },
+                        },
+                    )
+                    statuses.append(response.status)
+        finally:
+            await server.close()
+        return statuses, received
+
+    statuses, received = asyncio.run(run_test())
+
+    assert statuses == [200, 422]
+    [validation_sampling] = received
+    assert (validation_sampling.top_p, validation_sampling.top_k) == (0.95, 20)
+    assert not validation_sampling.scored_by_trainer
+
+
 @pytest.mark.parametrize(
     "headers, request_kwargs",
     [
@@ -1485,8 +1535,8 @@ def test_parse_sampling_config_requires_temperature_top_p_max_tokens() -> None:
         # What Verifiers 0.4.1 sends on every call: values that filter nothing.
         ({"top_k": -1, "min_p": 0.0}, None),
         ({"top_k": 0}, None),
-        ({"top_k": 20}, r"must not filter .* got top_k=20, min_p=0.0"),
-        ({"min_p": 0.05}, r"must not filter .* got top_k=-1, min_p=0.05"),
+        ({"top_k": 20}, r"got top_p=1.0, top_k=20"),
+        ({"min_p": 0.05}, r"min_p must be 0.0 \(no filter\), got 0.05"),
     ],
 )
 def test_parse_sampling_config_accepts_only_full_vocabulary_top_k_and_min_p(

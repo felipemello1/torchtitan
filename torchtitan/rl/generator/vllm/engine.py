@@ -616,6 +616,7 @@ def _build_sampling_params(sampling: SamplingConfig) -> SamplingParams:
     return SamplingParams(
         temperature=sampling.temperature,
         top_p=sampling.top_p,
+        top_k=sampling.top_k,
         max_tokens=sampling.max_tokens,
         n=1,  # always expects a single sample per request. Caller can call N times.
         stop_token_ids=sampling.stop_token_ids,
