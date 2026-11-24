@@ -105,7 +105,7 @@ class EngineLoop:
     run on the caller's event loop and reach the loop only through the thread-safe queue and the
     `concurrent.futures.Future`s it resolves. `release_groups` is an exception: it pops cache-salt
     pins directly; each pop, like the loop's `setdefault`, is a single dict operation, atomic
-    under the GIL.
+    under the GIL. So is `load_model_state_dict`'s write of the bool `_rank0_hot_swap_load_queued`.
 
     A model state dict load rides the same loop: `load_model_state_dict` puts a
     `ModelStateDictLoadMessage` on the queue, which rank 0 turns into a
@@ -119,6 +119,14 @@ class EngineLoop:
         decision: STEP, admit nothing    # ... until r0 finishes
         decision: LOAD_MODEL_STATE_DICT
         decision: STEP, admit [r1]       # under the new weights
+
+    A hot-swap load doesn't wait for the running burst: after every engine step, rank 0 checks for
+    one and ends the burst. With more than one rank, rank 0 broadcasts that check after every step,
+    so every rank runs the same number of steps. How long a queued load waits before it is applied:
+
+        hot swap, engine stepping   -> at most one engine step (until the current or the next one ends)
+        drain, engine stepping      -> until the last admitted request finishes (bursts stay full)
+        engine idle                 -> no wait
 
     The load fills the engine's weights through `fetch_model_state_dict`: with
     ``model_state_dict_load_mode="cpu_prefetch"`` a local copy from the pinned CPU buffers the
@@ -179,6 +187,9 @@ class EngineLoop:
         self._future: concurrent.futures.Future[None] | None = None
         # RANK 0: raised after broadcasting CLOSE so peers leave their collective first.
         self._rank0_result_drain_failure: Exception | None = None
+        # RANK 0: set when a hot-swap load is queued, cleared when the loop takes it off the queue.
+        # While set, the running burst ends after its current engine step.
+        self._rank0_hot_swap_load_queued = False
 
     def start(self) -> None:
         """Start the loop on the engine loop thread (one-time, idempotent)."""
@@ -208,9 +219,13 @@ class EngineLoop:
         """RANK 0: queue a model state dict load for `version` and wait until the loop has applied
         it. Loads queued together are applied once, at the highest version. With `drain`, the
         loop first finishes every admitted request and holds back new ones until the load is
-        applied."""
+        applied. Without it, the load waits for at most one engine step."""
         self._rank0_check_running("load_model_state_dict")
         reply: concurrent.futures.Future[None] = concurrent.futures.Future()
+        if not drain:
+            # Set before the put. Set after it, the flag could outlive the load: the loop could take
+            # the load off the queue first, and every later burst would end after one step.
+            self._rank0_hot_swap_load_queued = True
         self._queue.put(
             ModelStateDictLoadMessage(version=version, drain=drain, reply=reply)
         )
@@ -282,7 +297,8 @@ class EngineLoop:
         release the dispatcher and the engine.
 
         `_decide_next_action` is consulted once every `max_engine_steps_between_decisions` steps (a burst),
-        so new requests buffer and prefill together instead of on every step.
+        so new requests buffer and prefill together instead of on every step. A queued hot-swap load ends
+        a burst early.
 
         Example:
             max_engine_steps_between_decisions = 16
@@ -301,6 +317,7 @@ class EngineLoop:
         try:
             # One-time dispatcher setup before the loop starts.
             self._request_dispatcher.setup(self._rank0_result_drain_failed)
+            num_ranks = dist.get_world_size(self._broadcast_group)
             while True:
                 # Rank 0 decides next decision; followers pass None and learn from the broadcast.
                 decision = (
@@ -387,6 +404,19 @@ class EngineLoop:
                         )
                         await asyncio.sleep(0)  # let pending generate() calls enqueue
 
+                        # A queued hot-swap load ends the burst. With more than one rank, rank 0
+                        # broadcasts its check, so every rank stops after the same step.
+                        stop_burst = self._rank0_hot_swap_load_queued
+                        if num_ranks > 1:
+                            stop_flag = torch.tensor([int(stop_burst)])
+                            # A blocking call is fine: every rank arrives right after the same engine step.
+                            dist.broadcast(
+                                stop_flag, src=0, group=self._broadcast_group
+                            )
+                            stop_burst = bool(stop_flag.item())
+                        if stop_burst:
+                            break
+
         except Exception as exc:
             logger.exception("engine loop crashed; failing all outstanding replies")
             if self._rank == 0:
@@ -450,6 +480,13 @@ class EngineLoop:
         # Take everything currently in the queue if there is any, so they all can be part of this decision.
         while not self._queue.empty():
             messages.append(self._queue.get_nowait())
+
+        # A hot-swap load is off the queue now (even a cancelled one), so bursts run full again.
+        if any(
+            isinstance(message, ModelStateDictLoadMessage) and not message.drain
+            for message in messages
+        ):
+            self._rank0_hot_swap_load_queued = False
 
         released_session_ids: list[str] = []
         released_group_ids: list[int] = []
