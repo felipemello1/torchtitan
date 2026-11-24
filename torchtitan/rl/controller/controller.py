@@ -1546,6 +1546,7 @@ class Controller(Configurable):
                             for key, value in optimizer_result.metrics.items()
                         ],
                         *self._group_buffer.metrics(),
+                        *self._rollouter.curriculum_metrics(),
                         *time_metrics,
                         # The event loop's longest delay, and how many ms late it ran per second
                         *self._event_loop_lag.flush(),
