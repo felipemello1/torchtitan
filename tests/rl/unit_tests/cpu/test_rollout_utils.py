@@ -556,6 +556,59 @@ def test_build_from_group_drops_a_group_left_with_one_scored_rollout() -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    ("rewards", "expected_shares"),
+    [
+        ([1.0, 1.0], (1.0, 1.0, 0.0, 0.0)),
+        ([0.0, 0.0], (1.0, 0.0, 1.0, 0.0)),
+        ([0.5, 0.5], (1.0, 0.0, 0.0, 1.0)),
+        ([1.0, 0.0], (0.0, 0.0, 0.0, 0.0)),
+        # None: an ERROR_INFRA rollout, never scored. Fewer than 2 scored rollouts is zero-std too.
+        ([1.0, None], (1.0, 1.0, 0.0, 0.0)),
+        ([None, None], (1.0, 0.0, 0.0, 1.0)),
+    ],
+)
+def test_zero_std_share_splits_by_the_shared_reward(
+    rewards: list[float | None], expected_shares: tuple[float, ...]
+) -> None:
+    rollouts = []
+    for rollout_id, reward in enumerate(rewards):
+        if reward is None:
+            rollout = Rollout(
+                group_id=_GROUP_ID,
+                rollout_id=rollout_id,
+                status=RolloutStatus.ERROR_INFRA,
+            )
+        else:
+            rollout = _scored_rollout(
+                [_turn(prompt_token_ids=[1], completion_token_ids=[2], version=1)],
+                reward=reward,
+                advantage=0.0,
+            )
+            rollout.rollout_id = rollout_id
+        rollouts.append(rollout)
+
+    group = (
+        TrainingSampleBuilder.Config(drop_zero_std_reward_groups=False)
+        .build()
+        .build_from_group(
+            rollout_group=RolloutGroup(group_id=_GROUP_ID, rollouts=rollouts)
+        )
+    )
+
+    shares = {
+        metric.key: metric.value.value
+        for metric in group.metrics
+        if metric.key.startswith("rollout_reward/group_zero_std")
+    }
+    assert (
+        shares["rollout_reward/group_zero_std_frac"],
+        shares["rollout_reward/group_zero_std_reward_1_frac"],
+        shares["rollout_reward/group_zero_std_reward_0_frac"],
+        shares["rollout_reward/group_zero_std_reward_other_frac"],
+    ) == expected_shares
+
+
 def test_group_filters_preserve_group_id_for_commit() -> None:
     builder = TrainingSampleBuilder.Config().build()
 
