@@ -959,8 +959,12 @@ class Controller(Configurable):
             self.trainer.rank0.get_policy_version.call_one(),
             self.trainer.rank0.get_resume_state.call_one(),
         )
+        # run() restores the group buffer from this once it builds it
+        self._group_buffer_resume_state: dict[str, object] = {}
         if resume_state is not None:
             self._rollouter.load_state_dict(resume_state)
+            # A checkpoint without the buffer's state (an older one) starts the buffer as a fresh run does.
+            self._group_buffer_resume_state = resume_state.get("group_buffer", {})
             logger.info("Restored RL dataloader state")
             # TODO: Replay cached finished rollouts instead of regenerating all
             # pending prompts after resume.
@@ -1177,6 +1181,8 @@ class Controller(Configurable):
                 max_active_rollout_groups=max_active_rollout_groups,
                 window_size=window_size,
             )
+        # Before the data input loop starts, so a resumed demand caps the first admissions.
+        self._group_buffer.load_state_dict(self._group_buffer_resume_state)
 
         # training_batch_queue
         training_batch_queue: asyncio.Queue[
@@ -1639,9 +1645,13 @@ class Controller(Configurable):
                     self._rollouter.commit_training_sample_ids(
                         [*self._group_buffer.pop_dropped_group_ids(), *packed.group_ids]
                     )
+                    # The buffer's state as of this step's start, which is what the next step start reads.
                     optimizer_result = self._get_rank_0_value(
                         await self.trainer.all_ranks.optim_step.call(
-                            resume_state=self._rollouter.state_dict(),
+                            resume_state={
+                                **self._rollouter.state_dict(),
+                                "group_buffer": self._group_buffer.state_dict(),
+                            },
                             last_step=(step == num_training_steps),
                         )
                     )

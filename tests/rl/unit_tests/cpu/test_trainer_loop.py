@@ -67,6 +67,7 @@ def _controller(
         nonlocal version
         version += 1
         events.append(f"optim {version}")
+        controller.saved_resume_states.append(kwargs["resume_state"])
         return _RankValues(SimpleNamespace(policy_version=version, metrics={}))
 
     async def push():
@@ -124,7 +125,7 @@ def _controller(
         curriculum_metrics=lambda: [
             m.Metric("curriculum/pool/solved", m.NoReduce(3.0))
         ],
-        state_dict=lambda: {},
+        state_dict=lambda: {"step": 0},
     )
 
     async def record_step_start(*, trainer_policy_version):
@@ -135,8 +136,10 @@ def _controller(
         release_active_groups=release_active_groups,
         record_step_start=record_step_start,
         pop_dropped_group_ids=list,
+        state_dict=lambda: {"demand": 29},
     )
     controller._event_loop_lag = SimpleNamespace(flush=lambda: [])
+    controller.saved_resume_states = []
     controller.logged_metrics = []
     controller.metrics_processor = SimpleNamespace(
         log=lambda *, step, is_validation, metrics: controller.logged_metrics.append(
@@ -203,6 +206,15 @@ def test_push_then_pull_then_release_after_each_optimizer_step() -> None:
         "push end",
         "pull 2",
         "release 5 trained",
+    ]
+
+
+def test_each_optimizer_step_saves_the_buffer_state_with_the_rollouter_state() -> None:
+    controller = _controller([])
+    _run(controller, num_training_steps=1)
+
+    assert controller.saved_resume_states == [
+        {"step": 0, "group_buffer": {"demand": 29}}
     ]
 
 

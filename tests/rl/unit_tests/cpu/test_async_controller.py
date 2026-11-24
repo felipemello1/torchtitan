@@ -52,6 +52,7 @@ from torchtitan.rl.rollout.types import (
 )
 
 from torchtitan.rl.trainer.batcher import Batcher
+from torchtitan.rl.trainer.trainer import MirroredState
 from torchtitan.rl.trainer.training_sample_builder import (
     TrainingSample,
     TrainingSampleGroup,
@@ -950,6 +951,7 @@ def _run_with_generator_watcher(
     num_concurrent_rollout_groups=1,
     group_buffer=None,
     start_step=0,
+    group_buffer_resume_state=None,
 ) -> Controller:
     """Run Controller.run with stub loops: `watcher` waits on the engine loops, `trainer_loop` trains, the rest block."""
     controller = object.__new__(Controller)
@@ -966,7 +968,8 @@ def _run_with_generator_watcher(
             group_buffer=group_buffer
             or SimpleNamespace(
                 build=lambda **kwargs: SimpleNamespace(
-                    close=AsyncMock(side_effect=on_close)
+                    close=AsyncMock(side_effect=on_close),
+                    load_state_dict=lambda state_dict: None,
                 )
             ),
             validation=validation or ValidationConfig(),
@@ -976,6 +979,7 @@ def _run_with_generator_watcher(
         ),
     )
     controller.start_step = start_step
+    controller._group_buffer_resume_state = group_buffer_resume_state or {}
     controller._validation_tasks = []
     controller._model_state_dict_pull_tasks = []
     controller._has_pending_validation = False
@@ -1503,6 +1507,41 @@ def test_adaptive_buffer_aims_for_ready_batches_at_a_step_start() -> None:
     asyncio.run(run())
     with pytest.raises(ValueError, match="ready_batches must be >= 1, got 0.5"):
         AdaptiveRolloutGroupWorkBuffer.Config(ready_batches=0.5)
+
+
+def test_adaptive_buffer_resumes_its_demand_from_the_trainer_checkpoint() -> None:
+    """A buffer restored through the trainer checkpoint's `MirroredState` moves its demand as if the run had not
+    stopped."""
+
+    async def run() -> None:
+        buffer = _adaptive_buffer(num_prompts=8, max_offpolicy_steps=10)
+        for _ in range(3):
+            await buffer.record_step_start(trainer_policy_version=0)
+        saved = MirroredState()
+        saved.value = {"group_buffer": buffer.state_dict()}
+        loaded = MirroredState()
+        loaded.load_state_dict(saved.state_dict())
+
+        resumed = _adaptive_buffer(num_prompts=8, max_offpolicy_steps=10)
+        resumed.load_state_dict(loaded.loaded["group_buffer"])
+        # The restored demand, 62, caps the slots before any group is admitted
+        assert _buffer_metric(resumed, "rollout_buffer/available_active_slots") == 62
+
+        # The next step start reads the restored history [24, 29, 45]: demand 62 -> 75 in both, as in the buffer
+        # that never stopped. Restoring the demand alone, with an empty history, would give 67.
+        for step_buffer in (buffer, resumed):
+            await step_buffer.record_step_start(trainer_policy_version=0)
+        assert [
+            _buffer_metric(step_buffer, "rollout_buffer/demand_target_groups")
+            for step_buffer in (buffer, resumed)
+        ] == [75, 75]
+
+        # Nothing saved (a fresh start, or a checkpoint without the buffer's state): 3 batches of 8
+        fresh = _adaptive_buffer(num_prompts=8, max_offpolicy_steps=10)
+        fresh.load_state_dict({})
+        assert _buffer_metric(fresh, "rollout_buffer/available_active_slots") == 24
+
+    asyncio.run(run())
 
 
 def test_stall_driven_demand_moves_down_one_group_per_step() -> None:
@@ -2121,16 +2160,21 @@ def test_batcher_passes_the_version_that_trains_each_group() -> None:
 
 
 def test_run_builds_the_adaptive_buffer_with_one_generating_group_per_rollout_loop() -> None:
-    """The adaptive buffer admits at most one generating group per rollout loop, and starts at the resumed version."""
+    """The adaptive buffer admits at most one generating group per rollout loop, and starts at the resumed version
+    and demand."""
+    saved_demand = StallDrivenDemand(num_prompts_per_train_step=1, start_batches=40)
     controller = _run_with_generator_watcher(
         _block_forever,
         trainer_loop=_train_one_step,
         num_concurrent_rollout_groups=3,
         group_buffer=AdaptiveRolloutGroupWorkBuffer.Config(max_offpolicy_steps=8),
         start_step=5,
+        group_buffer_resume_state=saved_demand.state_dict(),
     )
     buffer = controller._group_buffer
     assert isinstance(buffer, AdaptiveRolloutGroupWorkBuffer)
     assert _buffer_metric(buffer, "rollout_buffer/generation_capacity_groups") == 3
     # Resumed at step 5: a group claimed now is 0 versions old for the first batch, which trains at 5.
     assert buffer._generator_policy_version == buffer._consuming_policy_version == 5
+    # The saved demand, 40 groups, caps the slots; a fresh start would cap them at 3 batches, 3 groups.
+    assert _buffer_metric(buffer, "rollout_buffer/available_active_slots") == 40

@@ -195,6 +195,34 @@ class StallDrivenDemand:
         )
         return self.demand
 
+    def state_dict(self) -> dict[str, object]:
+        """The demand and the history `observe` reads, as plain values, so a resumed run continues from them.
+
+        Example:
+            demand = StallDrivenDemand(num_prompts_per_train_step=8)
+            demand.observe(step=1, ready=0, generating=24, completed=0, trainable=0)
+            demand.state_dict()
+            # -> {"demand": 29, "state": "ok", "unavailable": [24], "generating": [24], "completed": [0],
+            #     "trainable": [0]}
+        """
+        return {
+            "demand": self.demand,
+            "state": self.state,
+            "unavailable": list(self._unavailable),
+            "generating": list(self._generating),
+            "completed": list(self._completed),
+            "trainable": list(self._trainable),
+        }
+
+    def load_state_dict(self, state_dict: dict[str, object]) -> None:
+        """Restore what `state_dict` returned; each history keeps its last `lookback_steps` values."""
+        self.demand = state_dict["demand"]
+        self.state = state_dict["state"]
+        self._unavailable = deque(state_dict["unavailable"], maxlen=self.lookback_steps)
+        self._generating = deque(state_dict["generating"], maxlen=self.lookback_steps)
+        self._completed = deque(state_dict["completed"], maxlen=self.lookback_steps)
+        self._trainable = deque(state_dict["trainable"], maxlen=self.lookback_steps)
+
 
 def estimate_next_unavailable_upper_bound(
     *,
