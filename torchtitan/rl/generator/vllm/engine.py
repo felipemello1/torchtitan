@@ -15,7 +15,7 @@ import tempfile
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from hashlib import sha256
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.distributed as dist
@@ -85,6 +85,7 @@ def add_extra_vllm_engine_args(
     config_field_by_engine_arg = {
         "max_num_batched_tokens": "Generator.Config.max_num_batched_tokens",
         "compilation_config": "VLLMEngine.Config.cuda_graph",
+        "kv_cache_dtype": "VLLMEngine.Config.kv_cache_dtype",
         "kv_transfer_config": "VLLMEngine.Config.kv_transfer_config",
         "seed": "Generator.Config.debug.seed",
         "watermark": "VLLMEngine.Config.watermark",
@@ -202,6 +203,28 @@ class VLLMEngine(GenerationEngine):
             watermark=0.03   admitted (400 >= 300)
             watermark=0.1    waits (400 < 1,000)
             no request running: admitted at any watermark
+        """
+
+        kv_cache_dtype: Literal["auto", "fp8"] = "auto"
+        """KV cache element type:
+
+            "auto"   the model dtype (bf16); attention runs the trainer's kernel
+            "fp8"    e4m3 with scale 1; the query is quantized to e4m3 too, and attention
+                     runs FA4's fp8 forward (SM100 family only)
+
+        fp8 vs auto:
+
+            KV cache full, or long unique contexts   fp8: 2x tokens fit, decode reads half the bytes
+            many requests sharing long prompts       auto: fp8 decode can be slower
+                                                     (see `paged_varlen_attention_out`)
+            k3 KL vs the trainer at policy age 0     fp8: ~3.5x auto's (`loss/mismatch_kl/mean`)
+            tokens outside IcePop's (0.2, 5) mask    fp8: ~5x auto's
+            a hybrid model's KV block                fp8: grows (896 -> 1,664 tokens), so
+                                                     prefix-cache hits are coarser
+
+        Both ratios come from an offline trainer rescoring of generated tokens (Qwen3.8-27B,
+        GB300, temperature 1, 27k-78k-token contexts). Its absolute values sit above a live
+        run's, so read your run's own step-1 `loss/mismatch_kl/mean` as the fp8 floor.
         """
 
         kv_transfer_config: KVTransferConfig | None = None
@@ -331,6 +354,12 @@ class VLLMEngine(GenerationEngine):
             raise ValueError(
                 "session_kv_holder needs reset_kv_cache_on_model_state_dict_load=False: vLLM "
                 "cannot reset the prefix cache while blocks are held"
+            )
+        if debug.batch_invariant and config.kv_cache_dtype != "auto":
+            raise ValueError(
+                f"debug.batch_invariant needs kv_cache_dtype='auto', got "
+                f"{config.kv_cache_dtype!r}: fp8 attention runs FA4's fp8 forward, which the "
+                "trainer does not run, so generator logprobs can't match the trainer's bitwise"
             )
         validate_ep_token_dispatchers(
             model,
@@ -497,6 +526,11 @@ class VLLMEngine(GenerationEngine):
         if max_num_batched_tokens is not None:
             engine_kwargs["max_num_batched_tokens"] = max_num_batched_tokens
         engine_kwargs["watermark"] = self.config.watermark
+        # TODO: fp8 grows a hybrid model's KV block (Qwen3.8-27B: 896 -> 1,664 tokens), and a
+        # prefix-cache hit ends on a block boundary, so each agent turn recomputes ~400 more
+        # prompt tokens (GB300: 2,053 vs 1,679 per turn). Not measured: whether vLLM's
+        # `prefix_match_unit` or a smaller `mamba_block_size` wins them back.
+        engine_kwargs["kv_cache_dtype"] = self.config.kv_cache_dtype
         # Smaller `priority` runs first and is preempted last; we pass `EngineRequest.group_id`
         # (-1 for all validation), so older groups have higher priority (see its docstring).
         # TODO: validation requests (priority -1) are admitted before training requests, also while a
