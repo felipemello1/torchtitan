@@ -330,6 +330,84 @@ class TorchCheckpointingManagerTest(unittest.TestCase):
                 loader.close()
             torch.testing.assert_close(restored.weight, saved.weight)
 
+    def _build_real_manager(
+        self, manager_class, folder: str, *, keep_latest_k: int = 0
+    ):
+        return manager_class.Config(
+            folder=folder,
+            interval=1,
+            keep_latest_k=keep_latest_k,
+            last_save_model_only=False,
+            initial_load_model_only=False,
+        ).build(
+            model_parts=[nn.Linear(2, 2)],
+            optimizers=_Stateful("optimizer"),
+            lr_schedulers=_Stateful("scheduler"),
+            ema=None,
+            extra_states={"train_state": _Stateful("train")},
+            sd_adapter=None,
+        )
+
+    def test_load_raises_on_the_other_managers_checkpoints(self) -> None:
+        for writer_class, reader_class in (
+            (CheckpointManager, TorchCheckpointingManager),
+            (TorchCheckpointingManager, CheckpointManager),
+        ):
+            with (
+                self.subTest(writer=writer_class.__name__),
+                tempfile.TemporaryDirectory() as folder,
+            ):
+                writer = self._build_real_manager(writer_class, folder)
+                writer.save(curr_step=2)
+                writer.close()
+                step_2_files = sorted(os.listdir(os.path.join(folder, "step-2")))
+                expected_error = rf"step-2 \(.*: {writer_class.__name__}\)"
+
+                reader = self._build_real_manager(reader_class, folder)
+                with self.assertRaisesRegex(ValueError, expected_error):
+                    reader.load()
+
+                # A folder that also holds the reader's own checkpoint is refused too.
+                reader.save(curr_step=1)
+                with self.assertRaisesRegex(ValueError, expected_error):
+                    reader.load()
+                reader.close()
+
+                self.assertEqual(
+                    step_2_files, sorted(os.listdir(os.path.join(folder, "step-2")))
+                )
+
+    @mock.patch("torch.distributed.get_rank", return_value=0)
+    def test_retention_keeps_the_other_managers_checkpoints(self, _rank) -> None:
+        for writer_class, saver_class in (
+            (CheckpointManager, TorchCheckpointingManager),
+            (TorchCheckpointingManager, CheckpointManager),
+        ):
+            with (
+                self.subTest(writer=writer_class.__name__),
+                tempfile.TemporaryDirectory() as folder,
+            ):
+                writer = self._build_real_manager(writer_class, folder)
+                writer.save(curr_step=2)
+                writer.close()
+                # An unfinished save of the saver: no completion file.
+                os.makedirs(os.path.join(folder, "step-3"))
+
+                # A seed-checkpoint save runs without a load first.
+                saver = self._build_real_manager(saver_class, folder, keep_latest_k=2)
+                with self.assertLogs(
+                    "torchtitan.components.checkpointer.base", "WARNING"
+                ) as logs:
+                    saver.save(curr_step=4)
+                # Drains the purge thread.
+                saver.close()
+
+                self.assertEqual({"step-2", "step-4"}, set(os.listdir(folder)))
+                kept_warnings = [
+                    line for line in logs.output if "another checkpoint manager" in line
+                ]
+                self.assertEqual(1, len(kept_warnings), logs.output)
+
     def _memory_bucket(self) -> str:
         memory_fs = fsspec.filesystem("memory")
         bucket = f"/bucket-{uuid.uuid4().hex}"
