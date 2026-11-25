@@ -718,14 +718,14 @@ class BaseCheckpointManager(Configurable, ABC):
                 raise ValueError("load_step must be -1 or non-negative.")
             if self.keep_latest_k < 0:
                 raise ValueError("keep_latest_k cannot be negative.")
-            if self.file_write_workers < 1:
-                raise ValueError(
-                    f"file_write_workers must be at least 1, got {self.file_write_workers}."
-                )
             if self.keep_latest_k == 1:
                 raise ValueError(
                     "We need to maintain at least 2 checkpoint replicas, "
                     "as the last one may be in the process of being saved."
+                )
+            if self.file_write_workers < 1:
+                raise ValueError(
+                    f"file_write_workers must be at least 1, got {self.file_write_workers}."
                 )
             if MODEL in self.exclude_from_loading:
                 raise ValueError(f"{MODEL} key shouldn't be in exclude_from_loading.")
