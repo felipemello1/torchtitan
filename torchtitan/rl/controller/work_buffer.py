@@ -7,17 +7,28 @@
 """Active work buffer shared between the data-input, rollout, and batcher loops.
 NOTE: The buffer holds work slots, and not the finalized RolloutGroups necessarily.
 
+Two buffers share one interface:
+
+    RolloutGroupWorkBuffer          fixed `(target_offpolicy_steps + 1) * P` slots; optional FIFO window; never drops
+    AdaptiveRolloutGroupWorkBuffer  slots from a quantile of the groups not ready at recent step starts, capped so
+                                    the mean age stays under its `target_offpolicy_steps` (or `max_offpolicy_steps`);
+                                    takes the oldest finalized group; drops groups past `max_offpolicy_steps`,
+                                    cancelling the ones still generating
 """
 
 import asyncio
 import collections
 import enum
+import logging
 from dataclasses import dataclass, field
 
 from torchtitan.config import Configurable
 from torchtitan.observability import structured_logger as sl
+from torchtitan.rl.controller.adaptive_demand import StallDrivenDemand
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout import RolloutGroup
+
+logger = logging.getLogger(__name__)
 
 
 class _RolloutGroupWorkState(enum.Enum):
@@ -32,7 +43,7 @@ class _RolloutGroupWorkState(enum.Enum):
 class RolloutGroupWork:
     """One prompt group's work, tracked through _RolloutGroupWorkState.
 
-    The input loop sets `group_id` + `sample`; the buffer owns `state` and `rollout_group`
+    The input loop sets `group_id` + `sample`; the buffer owns every other field
     (`init=False`, so the input loop can't set them).
     """
 
@@ -46,6 +57,15 @@ class RolloutGroupWork:
     rollout_group: RolloutGroup | None = field(
         default=None, init=False
     )  # set once FINALIZED
+    policy_version_at_claim: int | None = field(default=None, init=False)
+    """Generator policy version when generation started; only the adaptive buffer sets it, for its age drops."""
+    generation_task: asyncio.Task | None = field(default=None, init=False)
+    """Task generating this group, set by `track_generation`, so a buffer can cancel it."""
+    cancelled: bool = field(default=False, init=False)
+    """Set when the buffer cancelled this group's generation (the adaptive buffer, once the group is too old to
+    ever train); its slot stays charged until its `run_group` has ended on its rollout worker, or until
+    `Rollouter.cancel_group` gave up after an error or its timeout. Then the rollout loop releases it; the env server
+    may still be tearing down its episodes."""
     # TODO(async-rl): emit JSON lifecycle logging per RolloutGroupWork keyed by group_id:
     # admitted/claimed/finalized/batched/trained/dropped timestamps + policy version at admission and
     # at trainer consumption, for faithful end-to-end visibility.
@@ -75,8 +95,8 @@ class RolloutGroupWorkBuffer(Configurable):
         # target_offpolicy_steps=1, num_prompts_per_train_step=2 -> capacity=4
         await buffer.add_work(g0); await buffer.add_work(g1)   # 2/4 active
         await buffer.add_work(g2); await buffer.add_work(g3)   # 4/4 active (cap)
-        g0 = await buffer.take_finalized()                     # g0 leaves the dict; still 4/4 active
-        g1 = await buffer.take_finalized()                     # g1 leaves the dict; still 4/4 active
+        g0 = await buffer.take_finalized(consuming_policy_version=0)  # g0 leaves the dict; still 4/4 active
+        g1 = await buffer.take_finalized(consuming_policy_version=0)  # g1 leaves the dict; still 4/4 active
         slot_task = asyncio.create_task(buffer.wait_for_slot())  # waits: take_finalized did not free a slot
         assert not slot_task.done()
         await buffer.release_active_groups(2, reason="trained")  # trainer pulled -> a slot frees
@@ -154,20 +174,66 @@ class RolloutGroupWorkBuffer(Configurable):
                         return work
                 await self._condition.wait()
 
-    async def finalize_work(self, rollout_group: RolloutGroup) -> None:
-        """Rollout loop: store the produced RolloutGroup on its work entry (CLAIMED -> FINALIZED) and wake the batcher."""
+    def track_generation(self, work: RolloutGroupWork, task: asyncio.Task) -> None:
+        """Rollout loop: record the task generating a claimed group, so the buffer can cancel it.
+
+        This buffer never cancels; the adaptive buffer cancels groups that became too old to train while generating.
+        """
+        work.generation_task = task
+
+    async def finalize_work(self, rollout_group: RolloutGroup) -> bool:
+        """Rollout loop: store the produced RolloutGroup on its work entry (CLAIMED -> FINALIZED) and wake the batcher.
+
+        Returns False when the result is not stored: the buffer was closed, or it cancelled the group (whose slot
+        is released here instead).
+        """
         async with self._condition:
             work = self._work_by_group_id.get(rollout_group.group_id)
             if work is None:
                 # run()'s shutdown called close(); drop the result.
-                return
+                return False
+            if work.cancelled:
+                # Cancelled after its last rollout ended (cancel was a no-op): drop the result.
+                self._release_cancelled(work)
+                return False
             work.rollout_group = rollout_group
             work.state = _RolloutGroupWorkState.FINALIZED
             self._condition.notify_all()
+            return True
+
+    async def release_cancelled(self, group_id: int) -> None:
+        """Rollout loop: free the slot of a group the buffer cancelled, once its `run_group` ended on its worker.
+
+        Also called when `Rollouter.cancel_group` gave up after an error or its timeout. The env server may still be
+        tearing down the group's episodes.
+
+        Example:
+            # the adaptive buffer cancelled g0 (too old); g0's rollout loop sees CancelledError
+            await buffer.release_cancelled(0)   # g0 leaves the buffer; its slot is free
+        """
+        async with self._condition:
+            work = self._work_by_group_id.get(group_id)
+            if work is None:
+                # run()'s shutdown called close().
+                return
+            if not work.cancelled:
+                raise RuntimeError(f"group {group_id} was not cancelled by the buffer")
+            self._release_cancelled(work)
+
+    def _release_cancelled(self, work: RolloutGroupWork) -> None:
+        """Remove a cancelled group and free its slot. Caller holds the condition."""
+        del self._work_by_group_id[work.group_id]
+        self._active_rollout_groups -= 1
+        sl.log_trace_scalar({"rollout_buffer/released/cancelled_too_old": 1.0})
+        self._condition.notify_all()
 
     @sl.log_trace_span("take_finalized")
-    async def take_finalized(self) -> RolloutGroup | None:
+    async def take_finalized(
+        self, *, consuming_policy_version: int
+    ) -> RolloutGroup | None:
         """Batcher loop: return the oldest FINALIZED group the window allows.
+
+        `consuming_policy_version` is for the adaptive buffer's age drops; this buffer drops nothing.
 
         Cases:
             window_size is None: every finalized group is eligible; the oldest is returned.
@@ -182,7 +248,7 @@ class RolloutGroupWorkBuffer(Configurable):
 
         Example:
             # window_size=3: g0 CLAIMED, g1 WAITING, g2 and g3 FINALIZED
-            group = await buffer.take_finalized()
+            group = await buffer.take_finalized(consuming_policy_version=0)
             assert group.group_id == 2  # g2 is inside [g0, g2].
             # g3 remains blocked. With window_size=None, g3 would be taken next.
         """
@@ -204,6 +270,20 @@ class RolloutGroupWorkBuffer(Configurable):
                         self._condition.notify_all()
                         return work.rollout_group
                 await self._condition.wait()  # nothing finalized inside the window -> stall
+
+    async def record_step_start(self, *, trainer_policy_version: int) -> None:
+        """Trainer loop: called right before it waits for the next batch. This buffer ignores it;
+        the adaptive buffer updates its demand here.
+
+        Args:
+            trainer_policy_version: Version of the weights that will train the batch being waited for.
+        """
+
+    def pop_dropped_group_ids(self) -> list[int]:
+        """Trainer loop, at the optimizer step: groups dropped since the last call, so the dataloader
+        stops replaying them. This buffer drops nothing; the adaptive buffer drops groups too old to train.
+        """
+        return []
 
     async def release_active_groups(self, count: int, *, reason: str) -> None:
         """Free active slots: the trainer releases trained slots after its model state dict pull; the batcher
@@ -273,4 +353,383 @@ class RolloutGroupWorkBuffer(Configurable):
         ]
         # Next interval starts from the current gauge, not 0: slots stay occupied across a flush.
         self._active_rollout_groups_peak_since_flush = self._active_rollout_groups
+        return out
+
+
+class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
+    """Oldest-ready buffer with exact age eviction and a demand learned from the run.
+
+    Same callers and lifecycle as `RolloutGroupWorkBuffer`; three rules differ:
+
+    1. Demand. At every step start the buffer counts the groups that are not ready (generating, or the batch
+       being trained) and hands the count to `StallDrivenDemand`: demand = one batch + the value that count stays
+       under on 95% of steps + one spare group, moved up half the gap or down one group per step, never above the
+       mean-age ceiling (see `adaptive_demand.py`). Admission also stops at `generation_capacity` groups
+       generating, so demand cannot enlarge vLLM concurrency.
+    2. Selection. `take_finalized` returns the oldest FINALIZED group wherever it sits; a slow group never
+       blocks younger finished ones and keeps its slot until it finishes.
+    3. Age. A finalized group that would be consumed more than `max_offpolicy_steps` versions after it was
+       claimed is dropped (slot released at once, prompt not retried); with `max_offpolicy_steps=None` nothing is
+       dropped. A group still generating is cancelled as soon as the batch being assembled makes it that old, since
+       it can never train; it counts as a dropped group at once, and its slot is released once its `run_group` has
+       ended on its rollout worker, or once `Rollouter.cancel_group` gave up after an error or its timeout (the env
+       server may still be tearing down its episodes). The mean age is held under `target_offpolicy_steps` if set,
+       else under `max_offpolicy_steps` if set, by the demand ceiling, at the price of stalls when the workload needs
+       more groups than the ceiling allows. With neither, the demand follows the workload alone.
+
+    Example:
+        buffer = AdaptiveRolloutGroupWorkBuffer.Config(max_offpolicy_steps=10).build(
+            num_prompts_per_train_step=8, generation_capacity=60
+        )
+        buffer.metrics()   # rollout_buffer/demand_target_groups 24: three batches to start
+        await buffer.record_step_start(trainer_policy_version=0)   # nothing ready: unavailable 24 -> demand 29
+        buffer.metrics()   # rollout_buffer/demand_target_groups 29, rollout_buffer/ready_at_step_start 0
+
+        # g0 claimed at version 0; the batch being assembled trains at version 11 -> age 11 > 10 -> dropped
+        await buffer.finalize_work(RolloutGroup(group_id=0, rollouts=[...]))
+        await buffer.take_finalized(consuming_policy_version=11)
+        # -> slot released with reason "too_old"; selection skips to the next finalized group
+        # g1, also claimed at version 0, is still generating -> its generation task is cancelled; the slot is
+        # released with reason "cancelled_too_old" once its `run_group` has ended on its rollout worker
+
+    Args:
+        num_prompts_per_train_step: Prompt groups per train step (`P`).
+        generation_capacity: Most groups generating (waiting or claimed) at once: the controller's rollout loops,
+            `async_loop.num_concurrent_rollout_groups`.
+        policy_version: Version the generators and the trainer hold at start (the resumed step).
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Configurable.Config):
+        max_offpolicy_steps: int | None = 4
+        """Bounds the age of EVERY trained group: a finalized group older than this at consumption is dropped
+        (prompt not retried), and a group still generating is cancelled once it is that old. Without
+        `target_offpolicy_steps`, also the mean age the demand ceiling holds under. None: nothing is dropped for age."""
+
+        target_offpolicy_steps: int | None = None
+        """Bounds the MEAN age at this value: demand is capped at the mean-age ceiling
+        `target * P + P + generating * untrainable_share`. Costs stalls when generation cannot fill a batch within
+        the cap, never waste. None: the same ceiling is applied at `max_offpolicy_steps`, if set."""
+
+        lookback_steps: int = 10
+        """How many of the most recent step starts the demand rule looks back over; older values are forgotten."""
+
+        stall_probability: float = 0.05
+        """Share of steps allowed to stall; the demand covers the unavailable count on 1 - stall_probability of steps."""
+
+        start_batches: int = 3
+        """Demand at the first step, in batches of P; the rule learns the rest from the run itself."""
+
+        damping_factor: float = 0.5
+        """Share of the gap to the computed need closed per step going up, or coming down to the mean-age ceiling;
+        otherwise demand comes down one group per step."""
+
+        def __post_init__(self) -> None:
+            if self.max_offpolicy_steps is not None and self.max_offpolicy_steps < 1:
+                raise ValueError(
+                    f"max_offpolicy_steps must be None or >= 1, got {self.max_offpolicy_steps}"
+                )
+            if self.target_offpolicy_steps is not None and (
+                self.target_offpolicy_steps < 1
+                or (
+                    self.max_offpolicy_steps is not None
+                    and self.target_offpolicy_steps > self.max_offpolicy_steps
+                )
+            ):
+                raise ValueError(
+                    "target_offpolicy_steps must be None or in [1, max_offpolicy_steps], "
+                    f"got {self.target_offpolicy_steps} with max_offpolicy_steps={self.max_offpolicy_steps}"
+                )
+            if self.lookback_steps < 2:
+                raise ValueError(
+                    f"lookback_steps must be >= 2, got {self.lookback_steps}"
+                )
+            if not (0 < self.stall_probability < 0.5):
+                raise ValueError(
+                    f"stall_probability must be in (0, 0.5), got {self.stall_probability}"
+                )
+            if self.start_batches < 1:
+                raise ValueError(
+                    f"start_batches must be >= 1, got {self.start_batches}"
+                )
+            if not (0 < self.damping_factor <= 1):
+                raise ValueError(
+                    f"damping_factor must be in (0, 1], got {self.damping_factor}"
+                )
+
+    def __init__(
+        self,
+        config: Config,
+        *,
+        num_prompts_per_train_step: int,
+        generation_capacity: int,
+        policy_version: int = 0,
+    ) -> None:
+        self._demand = StallDrivenDemand(
+            num_prompts_per_train_step=num_prompts_per_train_step,
+            max_offpolicy_steps=config.max_offpolicy_steps,
+            target_offpolicy_steps=config.target_offpolicy_steps,
+            lookback_steps=config.lookback_steps,
+            stall_probability=config.stall_probability,
+            start_batches=config.start_batches,
+            damping_factor=config.damping_factor,
+        )
+        # The demand is the active-slot cap; only `record_step_start` moves it. No window: oldest finalized first.
+        super().__init__(
+            RolloutGroupWorkBuffer.Config(),
+            max_active_rollout_groups=self._demand.demand,
+            window_size=None,
+        )
+        self._num_prompts_per_train_step = num_prompts_per_train_step
+        self._max_offpolicy_steps = config.max_offpolicy_steps
+        self._generation_capacity = generation_capacity
+        self._warned_capacity_binds = False
+        self._generator_policy_version = policy_version
+        # metrics: the shelf and the generating count at the last step start; flow since the last step start
+        self._ready_at_step_start = 0
+        self._generating_at_step_start = 0
+        self._unavailable_at_step_start = 0
+        self._completed_since_step_start = 0
+        self._untrainable_since_step_start = 0
+        self._dropped_since_step_start = 0
+        self._dropped_too_old_since_flush = 0
+        self._cancelled_too_old_since_flush = 0
+        self._dropped_group_ids: list[int] = []
+        # Highest version the batcher assembled a batch for; claimed groups are checked when it advances.
+        self._consuming_policy_version = policy_version
+
+    def _has_active_slot_available(self) -> bool:
+        generating = sum(
+            work.state
+            in (_RolloutGroupWorkState.WAITING, _RolloutGroupWorkState.CLAIMED)
+            for work in self._work_by_group_id.values()
+        )
+        return (
+            super()._has_active_slot_available()
+            and generating < self._generation_capacity
+        )
+
+    async def add_work(self, work: RolloutGroupWork) -> None:
+        """Admit one rollout group as WAITING and charge one active slot, without re-checking the demand.
+
+        `record_step_start` can lower the demand while the data input loop reads the sample a
+        `wait_for_slot` let in; that group is still admitted, and the lower demand applies to the next one.
+        """
+        async with self._condition:
+            self._active_rollout_groups += 1
+            self._active_rollout_groups_peak_since_flush = max(
+                self._active_rollout_groups_peak_since_flush,
+                self._active_rollout_groups,
+            )
+            self._work_by_group_id[work.group_id] = work
+            self._condition.notify_all()
+
+    async def claim_next(self) -> RolloutGroupWork | None:
+        """Claim like the base buffer, and record the generator version the group starts under."""
+        work = await super().claim_next()
+        if work is not None:
+            work.policy_version_at_claim = self._generator_policy_version
+        return work
+
+    def _is_too_old(
+        self, work: RolloutGroupWork, *, consuming_policy_version: int
+    ) -> bool:
+        if work.policy_version_at_claim is None:
+            raise RuntimeError(f"group {work.group_id} was never claimed")
+        return (
+            self._max_offpolicy_steps is not None
+            and consuming_policy_version - work.policy_version_at_claim
+            > self._max_offpolicy_steps
+        )
+
+    def _drop_too_old(self, work: RolloutGroupWork) -> None:
+        """Remove a finalized group past `max_offpolicy_steps` and free its slot at once. Caller holds the condition."""
+        del self._work_by_group_id[work.group_id]
+        self._dropped_group_ids.append(work.group_id)
+        self._active_rollout_groups -= 1
+        self._dropped_too_old_since_flush += 1
+        self._dropped_since_step_start += 1
+        sl.log_trace_scalar({"rollout_buffer/released/too_old": 1.0})
+        self._condition.notify_all()
+
+    def _cancel_too_old_claimed(self, *, consuming_policy_version: int) -> None:
+        """Cancel every claimed group already past `max_offpolicy_steps` for the batch being assembled.
+
+        Batches train in version order and age only grows, so such a group would be dropped when it finalized:
+        cancel its generation task now instead of waiting for its slowest rollout; the rollout loop then stops the
+        group on its worker (`Rollouter.cancel_group`). It counts as a completed, dropped group, as a finalized
+        too-old drop does; its slot stays charged until the rollout loop calls `release_cancelled`. Caller holds the
+        condition.
+        """
+        for work in self._work_by_group_id.values():
+            if (
+                work.state is not _RolloutGroupWorkState.CLAIMED
+                or work.cancelled
+                or not self._is_too_old(
+                    work, consuming_policy_version=consuming_policy_version
+                )
+            ):
+                continue
+            work.cancelled = True
+            if work.generation_task is not None:
+                work.generation_task.cancel()
+            self._dropped_group_ids.append(work.group_id)
+            self._cancelled_too_old_since_flush += 1
+            self._completed_since_step_start += 1
+            self._dropped_since_step_start += 1
+
+    def pop_dropped_group_ids(self) -> list[int]:
+        dropped_group_ids, self._dropped_group_ids = self._dropped_group_ids, []
+        return dropped_group_ids
+
+    async def finalize_work(self, rollout_group: RolloutGroup) -> bool:
+        stored = await super().finalize_work(rollout_group)
+        if stored:
+            self._completed_since_step_start += 1
+        return stored
+
+    async def release_active_groups(self, count: int, *, reason: str) -> None:
+        await super().release_active_groups(count, reason=reason)
+        if reason == "untrainable_group":
+            self._untrainable_since_step_start += count
+        elif reason == "trained":
+            # The weight sync releases one batch of trained slots per pulled version.
+            # TODO: take the pulled version from the controller, which knows it at the release, instead of counting
+            # "trained" releases: another caller releasing with this reason would shift every group's claim age.
+            self._generator_policy_version += 1
+
+    @sl.log_trace_span("take_finalized")
+    async def take_finalized(
+        self, *, consuming_policy_version: int
+    ) -> RolloutGroup | None:
+        """Batcher loop: return the oldest FINALIZED group, dropping any that became too old while waiting.
+
+        Example:
+            # g0 is CLAIMED (slow), g1 and g2 are FINALIZED -> g1 is returned; g0 keeps its slot
+            group = await buffer.take_finalized(consuming_policy_version=0)
+            assert group.group_id == 1
+        """
+        async with self._condition:
+            if consuming_policy_version > self._consuming_policy_version:
+                self._consuming_policy_version = consuming_policy_version
+                self._cancel_too_old_claimed(
+                    consuming_policy_version=consuming_policy_version
+                )
+            while True:
+                if self._closed:
+                    return None
+                for work in list(self._work_by_group_id.values()):
+                    if work.state is not _RolloutGroupWorkState.FINALIZED:
+                        continue
+                    if self._is_too_old(
+                        work, consuming_policy_version=consuming_policy_version
+                    ):
+                        self._drop_too_old(work)
+                        continue
+                    del self._work_by_group_id[work.group_id]
+                    self._condition.notify_all()
+                    return work.rollout_group
+                await self._condition.wait()  # nothing finalized -> stall
+
+    async def record_step_start(self, *, trainer_policy_version: int) -> None:
+        """Trainer loop, right before it waits for a batch: measure the shelf and update the demand.
+
+        The shelf is everything admitted that is neither still generating nor held by the trainer:
+        `active - (waiting + claimed) - trained awaiting release`, i.e. finalized, selected, and queued groups.
+        """
+        async with self._condition:
+            states = [work.state for work in self._work_by_group_id.values()]
+            generating = states.count(_RolloutGroupWorkState.CLAIMED) + states.count(
+                _RolloutGroupWorkState.WAITING
+            )
+            # The trainer holds one batch of slots per version the generators have not pulled yet.
+            trained_awaiting_release = self._num_prompts_per_train_step * (
+                trainer_policy_version - self._generator_policy_version
+            )
+            ready = self._active_rollout_groups - generating - trained_awaiting_release
+            self._generating_at_step_start = generating
+            self._ready_at_step_start = ready
+            self._unavailable_at_step_start = max(0, self._demand.demand - ready)
+            completed = self._completed_since_step_start
+            self._demand.observe(
+                step=trainer_policy_version + 1,
+                ready=ready,
+                generating=generating,
+                completed=completed,
+                trainable=max(
+                    0,
+                    completed
+                    - self._untrainable_since_step_start
+                    - self._dropped_since_step_start,
+                ),
+            )
+            self._completed_since_step_start = 0
+            self._untrainable_since_step_start = 0
+            self._dropped_since_step_start = 0
+            # Warn once: past the capacity, extra demand cannot run and the trainer waits instead.
+            if (
+                self._demand.demand > self._generation_capacity
+                and not self._warned_capacity_binds
+            ):
+                self._warned_capacity_binds = True
+                logger.warning(
+                    f"Rollout buffer: demand {self._demand.demand} groups > generation_capacity "
+                    f"{self._generation_capacity} (async_loop.num_concurrent_rollout_groups), so at most "
+                    f"{self._generation_capacity} groups generate at once and the trainer can wait for batches."
+                )
+            grew = self._demand.demand > self._max_active_rollout_groups
+            self._max_active_rollout_groups = self._demand.demand
+            if grew:
+                self._condition.notify_all()
+
+    def metrics(self) -> list[m.Metric]:
+        generating = sum(
+            work.state
+            in (_RolloutGroupWorkState.WAITING, _RolloutGroupWorkState.CLAIMED)
+            for work in self._work_by_group_id.values()
+        )
+        out = [
+            *super().metrics(),
+            m.Metric(
+                "rollout_buffer/generation_capacity_groups",
+                m.NoReduce(float(self._generation_capacity)),
+            ),
+            m.Metric(
+                "rollout_buffer/available_generation_permits",
+                m.NoReduce(float(self._generation_capacity - generating)),
+            ),
+            m.Metric(
+                "rollout_buffer/demand_target_groups",
+                m.NoReduce(float(self._demand.demand)),
+            ),
+            m.Metric(
+                "rollout_buffer/ready_at_step_start",
+                m.NoReduce(float(self._ready_at_step_start)),
+            ),
+            m.Metric(
+                "rollout_buffer/generating_at_step_start",
+                m.NoReduce(float(self._generating_at_step_start)),
+            ),
+            # the rule's observable: slots that held no ready group at the step start
+            m.Metric(
+                "rollout_buffer/unavailable_at_step_start",
+                m.NoReduce(float(self._unavailable_at_step_start)),
+            ),
+            m.Metric(
+                "rollout_buffer/dropped_too_old",
+                m.NoReduce(float(self._dropped_too_old_since_flush)),
+            ),
+            # groups cancelled while generating, already too old to train
+            m.Metric(
+                "rollout_buffer/cancelled_too_old",
+                m.NoReduce(float(self._cancelled_too_old_since_flush)),
+            ),
+            # 1 while the mean-age ceiling caps the demand, else 0
+            m.Metric(
+                "rollout_buffer/demand_age_limited",
+                m.NoReduce(float(self._demand.state == "age-limited")),
+            ),
+        ]
+        self._dropped_too_old_since_flush = 0
+        self._cancelled_too_old_since_flush = 0
         return out

@@ -45,6 +45,8 @@ class RolloutWorkerActor(Actor):
             ThreadPoolExecutor(max_workers=num_threads)
         )
         self._worker = worker_config.build(**worker_kwargs)
+        # group id -> the task running its `run_group` here, for `cancel_group`.
+        self._group_tasks: dict[int, asyncio.Task] = {}
 
     @concurrent_endpoint
     async def setup_async(
@@ -73,14 +75,33 @@ class RolloutWorkerActor(Actor):
         group_size: int,
         sampling: Any,
     ) -> RolloutGroup:
-        return await self._worker.run_group(
-            generate_fn=generate_fn,
-            release_session_fn=release_session_fn,
-            sample=sample,
-            group_id=group_id,
-            group_size=group_size,
-            sampling=sampling,
-        )
+        self._group_tasks[group_id] = asyncio.current_task()
+        try:
+            return await self._worker.run_group(
+                generate_fn=generate_fn,
+                release_session_fn=release_session_fn,
+                sample=sample,
+                group_id=group_id,
+                group_size=group_size,
+                sampling=sampling,
+            )
+        finally:
+            self._group_tasks.pop(group_id, None)
+
+    @concurrent_endpoint
+    async def cancel_group(self, group_id: int) -> None:
+        """Cancel this group's `run_group` if this worker runs it; return once it ended.
+
+            group runs on this worker      cancel it, return when it ended
+            group not on this worker       return at once
+
+        Monarch starts one sender's concurrent calls in order, so a `run_group` sent before this call is found.
+        The cancelled `run_group` call fails with an `ActorError` at its caller.
+        """
+        task = self._group_tasks.get(group_id)
+        if task is not None:
+            task.cancel()
+            await asyncio.wait([task])
 
     @concurrent_endpoint
     async def sync_log_step(self, step: int) -> None:
