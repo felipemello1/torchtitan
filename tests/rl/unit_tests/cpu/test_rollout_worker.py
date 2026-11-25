@@ -189,8 +189,8 @@ def test_worker_executes_group_without_actor_mesh() -> None:
         ]
         # Each rollout releases its routing session after its last turn.
         assert released == [
-            {"routing_session_id": "group=7/rollout=0"},
-            {"routing_session_id": "group=7/rollout=1"},
+            {"routing_session_id": "group=7/rollout=0", "group_id": 7},
+            {"routing_session_id": "group=7/rollout=1", "group_id": 7},
         ]
 
         # Setup started this process's metrics, and `run_group` added them to the training group.

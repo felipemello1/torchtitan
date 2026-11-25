@@ -180,13 +180,13 @@ def test_rollout_loop_keeps_the_metrics_a_worker_sent_with_its_group() -> None:
     controller = object.__new__(Controller)
     controller.config = SimpleNamespace(
         async_loop=SimpleNamespace(num_samples_per_prompt=1),
-        generator_router=SimpleNamespace(admission=None),
     )
     controller._sampling = SamplingConfig()
     controller._rollouter = SimpleNamespace(run_group_rollouts=run_group_rollouts)
     controller.rollout_recorder = SimpleNamespace(record=lambda **kwargs: None)
     controller.generator_router = SimpleNamespace(
-        release_groups=SimpleNamespace(call_one=AsyncMock())
+        acquire_group=SimpleNamespace(call_one=AsyncMock()),
+        release_groups=SimpleNamespace(call_one=AsyncMock()),
     )
     group_buffer = SimpleNamespace(
         claim_next=claim_next,
@@ -1287,16 +1287,15 @@ def test_validation_renames_turn_metrics_and_uses_fresh_group_ids() -> None:
         return RolloutGroup(group_id=group_id, rollouts=[rollout])
 
     controller = object.__new__(Controller)
-    controller.config = SimpleNamespace(
-        generator_router=SimpleNamespace(admission=None)
-    )
+    controller.config = SimpleNamespace()
     controller._validation_group_ids = itertools.count(start=-1, step=-1)
     controller._make_generate_fn = lambda: None
     controller._make_release_session_fn = lambda: None
     controller._rollouter = SimpleNamespace(run_group_rollouts=run_group_rollouts)
     release_groups = AsyncMock()
     controller.generator_router = SimpleNamespace(
-        release_groups=SimpleNamespace(call_one=release_groups)
+        acquire_group=SimpleNamespace(call_one=AsyncMock()),
+        release_groups=SimpleNamespace(call_one=release_groups),
     )
 
     async def run_two_validations() -> list[m.Metric]:
@@ -1362,12 +1361,12 @@ def test_validate_rolls_out_each_prompt_n_times(
                 top_k=20,
             )
         ),
-        generator_router=SimpleNamespace(admission=None),
     )
     controller._sampling = SamplingConfig(temperature=0.8, seed=7, stop_token_ids=[1])
     controller._validation_group_ids = itertools.count(start=-1, step=-1)
     controller.generator_router = SimpleNamespace(
-        release_groups=SimpleNamespace(call_one=AsyncMock())
+        acquire_group=SimpleNamespace(call_one=AsyncMock()),
+        release_groups=SimpleNamespace(call_one=AsyncMock()),
     )
     controller.rollout_recorder = SimpleNamespace(record=lambda **kwargs: None)
     run_group_rollouts = AsyncMock(
@@ -1957,7 +1956,7 @@ def test_adaptive_buffer_cancel_racing_the_last_rollout_releases_the_slot_once()
 
 
 def _controller_for_rollout_loops(
-    *, run_group_rollouts, cancel_group, events: list
+    *, run_group_rollouts, cancel_group, events: list, acquire_group=None
 ) -> Controller:
     async def release_groups(group_ids: list[int]) -> None:
         events.append(("release_groups", group_ids))
@@ -1965,11 +1964,11 @@ def _controller_for_rollout_loops(
     controller = object.__new__(Controller)
     controller.config = SimpleNamespace(
         async_loop=SimpleNamespace(num_samples_per_prompt=2),
-        generator_router=SimpleNamespace(admission=None),
     )
     controller._sampling = None
     controller.generator_router = SimpleNamespace(
-        release_groups=SimpleNamespace(call_one=release_groups)
+        acquire_group=SimpleNamespace(call_one=acquire_group or AsyncMock()),
+        release_groups=SimpleNamespace(call_one=release_groups),
     )
     controller.rollout_recorder = SimpleNamespace(record=lambda **kwargs: None)
     controller._rollouter = SimpleNamespace(
@@ -2034,6 +2033,60 @@ def test_rollout_loop_stops_a_group_the_buffer_cancels_on_its_worker() -> None:
         assert (await taker).group_id == 2
         assert not any(loop.done() for loop in loops)
 
+        await buffer.close()
+        await asyncio.gather(*loops)
+
+    asyncio.run(run())
+
+
+def test_rollout_loop_acquires_before_rolling_out_and_releases_a_group_cancelled_while_waiting() -> (
+    None
+):
+    async def run() -> None:
+        buffer = _adaptive_buffer(
+            num_prompts=1, max_offpolicy_steps=1, generation_capacity=4
+        )
+        events = []
+
+        async def acquire_group(group_id: int, **kwargs) -> None:
+            events.append(("acquire_group", group_id))
+            if group_id == 0:
+                await asyncio.sleep(3600)  # no generator has KV room for g0
+
+        async def run_group_rollouts(*, group_id: int, **kwargs) -> RolloutGroup:
+            events.append(("run_group_rollouts", group_id))
+            return RolloutGroup(group_id=group_id, rollouts=[])
+
+        controller = _controller_for_rollout_loops(
+            run_group_rollouts=run_group_rollouts,
+            cancel_group=AsyncMock(),
+            events=events,
+            acquire_group=acquire_group,
+        )
+        loops = [
+            asyncio.create_task(
+                controller._rollout_loop(
+                    group_buffer=buffer, generate_fn=None, release_session_fn=None
+                )
+            )
+            for _ in range(2)
+        ]
+        await _admit(buffer, 0)
+        await _admit(buffer, 1)
+        # g1 is placed, runs and trains at version 0; g0 still waits for room, so it never ran.
+        assert (await buffer.take_finalized(consuming_policy_version=0)).group_id == 1
+        await buffer.release_active_groups(1, reason="trained")
+        assert ("run_group_rollouts", 0) not in events
+
+        # The batch for version 2 cancels g0 while it waits: it is released, and never runs.
+        taker = asyncio.create_task(buffer.take_finalized(consuming_policy_version=2))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert ("release_groups", [0]) in events
+        assert ("run_group_rollouts", 0) not in events
+
+        await _admit(buffer, 2)
+        assert (await taker).group_id == 2
         await buffer.close()
         await asyncio.gather(*loops)
 

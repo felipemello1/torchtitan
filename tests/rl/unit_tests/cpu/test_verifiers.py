@@ -1733,8 +1733,8 @@ def test_rollout_releases_every_trace_session_even_if_one_release_fails(caplog) 
         )
 
     assert [call.kwargs for call in release_session_fn.call_args_list] == [
-        {"routing_session_id": "opponent"},
-        {"routing_session_id": "policy"},
+        {"routing_session_id": "opponent", "group_id": 1},
+        {"routing_session_id": "policy", "group_id": 1},
     ]
     assert "releasing routing session opponent failed" in caplog.text
     assert popped_trace_ids == ["opponent", "policy"]

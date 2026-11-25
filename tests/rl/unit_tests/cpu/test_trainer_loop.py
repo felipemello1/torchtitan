@@ -13,6 +13,7 @@ Monarch / TorchStore) and check that ordering.
 
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -91,8 +92,7 @@ def _controller(
             max_offpolicy_steps=None,
             num_prompts_per_train_step=5,
             validation=ValidationConfig(),
-        ),
-        generator_router=SimpleNamespace(admission=None),
+        )
     )
     controller.start_step = 0
     controller._trainer_policy_version = 0
@@ -110,7 +110,9 @@ def _controller(
         all_ranks=trainer, rank0=trainer, by_dp_rank=[trainer]
     )
     controller.generator_router = SimpleNamespace(
-        sync_log_step=_Endpoint(), pull_model_state_dict=_Endpoint(pull)
+        sync_log_step=_Endpoint(),
+        pull_model_state_dict=_Endpoint(pull),
+        admission_metrics=SimpleNamespace(call_one=AsyncMock(return_value=[])),
     )
     controller.batcher = SimpleNamespace(
         sync_log_step=SimpleNamespace(broadcast=lambda step: None),

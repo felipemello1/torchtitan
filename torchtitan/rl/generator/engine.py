@@ -207,7 +207,11 @@ class KVCacheBudget:
         return self.num_blocks - self.free_floor_blocks
 
     def idle_session_blocks(self, num_tokens: int) -> int:
-        """Blocks the session KV holder keeps for a session of `num_tokens` tokens between turns."""
+        """Blocks the session KV holder keeps for a session of `num_tokens` tokens between turns.
+
+        Admission passes a turn's prompt + completion. The holder keeps only the prompt's blocks, so this
+        reads about ceil(completion / block_size) + 1 blocks high per idle session: a margin.
+        """
         attention_blocks = sum(
             math.ceil(num_tokens / block_size)
             for block_size in self.attention_block_sizes

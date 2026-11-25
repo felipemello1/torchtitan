@@ -4,14 +4,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import pytest
-
 from torchtitan.rl.generator.engine import KVCacheBudget
 from torchtitan.rl.routing.admission import KVRoomAdmission
 
 
 def _budget(num_blocks: int = 3411) -> KVCacheBudget:
-    """r8's engine (Qwen3.8-27B, MTP-3): 3,030 usable blocks; a 4,000-token session holds 6 blocks
+    """Qwen3.8-27B with MTP-3 on one GB300: 3,030 usable blocks; a 4,000-token session holds 6 blocks
     idle and charges 22 while it runs."""
     return KVCacheBudget(
         num_blocks=num_blocks,
@@ -144,11 +142,12 @@ def test_released_sessions_stop_charging_and_late_releases_are_ignored():
     policy.start_call("r0", session_id="s0", group_id=0, num_prompt_tokens=4000)
     policy.start_call("r1", session_id="s1", group_id=0, num_prompt_tokens=4000)
 
-    assert policy.release_session("s0") == 0
+    assert policy.release_session("s0", group_id=0) == 0
     # s0 is gone, and it no longer counts as a session not started.
     assert policy.ledger(0) == budget.running_session_blocks(4000)
     policy.end_call("r0", num_tokens=4500)  # its call's release arrives late
-    assert policy.release_session("s0") is None
+    assert policy.release_session("s0", group_id=0) is None
+    assert policy.ledger(0) == budget.running_session_blocks(4000)
 
     policy.release_group(0)
     policy.end_call("r1", num_tokens=4500)
@@ -170,6 +169,21 @@ def test_a_retried_attempt_is_charged_on_its_groups_generator():
     ) + budget.running_session_blocks(4000)
 
 
+def test_a_rollout_that_ends_before_its_first_call_stops_charging():
+    budget = _budget()
+    policy = _policy(budget)
+    _seed_first_prompt(policy)
+    policy.add_group(0, num_sessions=2, validation=False)
+    policy.place()
+    policy.start_call("r0", session_id="s0", group_id=0, num_prompt_tokens=4000)
+
+    # s1's env failed before its first call; a repeated release counts once.
+    policy.release_session("s1", group_id=0)
+    policy.release_session("s1", group_id=0)
+
+    assert policy.ledger(0) == budget.running_session_blocks(4000)
+
+
 def test_a_waiting_group_can_be_released():
     policy = _policy()
     policy.add_group(0, num_sessions=16, validation=False)
@@ -181,24 +195,17 @@ def test_a_waiting_group_can_be_released():
     assert policy.num_waiting_groups == 0
 
 
-def test_rejects_data_parallel_generators():
-    budget = KVCacheBudget(
-        num_blocks=3411,
-        free_floor_blocks=381,
-        attention_block_sizes=(1664,),
-        num_mamba_groups=3,
-        mamba_blocks_per_running_request=4,
-        max_model_len=262144,
-        data_parallel_size=2,
-    )
-    with pytest.raises(ValueError, match="data_parallel_size=1"):
-        _policy(budget)
-
-
 def _idle_sessions(
-    policy: KVRoomAdmission, sizes: list[int], *, group_id: int = 0, validation=False
+    policy: KVRoomAdmission,
+    sizes: list[int],
+    *,
+    group_id: int = 0,
+    validation=False,
+    first_prompt_tokens: int | None = None,
 ) -> None:
-    """Place a group with one idle session per size (in tokens), named f"g{group_id}/s{i}"."""
+    """Place a group with one idle session per size (in tokens), named f"g{group_id}/s{i}". With
+    `first_prompt_tokens`, each grew to its size from a first prompt that long (later groups are
+    charged for that prompt)."""
     policy.add_group(group_id, num_sessions=len(sizes), validation=validation)
     policy.place()
     for i, size in enumerate(sizes):
@@ -207,7 +214,7 @@ def _idle_sessions(
             request_id,
             session_id=f"g{group_id}/s{i}",
             group_id=group_id,
-            num_prompt_tokens=size,
+            num_prompt_tokens=first_prompt_tokens or size,
         )
         policy.end_call(request_id, num_tokens=size)
 
@@ -278,6 +285,27 @@ def test_the_newest_groups_sessions_pause_first():
     )
 
 
+def test_validation_sessions_pause_after_running_training_sessions():
+    budget = _budget()
+    policy = _policy(budget)
+    _seed_first_prompt(policy)
+    _idle_sessions(policy, [100_000] * 2, group_id=-1, validation=True)  # 2 x 64
+    policy.add_group(0, num_sessions=18, validation=False)
+    policy.place()
+    for i in range(18):  # 18 running x 164 + 128 = 3,080, over 3,030
+        policy.start_call(
+            f"r{i}", session_id=f"s{i}", group_id=0, num_prompt_tokens=240_000
+        )
+
+    policy.rebalance(now=0.0)
+
+    # A running training session is picked to pause at its turn's end; the idle validation ones stay.
+    assert policy.num_paused_sessions == 0
+    policy.end_call("r0", num_tokens=240_000)
+    assert policy.num_paused_sessions == 1
+    assert policy.start_call("v", session_id="g-1/s0", group_id=-1, num_prompt_tokens=1)
+
+
 def test_running_sessions_pause_when_their_call_returns():
     budget = _budget()
     policy = _policy(budget)
@@ -307,8 +335,8 @@ def test_resume_goes_longest_paused_first_and_runs_the_waiting_call():
     )
 
     # Two releases free 296 blocks: 2,516 + 148 (s19) + 164 (s20, running) = 2,828 <= 2,878.
-    policy.release_session("g0/s0")
-    policy.release_session("g0/s1")
+    policy.release_session("g0/s0", group_id=0)
+    policy.release_session("g0/s1", group_id=0)
 
     assert policy.rebalance(now=10.0) == ["waiting"]
     assert policy.num_paused_sessions == 0
@@ -325,12 +353,27 @@ def test_a_generator_with_paused_sessions_takes_no_new_group():
     assert policy.place() == {1: 1}
 
 
+def test_paused_sessions_that_end_free_their_generator_for_a_group():
+    policy = _policy()
+    _idle_sessions(policy, _OVER_H, first_prompt_tokens=4000)
+    policy.rebalance(now=0.0)  # g0/s19 and s20 stay paused, ledger 2,812
+    policy.add_group(1, num_sessions=1, validation=False)  # 22 <= 2,878 - 2,812
+    assert policy.place() == {}
+
+    # Both rollouts end while paused.
+    policy.release_session("g0/s19", group_id=0)
+    policy.release_session("g0/s20", group_id=0)
+    policy.rebalance(now=1.0)
+
+    assert policy.place() == {1: 0}
+
+
 def test_a_generator_with_only_paused_sessions_resumes_them_at_once():
     policy = _policy()
     _idle_sessions(policy, _OVER_H)
     policy.rebalance(now=0.0)
     for i in range(19):  # every unpaused session ends
-        policy.release_session(f"g0/s{i}")
+        policy.release_session(f"g0/s{i}", group_id=0)
 
     policy.rebalance(now=1.0)
 
@@ -377,27 +420,30 @@ def test_a_session_paused_past_the_bound_swaps_in_for_idle_sessions():
     )
 
 
-def test_a_hung_session_pauses_while_a_group_waits():
-    policy = _policy()
-    _seed_first_prompt(policy)
-    _idle_sessions(policy, [240_000] * 10)  # 1,480
-    policy.add_group(1, num_sessions=80, validation=False)  # 80 x 22 = 1,760: waits
-    assert policy.place() == {}
-    policy.rebalance(now=0.0)
-    for i in range(9):  # every session but g0/s9 runs again: 1,624, under H
+def test_a_session_idle_past_the_reclaim_time_holds_back_no_group():
+    budget = _budget()
+    policy = _policy(budget)
+    _idle_sessions(policy, [240_000] * 10, first_prompt_tokens=4000)
+    for i in range(9):  # every session but g0/s9 runs again: 9 x 164 + 148 = 1,624
         policy.start_call(
             f"again{i}", session_id=f"g0/s{i}", group_id=0, num_prompt_tokens=240_000
         )
+    policy.add_group(
+        1, num_sessions=60, validation=False
+    )  # 60 x 22 = 1,320: 1,624 + 1,320 > 2,878
+    assert policy.place() == {}
 
+    # Idle 601 s while a group waits (e.g. nobody released it): it leaves the ledger, and the group fits.
     policy.rebalance(now=601.0)
 
-    # It stays paused, not charged, until it calls: then it resumes when it fits.
-    assert policy.num_paused_sessions == 1
     assert policy.ledger(0) == 9 * 164
+    assert policy.num_reclaimed_sessions == 1
+    assert policy.place() == {1: 0}
+    # Once it calls again, it waits for room like any paused session.
     assert not policy.start_call(
         "back", session_id="g0/s9", group_id=0, num_prompt_tokens=240_000
     )
-    assert policy.rebalance(now=602.0) == ["back"]
+    assert policy.num_paused_sessions == 1
 
 
 def test_a_cancelled_waiting_call_is_forgotten():
@@ -409,7 +455,7 @@ def test_a_cancelled_waiting_call_is_forgotten():
     )
 
     policy.cancel_call("waiting")
-    policy.release_session("g0/s0")
-    policy.release_session("g0/s1")
+    policy.release_session("g0/s0", group_id=0)
+    policy.release_session("g0/s1", group_id=0)
 
     assert policy.rebalance(now=10.0) == []

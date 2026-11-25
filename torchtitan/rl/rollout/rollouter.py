@@ -793,7 +793,9 @@ class MessageEnvRolloutWorker(BaseRolloutWorker):
             errors = [error_entry(error)]
 
         try:
-            await release_session_fn(routing_session_id=routing_session_id)
+            await release_session_fn(
+                routing_session_id=routing_session_id, group_id=group_id
+            )
         except Exception:
             # Not fatal: `max_sessions` evicts an unreleased session.
             logger.exception("releasing routing session %s failed", routing_session_id)

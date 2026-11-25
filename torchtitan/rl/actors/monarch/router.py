@@ -84,8 +84,8 @@ class _InterGeneratorRouterActorEndpoints:
         await super().sync_log_step(step)
 
     @concurrent_endpoint
-    async def release_session(self, routing_session_id: str) -> None:
-        await super().release_session(routing_session_id)
+    async def release_session(self, routing_session_id: str, *, group_id: int) -> None:
+        await super().release_session(routing_session_id, group_id=group_id)
 
     @concurrent_endpoint
     async def release_groups(self, group_ids: list[int]) -> None:

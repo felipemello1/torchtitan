@@ -59,7 +59,8 @@ class _Actor:
         self.release_groups = _Endpoint()
         self.start_engine_loop = _Endpoint()
         self.close = _Endpoint()
-        # r8's engine: 3,030 usable blocks; a max-length session charges 177, a 4,000-token one 22.
+        # Qwen3.8-27B with MTP-3 on one GB300: 3,030 usable blocks; a max-length session charges 177,
+        # a 4,000-token one 22.
         self.kv_cache_budget = _Endpoint(
             returns=KVCacheBudget(
                 num_blocks=3411,
@@ -270,7 +271,7 @@ def test_release_session_unpins_it_and_frees_its_kv_on_its_generator():
     )
     assert _reserve(router, "r0", session_id="s0") == "gen0"
 
-    asyncio.run(router.release_session("s0"))
+    asyncio.run(router.release_session("s0", group_id=0))
 
     assert actors[0].release_sessions.calls == [((["s0"],), {})]
     assert actors[1].release_sessions.calls == []
@@ -467,7 +468,7 @@ def test_admission_holds_a_group_until_room_and_routes_its_calls_to_its_generato
         )
         # The release goes to the generator the group was placed on.
         router.release_reservation("r1", num_tokens=4100)
-        await router.release_session("g1/s0")
+        await router.release_session("g1/s0", group_id=1)
         assert actors[1].release_sessions.calls == [((["g1/s0"],), {})]
 
         # The first calls showed 4,000-token prompts, so a group now charges 16 x 22 = 352 and
@@ -510,6 +511,11 @@ def test_admission_metrics_raise_once_the_tick_task_died(monkeypatch):
 
     async def main():
         await router.start_engine_loop()
+        await router.acquire_group(0, group_size=16, validation=False)
+        waiting = asyncio.create_task(
+            router.acquire_group(1, group_size=16, validation=False)
+        )
+        await asyncio.sleep(0)
 
         def broken_place():
             raise RuntimeError("place failed")
@@ -517,8 +523,13 @@ def test_admission_metrics_raise_once_the_tick_task_died(monkeypatch):
         monkeypatch.setattr(router._admission, "place", broken_place)
         await asyncio.wait_for(asyncio.wait([router._admission_task]), timeout=5)
 
+        # Nothing would wake the waiting group: it fails, and so does every later endpoint call.
+        with pytest.raises(RuntimeError, match="admission tick task stopped"):
+            await asyncio.wait_for(waiting, timeout=5)
         with pytest.raises(RuntimeError, match="place failed"):
             router.admission_metrics()
+        with pytest.raises(RuntimeError, match="place failed"):
+            await _reserve_call(router, "r0", session_id="g0/s0", group_id=0)
         await router.close_generators()
 
     asyncio.run(main())
@@ -555,8 +566,8 @@ def test_a_paused_sessions_call_waits_until_the_session_resumes():
         assert not call.done()
 
         # Two rollouts end: the paused sessions fit again, and the waiting call runs.
-        await router.release_session("g0/s0")
-        await router.release_session("g0/s1")
+        await router.release_session("g0/s0", group_id=0)
+        await router.release_session("g0/s1", group_id=0)
 
         assert await asyncio.wait_for(call, timeout=5) == "gen0"
         await router.close_generators()
@@ -574,11 +585,12 @@ def test_cancel_reserve_drops_a_waiting_call():
 
         router.cancel_reserve("next")
         router.cancel_reserve("unknown")  # ignored
+        router.release_reservation("unknown", num_tokens=None)  # ignored
 
         with pytest.raises(asyncio.CancelledError):
             await call
-        await router.release_session("g0/s0")
-        await router.release_session("g0/s1")
+        await router.release_session("g0/s0", group_id=0)
+        await router.release_session("g0/s1", group_id=0)
         # The session resumes idle: no call was left to run, and nothing is reserved.
         assert router._reservations == {}
         assert router._generators[0].reserved_load == 0
@@ -603,8 +615,8 @@ def test_cancel_reserve_after_the_resume_leaves_no_reservation():
         ledger_before = router._admission.ledger(0)
 
         # The resume and the cancel land before the waiting call wakes up.
-        router._admission.release_session("g0/s0")
-        router._admission.release_session("g0/s1")
+        router._admission.release_session("g0/s0", group_id=0)
+        router._admission.release_session("g0/s1", group_id=0)
         router._admission_tick()
         router.cancel_reserve("next")
 
@@ -630,6 +642,74 @@ def test_releasing_a_paused_session_fails_its_waiting_call():
 
         with pytest.raises(RuntimeError, match="released while call 'next' waited"):
             await call
+        await router.close_generators()
+
+    asyncio.run(main())
+
+
+def test_a_call_of_a_group_admission_never_placed_raises():
+    async def main():
+        router = await _router_over_its_kv_cache(_Actor("gen0"))
+        with pytest.raises(ValueError, match="group 5 is not placed"):
+            await _reserve_call(router, "late", session_id="g5/s0", group_id=5)
+        await router.close_generators()
+
+    asyncio.run(main())
+
+
+def test_a_cancel_before_a_resume_leaves_the_session_idle():
+    async def main():
+        router = await _router_over_its_kv_cache(_Actor("gen0"))
+        call = asyncio.create_task(
+            _reserve_call(
+                router,
+                "next",
+                session_id="g0/s20",
+                group_id=0,
+                num_prompt_tokens=240_000,
+            )
+        )
+        await asyncio.sleep(0)
+
+        # The caller leaves; then, before the waiting call wakes, a release resumes the session.
+        router.cancel_reserve("next")
+        router._admission.release_session("g0/s0", group_id=0)
+        router._admission.release_session("g0/s1", group_id=0)
+        router._admission_tick()
+
+        with pytest.raises(asyncio.CancelledError):
+            await call
+        # g0/s19 and s20 resumed idle (148 each): 2,812 - 296 + 296.
+        assert router._admission.ledger(0) == 2812
+        await router.release_groups([0])
+        await router.close_generators()
+
+    asyncio.run(main())
+
+
+def test_a_waiting_call_whose_task_is_cancelled_is_uncharged():
+    async def main():
+        router = await _router_over_its_kv_cache(_Actor("gen0"))
+        call = asyncio.create_task(
+            _reserve_call(
+                router,
+                "next",
+                session_id="g0/s20",
+                group_id=0,
+                num_prompt_tokens=240_000,
+            )
+        )
+        await asyncio.sleep(0)
+
+        call.cancel()  # Monarch cancels the endpoint task, no cancel_reserve
+        with pytest.raises(asyncio.CancelledError):
+            await call
+        await router.release_session("g0/s0", group_id=0)
+        await router.release_session("g0/s1", group_id=0)
+
+        # Both paused sessions resume idle: no call is left to run.
+        assert router._admission.ledger(0) == 2812
+        assert router._reservations == {}
         await router.close_generators()
 
     asyncio.run(main())

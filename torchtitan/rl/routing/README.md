@@ -26,7 +26,8 @@ The router keeps one ledger per generator (`KVRoomAdmission`), in KV blocks, fro
 The controller calls `acquire_group` before a group builds its envs, and `release_groups` after it.
 Each call reports its prompt size to `reserve` and its prompt + completion size to `release_reservation`.
 
-Example (one generator, H = 3,030 blocks; a group starts while ledger + its charge <= 95% of H = 2,878):
+Example (one generator, H = 3,030 blocks; a group starts while ledger + its charge <= ADMIT_FRACTION
+(0.95) x H = 2,878):
 
     50 live sessions charge 2,700. Group 41 (16 fresh sessions x 22 = 352) waits: 3,052 > 2,878.
         Its envs don't start.
@@ -36,24 +37,29 @@ Example (one generator, H = 3,030 blocks; a group starts while ledger + its char
 Groups wait in order: validation groups first, by arrival, then training groups, lowest id first. A
 generator with no live session takes a group even over the mark. Before the first call shows a prompt
 size, a new session is charged the max model length, so each generator takes one group at the start.
+Without admission, `acquire_group` returns at once, so `rollout/admission_wait_s` is a router round trip.
 
 ### Growth pause
 
 Admitted sessions keep growing, one turn at a time. Every second, and on each release, the router pauses
 sessions on a generator whose ledger is over its usable blocks, where the holder starts releasing idle
-histories (`KVRoomAdmission.rebalance`):
+histories (`KVRoomAdmission.rebalance`; the constants are in `admission.py`):
 
-    ledger > 100% of H              pause idle sessions, newest group first (smallest within),
-                                    validation last, down to 90%; if those are not enough, running ones,
-                                    as their call returns
-    ledger + its charge <= 95%      resume the longest-paused session
-    paused 30 min                   swap it in for idle sessions, staying under 95%
-    no unpaused session left        resume the longest-paused session at once
-    idle 10 min while work waits    pause it (e.g. a hung env); it resumes when it calls again
+    ledger > PAUSE_FRACTION x H         pause training sessions, then validation ones: idle before
+                                        running, newest group first, smallest within; down to
+                                        DRAIN_FRACTION x H (a running one pauses as its call returns)
+    ledger + its charge <= ADMIT_FRACTION x H
+                                        resume the longest-paused session
+    paused PAUSE_AGE_BOUND_S            swap it in for idle sessions, staying under ADMIT_FRACTION x H
+    no unpaused session left            resume the longest-paused session at once
+    idle IDLE_RECLAIM_S, work waits     reclaim it (a hung env, a session nobody released): it leaves the
+                                        ledger and holds back no group; once it calls, it waits as paused
 
 A paused session's next call waits in `reserve`; to the rollout it looks like a slow model call. A
 generator with paused sessions takes no new group. The controller logs `admission/*` each step, and
-`generator/reserve_wait_ms` per call.
+`generator/reserve_wait_ms` per call (without admission, the router round trip). The router logs each
+generator's ledger, paused charge and paused / reclaimed sessions once per step.
 
-Not supported yet: generators with data parallelism (`KVRoomAdmission` raises), sliding-window attention,
-and Mamba groups outside vLLM's "align" mode (`VLLMEngine.kv_cache_budget` raises).
+Not supported yet: generators with data parallelism (`KVRoomAdmission` raises), vLLM's `SlidingWindowSpec`
+and Mamba groups outside vLLM's "align" mode (`VLLMEngine.kv_cache_budget` raises). Other windowed specs
+that subclass `FullAttentionSpec` are charged as full attention, an overcount.

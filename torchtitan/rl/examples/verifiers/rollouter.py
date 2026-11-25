@@ -335,7 +335,9 @@ class VerifiersRolloutWorker(BaseRolloutWorker):
             # TODO: an attempt Verifiers retried has no trace here, so its held KV waits for the
             # group's release. The generation server could record each rollout's session ids and
             # release those too. Its metadata, with any top-k rows, also stays until `close()`, as
-            # does every session of a `run` that raises (no trace ids then).
+            # does every session of a `run` that raises (no trace ids then). With router admission,
+            # such a session is reclaimed after `IDLE_RECLAIM_S`, and a rollout that raised before
+            # its first call stays charged until the group's release.
             generation_metadata_by_session = {
                 trace.id: self._generation_server.pop_generation_metadata(trace.id)
                 for trace in verifiers_episode.traces
@@ -343,7 +345,9 @@ class VerifiersRolloutWorker(BaseRolloutWorker):
 
             async def release(session_id: str) -> None:
                 try:
-                    await release_session_fn(routing_session_id=session_id)
+                    await release_session_fn(
+                        routing_session_id=session_id, group_id=group_id
+                    )
                 except Exception:
                     # Not fatal: `max_sessions` evicts an unreleased session.
                     logger.exception("releasing routing session %s failed", session_id)

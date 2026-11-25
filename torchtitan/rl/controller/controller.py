@@ -151,6 +151,11 @@ from torchtitan.tools.garbage_collector import GarbageCollector
 logger = logging.getLogger(__name__)
 
 
+class _AcquireGroupError(RuntimeError):
+    """`acquire_group` raised: admission can't place groups (e.g. its tick task stopped), so every later group
+    would fail the same way. The rollout loop raises it instead of dropping the group."""
+
+
 @dataclass(kw_only=True, slots=True)
 class ValidationConfig:
     """Held-out validation: how many prompts each validation has (`steps`) and when validations run.
@@ -528,6 +533,15 @@ class Controller(Configurable):
                 raise ValueError(
                     f"num_generators must be at least 1, got {self.num_generators}"
                 )
+            # Admission charges what the vLLM engine's session KV holder keeps (`VLLMEngine.kv_cache_budget`).
+            if (
+                self.generator_router.admission is not None
+                and getattr(self.generator.engine, "session_kv_holder", None) is None
+            ):
+                raise ValueError(
+                    "generator_router.admission needs generator.engine.session_kv_holder (a "
+                    f"VLLMEngine.Config option); {type(self.generator.engine).__qualname__} has none set"
+                )
             group_size = self.async_loop.num_samples_per_prompt
             rollouts_per_worker = self.rollouter.rollouts_per_worker
             # TODO: place single rollouts on workers, instead of groups
@@ -884,9 +898,9 @@ class Controller(Configurable):
         """Build the rollouter's `ReleaseSessionFn`: tell the generator router a rollout ended."""
         generator_router = self.generator_router
 
-        async def release_session(*, routing_session_id: str) -> None:
+        async def release_session(*, routing_session_id: str, group_id: int) -> None:
             await generator_router.release_session.call_one(
-                routing_session_id=routing_session_id
+                routing_session_id=routing_session_id, group_id=group_id
             )
 
         return release_session
@@ -1061,10 +1075,9 @@ class Controller(Configurable):
         group_ids = [next(self._validation_group_ids) for _ in samples]
 
         async def run_group(group_id: int, sample: object) -> RolloutGroup:
-            if self.config.generator_router.admission is not None:
-                await self.generator_router.acquire_group.call_one(
-                    group_id, group_size=num_samples_per_prompt, validation=True
-                )
+            await self.generator_router.acquire_group.call_one(
+                group_id, group_size=num_samples_per_prompt, validation=True
+            )
             return await self._rollouter.run_group_rollouts(
                 generate_fn=generate,
                 release_session_fn=release_session_fn,
@@ -1454,7 +1467,7 @@ class Controller(Configurable):
         consumes: a WAITING RolloutGroupWork (group_buffer.claim_next)
             waits for:    a claimable WAITING entry
             unblocked by: _data_input_loop group_buffer.add_work()
-        acquires (with generator_router.admission): a generator for the group (acquire_group)
+        acquires: a generator for the group (acquire_group; at once without generator_router.admission)
             waits for:    KV room on a generator, after the groups ahead of it
             unblocked by: other groups' release_groups, or their sessions ending
         produces: RolloutGroup (group_buffer.finalize_work)
@@ -1465,16 +1478,19 @@ class Controller(Configurable):
         async def acquire_and_run_group(work: RolloutGroupWork) -> RolloutGroup:
             # Wait for KV room before the group builds its envs, inside the group's task, so the
             # buffer's cancel also stops a waiting group.
-            admission_wait_s = None
-            if self.config.generator_router.admission is not None:
-                acquire_start = time.perf_counter()
-                with sl.log_trace_span("acquire_group"):
+            acquire_start = time.perf_counter()
+            with sl.log_trace_span("acquire_group"):
+                try:
                     await self.generator_router.acquire_group.call_one(
                         work.group_id,
                         group_size=self.config.async_loop.num_samples_per_prompt,
                         validation=False,
                     )
-                admission_wait_s = time.perf_counter() - acquire_start
+                except Exception as error:
+                    raise _AcquireGroupError(
+                        f"acquire_group failed for group {work.group_id}"
+                    ) from error
+            admission_wait_s = time.perf_counter() - acquire_start
             group = await self._rollouter.run_group_rollouts(
                 generate_fn=generate_fn,
                 release_session_fn=release_session_fn,
@@ -1483,10 +1499,9 @@ class Controller(Configurable):
                 group_size=self.config.async_loop.num_samples_per_prompt,
                 sampling=self._sampling,
             )
-            if admission_wait_s is not None:
-                group.metrics.append(
-                    m.Metric("rollout/admission_wait_s", m.Mean(admission_wait_s))
-                )
+            group.metrics.append(
+                m.Metric("rollout/admission_wait_s", m.Mean(admission_wait_s))
+            )
             return group
 
         while True:
@@ -1534,6 +1549,9 @@ class Controller(Configurable):
                 # TODO: a cancelled group has no summary, so the curriculum keeps drawing a task that always
                 # runs past max_offpolicy_steps. Report the cancel to the curriculum (needs a Curriculum hook).
                 await self._rollouter.cancel_group(work.group_id)
+            except _AcquireGroupError:
+                # Ends the run (`FIRST_COMPLETED` in `run`): no later group could be placed either.
+                raise
             except Exception:
                 logger.exception(f"rollout group {work.group_id} failed; dropping")
                 group = RolloutGroup(
@@ -1778,12 +1796,8 @@ class Controller(Configurable):
             # TODO(metrics): See if metrics are being computed at the right place. E.g. should we put all
             # rollout related metrics here, or move all of them to the rollouter.
             time_metrics = step_timer.flush()
-            # Also raises if the router's admission stopped placing groups.
-            admission_metrics = (
-                await self.generator_router.admission_metrics.call_one()
-                if self.config.generator_router.admission is not None
-                else []
-            )
+            # Empty without admission; raises if the router's admission stopped placing groups.
+            admission_metrics = await self.generator_router.admission_metrics.call_one()
             with sl.log_trace_span("metrics_log"):
                 self.metrics_processor.log(
                     step=step,

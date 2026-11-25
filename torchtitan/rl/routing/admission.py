@@ -19,7 +19,7 @@ from torchtitan.rl.generator.engine import KVCacheBudget
 
 # A group starts while its generator's ledger plus the group's charge stays at or under this fraction of
 # the generator's usable blocks. The 5% left over absorbs a turn's growth before the holder releases
-# idle sessions; on a replay of a lossless load (Qwen3.8-27B, one GB300) the ledger averaged 93%.
+# idle sessions.
 ADMIT_FRACTION = 0.95
 # Above PAUSE_FRACTION of usable blocks the session KV holder starts releasing idle sessions' blocks. Then
 # sessions pause until the ledger is at DRAIN_FRACTION; a paused session resumes under ADMIT_FRACTION.
@@ -27,7 +27,8 @@ PAUSE_FRACTION = 1.0
 DRAIN_FRACTION = 0.90
 # A session paused this long swaps in for idle sessions, so a session that never fits still resumes.
 PAUSE_AGE_BOUND_S = 1800.0
-# While a generator has paused sessions or groups wait, a session idle this long (e.g. a hung env) pauses.
+# While work waits, a session idle this long is reclaimed: it leaves the ledger and holds nothing back. E.g. a
+# hung env, or a session nobody released (a rollout that raised, a retried attempt's first session).
 IDLE_RECLAIM_S = 600.0
 # A session not started yet is charged the mean first prompt of the last this-many training sessions,
 # so the estimate follows the prompt lengths of the tasks being drawn.
@@ -53,17 +54,18 @@ class KVRoomAdmission(Configurable):
     where the holder releases idle sessions (`PAUSE_FRACTION`); a paused session's next call waits in
     `start_call` until it resumes:
 
-        ledger > PAUSE_FRACTION x usable    pause idle sessions, newest group first (smallest within),
-                                            validation last, until the ledger is at DRAIN_FRACTION; if those
-                                            are not enough, running ones, paused when their call returns
+        ledger > PAUSE_FRACTION x usable    pause training sessions, then validation ones (`_pause_victims`),
+                                            until the ledger is at DRAIN_FRACTION; an idle one now, a running
+                                            one when its call returns
         ledger + its charge <= room         resume the longest-paused session (no overtaking)
-        paused PAUSE_AGE_BOUND_S            swap it in for idle sessions, in the same order, staying in room
+        paused PAUSE_AGE_BOUND_S            swap it in for idle sessions, in pause order, staying in room
         no unpaused session left            resume the longest-paused session at once
-        idle IDLE_RECLAIM_S, work waits     pause it (a hung env); it resumes once it calls again
-        a generator with paused sessions    takes no new group
+        idle IDLE_RECLAIM_S, work waits     reclaim it: it leaves the ledger and holds back no group; once it
+                                            calls again, it waits like a paused session
+        a generator with paused sessions    takes no new group (reclaimed sessions don't count)
 
     Both run each `rebalance`: after a pause, the longest-paused sessions take back the room between
-    DRAIN_FRACTION and ADMIT_FRACTION.
+    DRAIN_FRACTION and ADMIT_FRACTION; a session paused and resumed in the same `rebalance` is not counted.
 
     Example (one generator: 3,030 usable blocks, room 2,878; a 4,000-token session charges 22 blocks
     while it runs):
@@ -73,7 +75,7 @@ class KVRoomAdmission(Configurable):
         policy.start_call("g7/r0/0", session_id="g7/r0", group_id=7, num_prompt_tokens=4000)
         policy.end_call("g7/r0/0", num_tokens=5200)  # the turn returned: prompt + completion
         policy.rebalance(now=time.monotonic())  # -> [] (no paused call resumed)
-        policy.release_session("g7/r0")  # the rollout ended
+        policy.release_session("g7/r0", group_id=7)  # the rollout ended
         policy.release_group(7)  # the group ended
 
     Args:
@@ -101,6 +103,8 @@ class KVRoomAdmission(Configurable):
         self._waiting: list[int] = []
         self._arrivals = itertools.count()
         self._sessions: dict[str, _Session] = {}
+        # The same sessions by generator, so a generator's ledger reads only its own.
+        self._generator_sessions: list[dict[str, _Session]] = [{} for _ in budgets]
         # The session of each call in flight, so `end_call` needs only the request id.
         self._request_sessions: dict[str, str] = {}
         self._first_prompts: deque[int] = deque(maxlen=FIRST_PROMPT_WINDOW)
@@ -109,6 +113,7 @@ class KVRoomAdmission(Configurable):
         self.num_pauses = 0
         self.num_resumes = 0
         self.num_swaps = 0
+        self.num_reclaims = 0
 
     # ======== Groups ========
 
@@ -132,10 +137,10 @@ class KVRoomAdmission(Configurable):
             policy.place()  # -> {4: 1}; group 5 keeps waiting
         """
         ledgers = [self.ledger(generator) for generator in range(len(self._budgets))]
-        # Paused sessions are already admitted, so they get the room first.
+        # Paused sessions are already admitted, so they get the room first. A reclaimed one waits for nothing.
         has_paused = [False] * len(self._budgets)
         for session in self._sessions.values():
-            if session.paused_at is not None:
+            if session.paused_at is not None and not session.reclaimed:
                 has_paused[session.generator] = True
         validation_sessions = [0] * len(self._budgets)
         for group in self._groups.values():
@@ -182,12 +187,18 @@ class KVRoomAdmission(Configurable):
     ) -> bool:
         """Charge a placed group's session for a call: the prompt sets its size, so a compacted (shorter)
         prompt lowers it. Return False if the session is paused: the call waits until `rebalance`
-        returns its id, or `cancel_call`."""
+        returns its id, or `cancel_call`. A session makes one call at a time."""
         group = self._groups[group_id]
         session = self._sessions.get(session_id)
+        if session is not None and session.parked_request_id is not None:
+            raise ValueError(
+                f"call {request_id!r} of session {session_id!r} arrived while its call "
+                f"{session.parked_request_id!r} waits for the session to resume"
+            )
         if session is None:
             session = _Session(group_id=group_id, generator=group.generator)
             self._sessions[session_id] = session
+            self._generator_sessions[group.generator][session_id] = session
             group.session_ids.add(session_id)
             group.num_started += 1
             if group.first_prompt_tokens is None:
@@ -197,22 +208,31 @@ class KVRoomAdmission(Configurable):
 
         session.num_tokens = num_prompt_tokens
         self._request_sessions[request_id] = session_id
+        # Set before parking too, so an older call's late release can't undo this size.
+        session.latest_request_id = request_id
         if session.paused_at is not None:
+            if session.reclaimed:
+                # It calls again: from now on it waits for room like any paused session.
+                session.reclaimed = False
+                session.paused_at = self._clock
             session.parked_request_id = request_id
             return False
         session.request_ids.add(request_id)
-        session.latest_request_id = request_id
         session.idle_since = None
         return True
 
     def cancel_call(self, request_id: str) -> None:
-        """Forget a call that waits for its paused session to resume (its caller is gone)."""
+        """Forget a call whose caller is gone: still waiting for its paused session, or resumed but never
+        sent. Unknown ids are ignored."""
         session_id = self._request_sessions.pop(request_id, None)
         if session_id is None:
             return
         session = self._sessions[session_id]
         if session.parked_request_id == request_id:
             session.parked_request_id = None
+        session.request_ids.discard(request_id)
+        if not session.request_ids and session.idle_since is None:
+            session.idle_since = self._clock
 
     def end_call(self, request_id: str, *, num_tokens: int | None) -> None:
         """Stop charging a call as running. `num_tokens` (prompt + completion; None if the call failed)
@@ -237,14 +257,27 @@ class KVRoomAdmission(Configurable):
             session.pause_at_turn_end = False
             self._set_paused(session)
 
-    def release_session(self, session_id: str) -> int | None:
-        """Stop charging a session whose rollout ended; return the generator it was on, if known."""
+    def release_session(self, session_id: str, *, group_id: int) -> int | None:
+        """Stop charging a session whose rollout ended; return the generator it was on, if it called.
+
+        the session called                  its charge goes
+        it never called                     one fewer not-started session is charged to its group
+        released before, or unknown group   ignored
+        """
         session = self._sessions.get(session_id)
-        if session is None:
-            return None
-        self._groups[session.group_id].session_ids.discard(session_id)
-        self._drop_session(session_id)
-        return session.generator
+        if session is not None:
+            group = self._groups[session.group_id]
+            group.released_session_ids.add(session_id)
+            group.session_ids.discard(session_id)
+            self._drop_session(session_id)
+            return session.generator
+
+        group = self._groups.get(group_id)
+        if group is not None and session_id not in group.released_session_ids:
+            # The rollout ended before its first call.
+            group.released_session_ids.add(session_id)
+            group.num_started += 1
+        return None
 
     # ======== Ledger ========
 
@@ -252,8 +285,8 @@ class KVRoomAdmission(Configurable):
         """Return the KV blocks the live sessions placed on `generator` charge it now."""
         budget = self._budgets[generator]
         blocks = 0
-        for session in self._sessions.values():
-            if session.generator != generator or session.paused_at is not None:
+        for session in self._generator_sessions[generator].values():
+            if session.paused_at is not None:
                 continue
             if session.request_ids:
                 blocks += budget.running_session_blocks(session.num_tokens)
@@ -272,8 +305,8 @@ class KVRoomAdmission(Configurable):
         ]
 
     def paused_fractions(self) -> list[float]:
-        """Return the idle charge of each generator's paused sessions, as a fraction of its usable blocks:
-        what the holder may still keep for them."""
+        """Return the idle charge of each generator's paused and reclaimed sessions, as a fraction of its
+        usable blocks: what the holder may still keep for them."""
         paused_blocks = [0] * len(self._budgets)
         for session in self._sessions.values():
             if session.paused_at is not None:
@@ -287,19 +320,48 @@ class KVRoomAdmission(Configurable):
         ]
 
     def longest_pause_s(self) -> float:
-        """Return how long the longest-paused session has been paused, as of the last `rebalance`."""
+        """Return how long the longest-paused session has waited for room, as of the last `rebalance`."""
         return max(
             (
                 self._clock - session.paused_at
                 for session in self._sessions.values()
-                if session.paused_at is not None
+                if session.paused_at is not None and not session.reclaimed
             ),
             default=0.0,
         )
 
+    def generator_lines(self) -> list[str]:
+        """One line per generator, for a per-step log: ledger and paused charge over usable blocks, and its
+        paused and reclaimed sessions.
+
+            generator 3: ledger 0.95, paused 0.07, 6 paused, 1 reclaimed
+        """
+        paused_fractions = self.paused_fractions()
+        lines = []
+        for generator, fraction in enumerate(self.ledger_fractions()):
+            sessions = self._generator_sessions[generator].values()
+            num_reclaimed = sum(session.reclaimed for session in sessions)
+            num_paused = (
+                sum(session.paused_at is not None for session in sessions)
+                - num_reclaimed
+            )
+            lines.append(
+                f"generator {generator}: ledger {fraction:.2f}, paused {paused_fractions[generator]:.2f}, "
+                f"{num_paused} paused, {num_reclaimed} reclaimed"
+            )
+        return lines
+
     @property
     def num_paused_sessions(self) -> int:
-        return sum(session.paused_at is not None for session in self._sessions.values())
+        """Sessions paused to wait for room (reclaimed ones not included)."""
+        return sum(
+            session.paused_at is not None and not session.reclaimed
+            for session in self._sessions.values()
+        )
+
+    @property
+    def num_reclaimed_sessions(self) -> int:
+        return sum(session.reclaimed for session in self._sessions.values())
 
     @property
     def num_waiting_groups(self) -> int:
@@ -315,14 +377,13 @@ class KVRoomAdmission(Configurable):
             now: Seconds on a monotonic clock.
         """
         self._clock = now
-        sessions_by_generator: list[list[_Session]] = [[] for _ in self._budgets]
         for session in self._sessions.values():
-            sessions_by_generator[session.generator].append(session)
             if not session.request_ids and session.idle_since is None:
                 session.idle_since = now
 
         resumed_calls: list[str] = []
-        for generator, sessions in enumerate(sessions_by_generator):
+        for generator, generator_sessions in enumerate(self._generator_sessions):
+            sessions = list(generator_sessions.values())
             ledger = self._pause(generator, sessions)
             resumed_calls += self._resume(generator, sessions, ledger)
         return resumed_calls
@@ -340,33 +401,32 @@ class KVRoomAdmission(Configurable):
         )
         if ledger - leaving > PAUSE_FRACTION * budget.usable_blocks:
             target = ledger - leaving
-            for session in self._pause_victims(sessions, running=False):
+            for session in self._pause_victims(sessions):
                 if target <= DRAIN_FRACTION * budget.usable_blocks:
                     break
-                blocks = budget.idle_session_blocks(session.num_tokens)
-                target -= blocks
-                ledger -= blocks
-                self._set_paused(session)
-            # Idle sessions were not enough: e.g. short tool calls leave few sessions idle at a time.
-            for session in self._pause_victims(sessions, running=True):
-                if target <= DRAIN_FRACTION * budget.usable_blocks:
-                    break
-                target -= budget.running_session_blocks(session.num_tokens)
-                session.pause_at_turn_end = True
+                if session.request_ids:
+                    target -= budget.running_session_blocks(session.num_tokens)
+                    session.pause_at_turn_end = True
+                else:
+                    blocks = budget.idle_session_blocks(session.num_tokens)
+                    target -= blocks
+                    ledger -= blocks
+                    self._set_paused(session)
 
         work_waits = bool(self._waiting) or any(
-            session.paused_at is not None for session in sessions
+            session.paused_at is not None and not session.reclaimed
+            for session in sessions
         )
         if work_waits:
-            hung = [
-                session
-                for session in self._pause_victims(sessions, running=False)
-                if self._clock - session.idle_since > IDLE_RECLAIM_S
-            ]
-            hung.sort(key=lambda hung_session: hung_session.idle_since)
-            for session in hung:
-                ledger -= budget.idle_session_blocks(session.num_tokens)
-                self._set_paused(session)
+            for session in self._pause_victims(sessions):
+                if (
+                    not session.request_ids
+                    and self._clock - session.idle_since > IDLE_RECLAIM_S
+                ):
+                    ledger -= budget.idle_session_blocks(session.num_tokens)
+                    session.paused_at = self._clock
+                    session.reclaimed = True
+                    self.num_reclaims += 1
         return ledger
 
     def _resume(
@@ -383,10 +443,10 @@ class KVRoomAdmission(Configurable):
         resumed: set[int] = set()
         resumed_calls = []
         for session in paused:
-            # A session with a waiting call resumes running. A hung one stays paused until it calls.
+            # A session with a waiting call resumes running. A reclaimed one stays out until it calls.
             if session.parked_request_id is not None:
                 blocks = budget.running_session_blocks(session.num_tokens)
-            elif self._clock - session.idle_since > IDLE_RECLAIM_S:
+            elif session.reclaimed:
                 continue
             else:
                 blocks = budget.idle_session_blocks(session.num_tokens)
@@ -404,11 +464,15 @@ class KVRoomAdmission(Configurable):
                     self._set_paused(victim)
                 self.num_swaps += 1
 
+            if session.paused_at == self._clock:
+                # Paused earlier in this `rebalance`: it never waited.
+                self.num_pauses -= 1
+            else:
+                self.num_resumes += 1
             session.paused_at = None
             ledger += blocks
             any_unpaused = True
             resumed.add(id(session))
-            self.num_resumes += 1
             if session.parked_request_id is not None:
                 session.request_ids.add(session.parked_request_id)
                 session.latest_request_id = session.parked_request_id
@@ -417,27 +481,24 @@ class KVRoomAdmission(Configurable):
                 session.parked_request_id = None
         return resumed_calls
 
-    def _pause_victims(
-        self, sessions: list[_Session], *, running: bool
-    ) -> list[_Session]:
-        """Unpaused sessions, idle (or running): training before validation, then the newest group first,
-        then the smallest. A group trains once all its rollouts end, so a paused session holds back its
-        whole group: pausing the newest group delays the least finished work.
+    def _pause_victims(self, sessions: list[_Session]) -> list[_Session]:
+        """Unpaused sessions in pause order: training before validation, idle before running, then the
+        newest group first, then the smallest. A group trains once all its rollouts end, so a paused
+        session holds back its whole group: pausing the newest group delays the least finished work.
 
-            groups 3 (older), 5 (newer); sessions g3/s0 200k tokens, g5/s0 250k, g5/s1 30k
-            -> g5/s1, g5/s0, g3/s0
+            groups 3 (older), 5 (newer); idle g3/s0 200k tokens, idle g5/s0 250k, idle g5/s1 30k,
+            running g5/s2 10k  ->  g5/s1, g5/s0, g3/s0, g5/s2
         """
         candidates = [
             session
             for session in sessions
-            if session.paused_at is None
-            and not session.pause_at_turn_end
-            and bool(session.request_ids) == running
+            if session.paused_at is None and not session.pause_at_turn_end
         ]
         return sorted(
             candidates,
             key=lambda session: (
                 self._groups[session.group_id].validation,
+                bool(session.request_ids),
                 -self._groups[session.group_id].arrival,
                 session.num_tokens,
             ),
@@ -454,10 +515,10 @@ class KVRoomAdmission(Configurable):
         """Idle training sessions, in `_pause_victims` order, that free `needed` blocks; None if they can't.
         Sessions resumed in this `rebalance` (`resumed`, by `id`) are not swapped back out."""
         victims, freed = [], 0
-        for session in self._pause_victims(sessions, running=False):
+        for session in self._pause_victims(sessions):
             if freed >= needed:
                 break
-            if self._groups[session.group_id].validation:
+            if self._groups[session.group_id].validation or session.request_ids:
                 break
             if id(session) in resumed:
                 continue
@@ -522,6 +583,7 @@ class KVRoomAdmission(Configurable):
 
     def _drop_session(self, session_id: str) -> None:
         session = self._sessions.pop(session_id)
+        del self._generator_sessions[session.generator][session_id]
         for request_id in session.request_ids:
             del self._request_sessions[request_id]
         if session.parked_request_id is not None:
@@ -540,7 +602,10 @@ class _Group:
     """Live sessions."""
 
     num_started: int = 0
-    """Sessions that made a call, released ones included."""
+    """Sessions that made a call (released ones included), plus rollouts released before their first call."""
+
+    released_session_ids: set[str] = field(default_factory=set)
+    """Sessions already released, so a repeated release counts once."""
 
     first_prompt_tokens: int | None = None
     """The first prompt of the group's first session to call."""
@@ -559,7 +624,14 @@ class _Session:
     """Calls in flight."""
 
     latest_request_id: str | None = None
+    """Its last call: only that call's release sets its size."""
+
     paused_at: float | None = None
+    """When it paused, on the `rebalance` clock; None while unpaused."""
+
+    reclaimed: bool = False
+    """Paused for idling IDLE_RECLAIM_S while work waited: out of the ledger, and it holds back no group."""
+
     pause_at_turn_end: bool = False
     """Picked as a pause victim while its call ran: it pauses when the call returns."""
 
