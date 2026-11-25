@@ -187,7 +187,8 @@ def _use_mooncake_master(address: str) -> None:
 
 
 def _enable_breakable_cuda_graphs() -> None:
-    """Turn on vLLM's breakable CUDA graphs: piecewise graphs that run attention eagerly.
+    """Turn on vLLM's breakable CUDA graphs: piecewise graphs that run attention eagerly,
+    which the MTP drafter replays.
 
     vLLM makes its attention op a graph break when it imports the op, and only if this
     variable is set then. Raises if the op was imported before.
@@ -364,8 +365,8 @@ class VLLMEngine(GenerationEngine):
           acceptance can fall as the policy drifts.
         - With `session_kv_holder`, prefix hits keep the last block that vLLM drops by
           default for drafts (see `_build_engine_args`).
-        - With `cuda_graph.mode="FULL"`, steps with prefill replay piecewise graphs
-          (`VLLMCudaGraphConfig.mode`).
+        - With `cuda_graph.mode="FULL"`, every target step replays a FULL graph and the
+          drafter replays piecewise graphs (`VLLMCudaGraphConfig.mode`).
         - Not supported with `debug.batch_invariant` or models with a vision encoder."""
 
     def __init__(
