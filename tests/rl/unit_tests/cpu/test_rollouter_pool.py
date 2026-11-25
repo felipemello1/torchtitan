@@ -111,7 +111,7 @@ class _LoopBlockingWorker(BaseRolloutWorker):
         # Yield, so the lag task wakes up late and records the delay before the group returns.
         await asyncio.sleep(0.1)
         group = RolloutGroup(group_id=group_id, rollouts=[])
-        group.metrics += self.flush_process_metrics(group_id)
+        group.metrics += await self.flush_process_metrics(group_id)
         return group
 
 

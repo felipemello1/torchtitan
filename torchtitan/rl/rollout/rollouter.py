@@ -480,7 +480,7 @@ class BaseRolloutWorker(Configurable, ABC):
         self._event_loop_lag = m.EventLoopLag("rollout_worker")
         self._thread_pool_lag = m.ThreadPoolLag("rollout_worker")
 
-    def flush_process_metrics(self, group_id: int) -> list[m.Metric]:
+    async def flush_process_metrics(self, group_id: int) -> list[m.Metric]:
         """Return this process's lag since the previous training group, its RAM (now and peak) and its
         host's available memory, then reset the lag trackers.
 
@@ -542,7 +542,7 @@ class BaseRolloutWorker(Configurable, ABC):
         """Roll out one prompt group. A worker ends it by adding this process's metrics:
 
             group = await self.make_scored_group(...)
-            group.metrics += self.flush_process_metrics(group_id)
+            group.metrics += await self.flush_process_metrics(group_id)
             return group
 
         Args:
@@ -693,7 +693,7 @@ class MessageEnvRolloutWorker(BaseRolloutWorker):
         group = await self.make_scored_group(
             rollouts=[task.result() for task in tasks], sample=sample, group_id=group_id
         )
-        group.metrics += self.flush_process_metrics(group_id)
+        group.metrics += await self.flush_process_metrics(group_id)
         return group
 
     async def _run_single_rollout(

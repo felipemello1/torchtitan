@@ -39,7 +39,14 @@ from torchtitan.rl.examples.verifiers.rollouter import (
 from torchtitan.rl.generator.types import SamplingConfig
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout.rollouter import log_failed_rollout
-from torchtitan.rl.rollout.types import Completion, Rollout, RolloutGroup, RolloutStatus
+from torchtitan.rl.rollout.types import (
+    Completion,
+    Rollout,
+    RolloutGroup,
+    RolloutStatus,
+    RolloutTurn,
+    RolloutTurnID,
+)
 from verifiers.v1.trace import Error as VerifiersError
 
 
@@ -232,8 +239,9 @@ def test_verifiers_worker_sends_muse_glimmer_renderer_config(monkeypatch) -> Non
     worker._config = SimpleNamespace(connection_timeout_sec=5.0, renderer_multiplex=8)
     worker._env_server_address = "tcp://127.0.0.1:1"
     worker._generation_server = SimpleNamespace(
-        start=AsyncMock(), base_url="http://127.0.0.1:2/v1"
+        start=AsyncMock(), base_url="http://127.0.0.1:2/v1", generation_metadata={}
     )
+    worker._rollout_tasks_by_group = {}
     renderers_config = CustomRendererConfig(
         import_path="torchtitan.models.muse_glimmer.renderer.MuseGlimmerRenderer",
         reasoning_strength="low",
@@ -249,7 +257,7 @@ def test_verifiers_worker_sends_muse_glimmer_renderer_config(monkeypatch) -> Non
     )
 
     # Raises AttributeError if setup didn't start the metrics.
-    worker.flush_process_metrics(group_id=0)
+    asyncio.run(worker.flush_process_metrics(group_id=0))
 
     sent = worker._verifiers_train_client_config
     # The worker's agents call its own generation server.
@@ -1764,6 +1772,7 @@ def test_a_rollout_that_raises_fails_its_group_after_its_siblings_stop() -> None
 
     worker = object.__new__(VerifiersRolloutWorker)
     worker._generation_server = SimpleNamespace(set_generate_fn=lambda fn: None)
+    worker._rollout_tasks_by_group = {}
     worker._run_single_rollout = run_single_rollout
 
     with pytest.raises(ExceptionGroup) as raised:
@@ -1779,6 +1788,7 @@ def test_a_rollout_that_raises_fails_its_group_after_its_siblings_stop() -> None
         )
     assert [str(error) for error in raised.value.exceptions] == ["rollout 0 failed"]
     assert stopped == [1]
+    assert worker._rollout_tasks_by_group == {}
 
 
 def test_group_metrics_count_aborted_calls_and_the_untrainable_rollouts_with_one() -> None:
@@ -1807,9 +1817,10 @@ def test_group_metrics_count_aborted_calls_and_the_untrainable_rollouts_with_one
 
     worker = object.__new__(VerifiersRolloutWorker)
     worker._generation_server = SimpleNamespace(set_generate_fn=lambda fn: None)
+    worker._rollout_tasks_by_group = {}
     worker._run_single_rollout = run_single_rollout
     worker.make_scored_group = make_scored_group
-    worker.flush_process_metrics = lambda group_id: []
+    worker.flush_process_metrics = AsyncMock(return_value=[])
 
     group = asyncio.run(
         worker.run_group(
@@ -1878,3 +1889,55 @@ def test_parse_sampling_config_accepts_only_full_vocabulary_top_k_and_min_p(
 def test_parse_sampling_config_requires_stop_token_ids() -> None:
     with pytest.raises(ValueError, match="stop_token_ids"):
         _parse_sampling_config({"temperature": 1.0})
+
+
+def test_worker_metrics_count_the_topk_rows_it_holds() -> None:
+    # The generation server holds one running rollout's rows: [4, 2] int32 ids and float32 logprobs,
+    # 64 bytes. Group 5 has one finished rollout holding [2, 2] rows (32 bytes); its sibling runs.
+    worker = object.__new__(VerifiersRolloutWorker)
+    worker._generation_server = SimpleNamespace(
+        generation_metadata={
+            "running": _metadata_with_topk(
+                {
+                    (1, (11, 12, 13, 14)): (
+                        np.zeros((4, 2), dtype=np.int32),
+                        np.zeros((4, 2), dtype=np.float32),
+                    )
+                }
+            )
+        }
+    )
+    finished_rollout = Rollout(
+        group_id=5,
+        rollout_id=0,
+        status=RolloutStatus.COMPLETED,
+        turns=[
+            RolloutTurn(
+                rollout_id=RolloutTurnID(group_id=5, rollout_id=0, turn_id=0),
+                prompt_prefix_len=0,
+                prompt_delta_token_ids=np.array([1], dtype=np.int32),
+                completion_token_ids=np.array([2, 3], dtype=np.int32),
+                completion_logprobs=np.array([-0.5, -0.25], dtype=np.float32),
+                completion_topk_token_ids=np.zeros((2, 2), dtype=np.int32),
+                completion_topk_logprobs=np.zeros((2, 2), dtype=np.float32),
+            )
+        ],
+    )
+
+    async def flush_with_one_rollout_running() -> tuple[list, list]:
+        worker.start_process_metrics()
+        finished = asyncio.get_running_loop().create_future()
+        finished.set_result(finished_rollout)
+        running = asyncio.get_running_loop().create_future()
+        worker._rollout_tasks_by_group = {5: [finished, running]}
+        validation_metrics = await worker.flush_process_metrics(group_id=-1)
+        training_metrics = await worker.flush_process_metrics(group_id=0)
+        running.cancel()
+        return validation_metrics, training_metrics
+
+    validation_metrics, training_metrics = asyncio.run(flush_with_one_rollout_running())
+
+    metrics = {metric.key: metric.value.value for metric in training_metrics}
+    assert validation_metrics == []
+    assert metrics["rollout_worker/topk_rows_gib"] == 96 / 2**30
+    assert metrics["rollout_worker/malloc_in_use_gib"] > 0

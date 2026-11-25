@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import logging
 from dataclasses import dataclass, replace
 from typing import Any, TYPE_CHECKING
@@ -63,6 +64,35 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 VERIFIERS_REWARD_KEY = "verifiers_reward"
+
+# glibc's malloc controls: the rollout worker sets its mmap threshold, trims its heap and reads its
+# heap counters.
+_LIBC = ctypes.CDLL("libc.so.6")
+# `mallopt`'s parameter for the mmap threshold (glibc's malloc.h).
+_M_MMAP_THRESHOLD = -3
+
+
+class _MallInfo2(ctypes.Structure):
+    """glibc's `struct mallinfo2` (glibc 2.33+): heap counters in bytes."""
+
+    _fields_ = [
+        (name, ctypes.c_size_t)
+        for name in (
+            "arena",
+            "ordblks",
+            "smblks",
+            "hblks",
+            "hblkhd",
+            "usmblks",
+            "fsmblks",
+            "uordblks",
+            "fordblks",
+            "keepcost",
+        )
+    ]
+
+
+_LIBC.mallinfo2.restype = _MallInfo2
 
 
 class RewardFromVerifiers(RewardFn):
@@ -209,6 +239,8 @@ class VerifiersRolloutWorker(BaseRolloutWorker):
         # TODO: remove it with the env server, once the Verifiers env runs in the rollout worker.
         self._env_server_address = env_server_address
         self._generation_server: GenerationServer = config.generation_server.build()
+        # Each running group's rollout tasks, for the top-k rows its finished rollouts hold.
+        self._rollout_tasks_by_group: dict[int, list[asyncio.Task[Rollout]]] = {}
         self._verifiers_env_client: VerifiersEnvClient
         self._verifiers_train_client_config: VerifiersTrainClientConfig
 
@@ -224,6 +256,11 @@ class VerifiersRolloutWorker(BaseRolloutWorker):
         renders in the env server, so no tokenizer here. `VerifiersRollouter.setup_async`
         rejects a vision processor."""
         del tokenizer_config, vision_processor_config
+        # Each top-k array of 256 KiB or more (k = 32: a generation of 2,048+ tokens) gets its own
+        # mmap, so freeing it returns its RAM. glibc's default threshold climbs to 32 MiB after big
+        # frees, and then freed rows stay in the process.
+        _LIBC.mallopt(_M_MMAP_THRESHOLD, 256 * 1024)
+
         if not isinstance(renderer_config, RenderersConfigAdapter):
             raise ValueError(
                 "Verifiers requires a renderer configured with from_renderers(...) "
@@ -269,23 +306,29 @@ class VerifiersRolloutWorker(BaseRolloutWorker):
         self._generation_server.set_generate_fn(generate_fn)
 
         # Run the group's rollouts in the env server, all at once.
-        async with asyncio.TaskGroup() as task_group:
-            tasks = [
-                task_group.create_task(
-                    self._run_single_rollout(
-                        release_session_fn=release_session_fn,
-                        sample=sample,
-                        sampling=(
-                            sampling
-                            if sampling.seed is None
-                            else replace(sampling, seed=sampling.seed + rollout_id)
-                        ),
-                        group_id=group_id,
-                        rollout_id=rollout_id,
+        tasks: list[asyncio.Task[Rollout]] = []
+        self._rollout_tasks_by_group[group_id] = tasks
+        try:
+            async with asyncio.TaskGroup() as task_group:
+                tasks += [
+                    task_group.create_task(
+                        self._run_single_rollout(
+                            release_session_fn=release_session_fn,
+                            sample=sample,
+                            sampling=(
+                                sampling
+                                if sampling.seed is None
+                                else replace(sampling, seed=sampling.seed + rollout_id)
+                            ),
+                            group_id=group_id,
+                            rollout_id=rollout_id,
+                        )
                     )
-                )
-                for rollout_id in range(group_size)
-            ]
+                    for rollout_id in range(group_size)
+                ]
+        finally:
+            # Also on `cancel_group`: a cancelled group's rollouts must not stay referenced.
+            del self._rollout_tasks_by_group[group_id]
         group = await self.make_scored_group(
             rollouts=[task.result() for task in tasks], sample=sample, group_id=group_id
         )
@@ -310,8 +353,48 @@ class VerifiersRolloutWorker(BaseRolloutWorker):
                 m.Sum(float(num_untrainable_with_aborted_call)),
             ),
         ]
-        group.metrics += self.flush_process_metrics(group_id)
+        group.metrics += await self.flush_process_metrics(group_id)
         return group
+
+    async def flush_process_metrics(self, group_id: int) -> list[m.Metric]:
+        """Return freed heap memory to the OS, then add two metrics to the base ones (training groups
+        only, as in the base):
+
+            rollout_worker/topk_rows_gib       top-k arrays this worker holds: the generation server's,
+                                               plus those of finished rollouts whose siblings still run
+            rollout_worker/malloc_in_use_gib   heap bytes in use: heap chunks plus mmapped ones
+        """
+        # Off the event loop: it walks every free page of a heap that can reach tens of GiB.
+        await asyncio.to_thread(_LIBC.malloc_trim, 0)
+        if group_id < 0:
+            return []
+
+        topk_arrays = [
+            array
+            for metadata in self._generation_server.generation_metadata.values()
+            for arrays in metadata.topk_by_generation.values()
+            for array in arrays
+        ] + [
+            array
+            for tasks in self._rollout_tasks_by_group.values()
+            for task in tasks
+            if task.done() and not task.cancelled()
+            for turn in task.result().turns
+            for array in (turn.completion_topk_token_ids, turn.completion_topk_logprobs)
+            if array is not None
+        ]
+        heap = _LIBC.mallinfo2()
+        return [
+            *await super().flush_process_metrics(group_id),
+            m.Metric(
+                "rollout_worker/topk_rows_gib",
+                m.Max(sum(array.nbytes for array in topk_arrays) / 2**30),
+            ),
+            m.Metric(
+                "rollout_worker/malloc_in_use_gib",
+                m.Max((heap.uordblks + heap.hblkhd) / 2**30),
+            ),
+        ]
 
     async def _run_single_rollout(
         self,
