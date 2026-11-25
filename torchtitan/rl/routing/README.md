@@ -43,8 +43,9 @@ Admitted sessions keep growing, one turn at a time. Every second, and on each re
 sessions on a generator whose ledger is over its usable blocks, where the holder starts releasing idle
 histories (`KVRoomAdmission.rebalance`):
 
-    ledger > 100% of H              pause idle sessions, smallest first, validation last, down to 90%;
-                                    if those are not enough, running ones, as their call returns
+    ledger > 100% of H              pause idle sessions, newest group first (smallest within),
+                                    validation last, down to 90%; if those are not enough, running ones,
+                                    as their call returns
     ledger + its charge <= 95%      resume the longest-paused session
     paused 30 min                   swap it in for idle sessions, staying under 95%
     no unpaused session left        resume the longest-paused session at once

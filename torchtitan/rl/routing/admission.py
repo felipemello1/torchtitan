@@ -53,11 +53,11 @@ class KVRoomAdmission(Configurable):
     where the holder releases idle sessions (`PAUSE_FRACTION`); a paused session's next call waits in
     `start_call` until it resumes:
 
-        ledger > PAUSE_FRACTION x usable    pause idle sessions, smallest first, validation last, until the
-                                            ledger is at DRAIN_FRACTION; if those are not enough, running
-                                            ones, paused when their call returns
+        ledger > PAUSE_FRACTION x usable    pause idle sessions, newest group first (smallest within),
+                                            validation last, until the ledger is at DRAIN_FRACTION; if those
+                                            are not enough, running ones, paused when their call returns
         ledger + its charge <= room         resume the longest-paused session (no overtaking)
-        paused PAUSE_AGE_BOUND_S            swap it in for idle sessions, smallest first, staying in room
+        paused PAUSE_AGE_BOUND_S            swap it in for idle sessions, in the same order, staying in room
         no unpaused session left            resume the longest-paused session at once
         idle IDLE_RECLAIM_S, work waits     pause it (a hung env); it resumes once it calls again
         a generator with paused sessions    takes no new group
@@ -420,7 +420,13 @@ class KVRoomAdmission(Configurable):
     def _pause_victims(
         self, sessions: list[_Session], *, running: bool
     ) -> list[_Session]:
-        """Unpaused sessions, idle (or running), training before validation, smallest first."""
+        """Unpaused sessions, idle (or running): training before validation, then the newest group first,
+        then the smallest. A group trains once all its rollouts end, so a paused session holds back its
+        whole group: pausing the newest group delays the least finished work.
+
+            groups 3 (older), 5 (newer); sessions g3/s0 200k tokens, g5/s0 250k, g5/s1 30k
+            -> g5/s1, g5/s0, g3/s0
+        """
         candidates = [
             session
             for session in sessions
@@ -432,6 +438,7 @@ class KVRoomAdmission(Configurable):
             candidates,
             key=lambda session: (
                 self._groups[session.group_id].validation,
+                -self._groups[session.group_id].arrival,
                 session.num_tokens,
             ),
         )
@@ -444,7 +451,7 @@ class KVRoomAdmission(Configurable):
         needed: float,
         resumed: set[int],
     ) -> list[_Session] | None:
-        """Idle training sessions, smallest first, that free `needed` blocks; None if they can't.
+        """Idle training sessions, in `_pause_victims` order, that free `needed` blocks; None if they can't.
         Sessions resumed in this `rebalance` (`resumed`, by `id`) are not swapped back out."""
         victims, freed = [], 0
         for session in self._pause_victims(sessions, running=False):

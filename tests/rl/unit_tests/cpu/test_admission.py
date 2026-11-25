@@ -247,6 +247,37 @@ def test_validation_sessions_pause_after_training_sessions():
     assert policy.start_call("v", session_id="g-1/s0", group_id=-1, num_prompt_tokens=1)
 
 
+def test_the_newest_groups_sessions_pause_first():
+    policy = _policy()
+    _seed_first_prompt(policy)
+    policy.add_group(0, num_sessions=11, validation=False)
+    policy.add_group(1, num_sessions=10, validation=False)
+    policy.place()
+    # 11 x 148 + 10 x 154 = 3,168 > 3,030; group 1 is newer and its sessions are larger.
+    for group_id, num_sessions, num_tokens in ((0, 11, 240_000), (1, 10, 250_000)):
+        for i in range(num_sessions):
+            request_id = f"g{group_id}/r{i}"
+            policy.start_call(
+                request_id,
+                session_id=f"g{group_id}/s{i}",
+                group_id=group_id,
+                num_prompt_tokens=num_tokens,
+            )
+            policy.end_call(request_id, num_tokens=num_tokens)
+
+    policy.rebalance(now=0.0)
+
+    # 3 of group 1 pause (3,168 - 3 x 154 = 2,706 <= 2,727), then one resumes under 2,878: 2,860.
+    assert policy.num_paused_sessions == 2
+    assert policy.ledger(0) == 2860
+    assert all(
+        policy.start_call(
+            f"again{i}", session_id=f"g0/s{i}", group_id=0, num_prompt_tokens=1
+        )
+        for i in range(11)
+    )
+
+
 def test_running_sessions_pause_when_their_call_returns():
     budget = _budget()
     policy = _policy(budget)
