@@ -430,3 +430,88 @@ def test_record_disables_on_extract_failure(
     log.record(None, SimpleNamespace())
 
     assert log._enabled is False
+
+
+def _exported_points(meter_provider, path) -> dict[str, list[dict]]:
+    meter_provider.force_flush(timeout_millis=1000)
+    resource_metrics = json.loads(path.read_text().splitlines()[-1])["resource_metrics"]
+    return {
+        metric["name"]: metric["data"]["data_points"]
+        for metric in resource_metrics[0]["scope_metrics"][0]["metrics"]
+    }
+
+
+@pytest.mark.parametrize("with_connector", [True, False])
+def test_observe_kv_reuse_exports_holder_and_connector_counters(
+    no_otel_env, monkeypatch, tmp_path, meter_providers, with_connector
+):
+    monkeypatch.setenv("OTEL_METRICS_EXPORTER", "jsonl")
+    monkeypatch.setenv("VLLM_LOG_STATS_INTERVAL", "600")
+    log = VllmOtelStatLogger.Config().build(
+        vllm_config=_vllm_config(),
+        context=_context(generator_name="gen-a", output_dir=str(tmp_path)),
+    )
+    holder = SimpleNamespace(
+        num_held_blocks=7,
+        num_evicted=2,
+        num_reusable_prefix_tokens=640,
+        num_lost_prefix_tokens=64,
+    )
+    connector = SimpleNamespace(
+        gpu_evicted_blocks={"yes": 5, "no": 1},
+        broken_chain_requests={"hole": 1, "no_state": 0},
+        broken_chain_tokens={"hole": 48, "no_state": 0},
+        num_stored_blocks=9,
+        num_cpu_gdn_state_blocks=3,
+    )
+
+    log.observe_kv_reuse(holder=holder, connector=connector if with_connector else None)
+    # Plain ints change on the engine thread; the exporter reads them at collection.
+    holder.num_evicted = 3
+    connector.gpu_evicted_blocks["no"] = 4
+
+    points = _exported_points(
+        meter_providers[0], tmp_path / "vllm_metrics" / "gen-a.rank0.jsonl"
+    )
+    if not with_connector:
+        # Lost prefix needs the connector's admission record, so it is not exported either.
+        assert {
+            name
+            for name in points
+            if name.startswith(("vllm.session_kv.", "vllm.cpu_kv."))
+        } == {"vllm.session_kv.held_blocks", "vllm.session_kv.evicted_sessions"}
+        return
+
+    values = {
+        name: points[name][0]["value"]
+        for name in (
+            "vllm.session_kv.held_blocks",
+            "vllm.session_kv.evicted_sessions",
+            "vllm.session_kv.reusable_prefix_tokens",
+            "vllm.session_kv.lost_prefix_tokens",
+            "vllm.cpu_kv.stored_blocks",
+            "vllm.cpu_kv.gdn_state_blocks",
+        )
+    }
+    assert values == {
+        "vllm.session_kv.held_blocks": 7,
+        "vllm.session_kv.evicted_sessions": 3,
+        "vllm.session_kv.reusable_prefix_tokens": 640,
+        "vllm.session_kv.lost_prefix_tokens": 64,
+        "vllm.cpu_kv.stored_blocks": 9,
+        "vllm.cpu_kv.gdn_state_blocks": 3,
+    }
+
+    def by_attribute(name: str, attribute: str) -> dict[str, int]:
+        return {
+            point["attributes"][attribute]: point["value"] for point in points[name]
+        }
+
+    assert by_attribute("vllm.cpu_kv.gpu_evicted_blocks", "cpu_copy") == {
+        "yes": 5,
+        "no": 4,
+    }
+    assert by_attribute("vllm.cpu_kv.broken_chain_tokens", "cause") == {
+        "hole": 48,
+        "no_state": 0,
+    }
