@@ -80,6 +80,8 @@ checkpointer=CheckpointManager.Config(
 ```
 `CheckpointManager` then writes 8 files per rank, split by size. `TorchCheckpointingManager` writes one file per item (model, optimizer, ...), so it uses at most one thread per item.
 
+`TorchCheckpointingManager` also writes with O_DIRECT by default, which skips the page cache. On NFS, set `file_write_direct_io=False` for faster buffered writes.
+
 6. EXAMPLE CHECKPOINT CONFIGURATION
 ```python
 checkpointer=CheckpointManager.Config(

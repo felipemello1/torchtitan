@@ -194,7 +194,9 @@ class TorchCheckpointingManagerTest(unittest.TestCase):
         manager.__del__()
 
     def test_default_backend_configuration_owns_schema_and_barrier(self) -> None:
-        backend_config = _default_backend_config(_async_save_config())
+        backend_config = _default_backend_config(
+            _async_save_config(file_write_workers=1)
+        )
 
         self.assertIsInstance(backend_config.save, AsyncCheckpointSaverConfig)
         self.assertTrue(backend_config.save.staging_config.use_pinned_memory)
@@ -329,6 +331,57 @@ class TorchCheckpointingManagerTest(unittest.TestCase):
             finally:
                 loader.close()
             torch.testing.assert_close(restored.weight, saved.weight)
+
+    def _save_one_real_checkpoint(self, folder: str, **overrides) -> None:
+        manager = TorchCheckpointingManager.Config(
+            folder=folder,
+            interval=1,
+            keep_latest_k=0,
+            last_save_model_only=False,
+            **overrides,
+        ).build(
+            model_parts=[nn.Linear(2, 2)],
+            optimizers=_Stateful("optimizer"),
+            lr_schedulers=_Stateful("scheduler"),
+            ema=None,
+            extra_states={"train_state": _Stateful("train")},
+            sd_adapter=None,
+        )
+        try:
+            self.assertTrue(manager.save(curr_step=1))
+        finally:
+            manager.close()
+
+    def test_file_write_workers_reaches_the_writer_threads(self) -> None:
+        # The files look the same at any thread count; the writer logs how many it used.
+        with (
+            tempfile.TemporaryDirectory() as folder,
+            self.assertLogs("torch_checkpointing.checkpoint_writer", "INFO") as logs,
+        ):
+            self._save_one_real_checkpoint(folder, file_write_workers=3)
+
+        self.assertTrue(
+            any("num_threads=3 " in line for line in logs.output), logs.output
+        )
+
+    @unittest.skipUnless(hasattr(os, "O_DIRECT"), "O_DIRECT is Linux-only")
+    def test_file_write_direct_io_false_opens_files_without_o_direct(self) -> None:
+        # The library asks for O_DIRECT at open time on every filesystem, then falls
+        # back on ext4 and XFS, so the open flags show the setting on any disk.
+        for file_write_direct_io in (True, False):
+            with (
+                self.subTest(file_write_direct_io=file_write_direct_io),
+                tempfile.TemporaryDirectory() as folder,
+                mock.patch("os.open", wraps=os.open) as os_open,
+            ):
+                self._save_one_real_checkpoint(
+                    folder, file_write_direct_io=file_write_direct_io
+                )
+                opened_with_o_direct = any(
+                    len(call.args) > 1 and call.args[1] & os.O_DIRECT
+                    for call in os_open.call_args_list
+                )
+                self.assertEqual(file_write_direct_io, opened_with_o_direct)
 
     def _memory_bucket(self) -> str:
         memory_fs = fsspec.filesystem("memory")
@@ -957,7 +1010,7 @@ class TorchCheckpointingManagerTest(unittest.TestCase):
             return_value=structured_logger_init_fn,
         ):
             backend_config = _default_backend_config(
-                _async_save_config(),
+                _async_save_config(file_write_workers=1),
                 subprocess_init_fn=original_init_fn,
                 subprocess_init_args=("argument",),
             )

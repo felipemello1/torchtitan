@@ -104,13 +104,16 @@ def _backend_path(path: str) -> str:
     return _split_uri(path)[1]
 
 
-def _storage_config(path: str) -> StorageConfig | None:
-    """Backend storage for ``path``: fsspec storage for a URI's protocol.
+def _storage_config(path: str, *, file_write_direct_io: bool) -> StorageConfig:
+    """Backend storage for ``path``.
 
-    ``None`` for a local path, which keeps the backend's own local default.
+    gs://bucket/run   -> FsspecStorageConfig(protocol="gs")
+    /checkpoint/run   -> LocalFileSystemStorageConfig(use_direct_io=file_write_direct_io)
     """
     protocol, _ = _split_uri(path)
-    return None if protocol is None else FsspecStorageConfig(protocol=protocol)
+    if protocol is None:
+        return LocalFileSystemStorageConfig(use_direct_io=file_write_direct_io)
+    return FsspecStorageConfig(protocol=protocol)
 
 
 def _init_subprocess_logging(
@@ -156,9 +159,15 @@ def _item_specs() -> dict[str, ItemSpec]:
     }
 
 
-def _writer_config(*, use_barrier: bool) -> CheckpointWriterConfig:
+def _writer_config(
+    *, use_barrier: bool, file_write_workers: int
+) -> CheckpointWriterConfig:
+    # TODO: torch_checkpointing writes one file per item, so threads stop at the
+    # item count, and the optimizer item (2/3 of the bytes with Adam) is one
+    # stream. Pass the library's split option once it has one.
     return CheckpointWriterConfig(
         checkpoint_write_barrier_timeout_sec=_DEFAULT_BARRIER_TIMEOUT_SEC,
+        file_write_max_threads=file_write_workers,
         barrier_config=(
             # Runs over the store the default process group already serves, so
             # no second store or port is needed.
@@ -171,17 +180,23 @@ def _writer_config(*, use_barrier: bool) -> CheckpointWriterConfig:
     )
 
 
-def _async_save_config() -> AsyncCheckpointSaverConfig:
+def _async_save_config(*, file_write_workers: int) -> AsyncCheckpointSaverConfig:
     return AsyncCheckpointSaverConfig(
-        writer_config=_writer_config(use_barrier=True),
+        writer_config=_writer_config(
+            use_barrier=True, file_write_workers=file_write_workers
+        ),
         staging_config=CheckpointStagerConfig(use_pinned_memory=True),
         wait_timeout_secs=_DEFAULT_BARRIER_TIMEOUT_SEC,
     )
 
 
-def _sync_save_config(*, use_barrier: bool = True) -> SyncCheckpointSaverConfig:
+def _sync_save_config(
+    *, file_write_workers: int, use_barrier: bool = True
+) -> SyncCheckpointSaverConfig:
     return SyncCheckpointSaverConfig(
-        writer_config=_writer_config(use_barrier=use_barrier),
+        writer_config=_writer_config(
+            use_barrier=use_barrier, file_write_workers=file_write_workers
+        ),
         wait_timeout_secs=_DEFAULT_BARRIER_TIMEOUT_SEC,
     )
 
@@ -228,6 +243,19 @@ class TorchCheckpointingManager(BaseCheckpointManager):
 
     @dataclass(kw_only=True, slots=True)
     class Config(BaseCheckpointManager.Config):
+        file_write_direct_io: bool = True
+        """Open checkpoint files for writing with O_DIRECT, which skips the page
+        cache. Set False on NFS, where buffered writes were faster for one rank's
+        save:
+
+            40.3 GB, file_write_workers=1:  41.0 s -> 22.5 s
+            10 GB,   file_write_workers=4:  8.97 s -> 5.22 s
+
+        On ext4 and XFS the library falls back to buffered writes, so the value
+        changes nothing there. torch_checkpointing never fsyncs, so neither value
+        makes a save durable on its own.
+        """
+
         def __post_init__(self) -> None:
             BaseCheckpointManager.Config.__post_init__(self)
             # Async saves stage into pinned memory and write from a background
@@ -304,16 +332,22 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         self.purge_exempt = (
             config.purge_exempt.build() if config.purge_exempt is not None else None
         )
+        self.file_write_workers = config.file_write_workers
+        self.file_write_direct_io = config.file_write_direct_io
 
         if self.load_only:
-            save_config = _sync_save_config(use_barrier=False)
+            save_config = _sync_save_config(
+                use_barrier=False, file_write_workers=self.file_write_workers
+            )
         elif config.async_mode == "disabled":
-            save_config = _sync_save_config()
+            save_config = _sync_save_config(file_write_workers=self.file_write_workers)
         else:
-            save_config = _async_save_config()
+            save_config = _async_save_config(file_write_workers=self.file_write_workers)
         manager_config = _default_backend_config(
             save_config,
-            storage_config=_storage_config(self.folder),
+            storage_config=_storage_config(
+                self.folder, file_write_direct_io=self.file_write_direct_io
+            ),
         )
         self._manager_config = manager_config
         self._prewarmed = False
@@ -396,8 +430,12 @@ class TorchCheckpointingManager(BaseCheckpointManager):
                 required=model_spec.required,
             )
             hf_manager = _default_backend_config(
-                _sync_save_config(use_barrier=False),
-                storage_config=_storage_config(checkpoint_id),
+                _sync_save_config(
+                    use_barrier=False, file_write_workers=self.file_write_workers
+                ),
+                storage_config=_storage_config(
+                    checkpoint_id, file_write_direct_io=self.file_write_direct_io
+                ),
                 items={item_key: hf_model_spec},
                 default=None,
             ).build()
@@ -423,8 +461,12 @@ class TorchCheckpointingManager(BaseCheckpointManager):
             manager = self._manager
             if _split_uri(checkpoint_id)[0] != _split_uri(self.folder)[0]:
                 manager = _default_backend_config(
-                    _sync_save_config(use_barrier=False),
-                    storage_config=_storage_config(checkpoint_id),
+                    _sync_save_config(
+                        use_barrier=False, file_write_workers=self.file_write_workers
+                    ),
+                    storage_config=_storage_config(
+                        checkpoint_id, file_write_direct_io=self.file_write_direct_io
+                    ),
                 ).build()
             try:
                 loaded = manager.load(
@@ -596,9 +638,7 @@ class TorchCheckpointingManager(BaseCheckpointManager):
                 required=model_spec.required,
             )
             fqn_to_index_mapping = self.sd_adapter.fqn_to_index_mapping
-            hf_storage_config = storage_config or LocalFileSystemStorageConfig(
-                use_direct_io=False
-            )
+            hf_storage_config = _storage_config(self.folder, file_write_direct_io=False)
             output_dir = _backend_path(checkpoint_id)
 
             # The backend invokes the callback after each rank finishes writing
@@ -619,7 +659,7 @@ class TorchCheckpointingManager(BaseCheckpointManager):
                 )
 
         manager_config = _default_backend_config(
-            _sync_save_config(),
+            _sync_save_config(file_write_workers=self.file_write_workers),
             storage_config=storage_config,
             items=item_specs,
             pre_finalize_callback=pre_finalize_callback,
