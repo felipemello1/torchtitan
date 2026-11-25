@@ -1094,15 +1094,18 @@ class Controller(Configurable):
             )
 
         # TODO(naming): reserve "sample" for TrainingSample; rename the rollouter's raw-prompt "sample" -> "prompt"/"data_input".
-        group_results = await asyncio.gather(
-            *(
-                run_group(group_id, sample)
-                for group_id, sample in zip(group_ids, samples, strict=True)
-            ),
-            return_exceptions=True,
-        )
-        # Drop the generators' pinned cache salts and held KV for these groups.
-        await self.generator_router.release_groups.call_one(group_ids)
+        try:
+            group_results = await asyncio.gather(
+                *(
+                    run_group(group_id, sample)
+                    for group_id, sample in zip(group_ids, samples, strict=True)
+                ),
+                return_exceptions=True,
+            )
+        finally:
+            # Drop the generators' pinned cache salts and held KV for these groups, and their admission charge:
+            # also when shutdown cancels this validation, so the one after training gets the room.
+            await self.generator_router.release_groups.call_one(group_ids)
 
         # Keep the groups that succeeded; log + count the ones that raised.
         rollout_groups: list[RolloutGroup] = []
@@ -1344,9 +1347,9 @@ class Controller(Configurable):
             # Then cancel covers anything blocked on the queue (which close does not wake); gather awaits all.
             # Cancel the validations too: `_validation_tasks` holds every validation not logged yet. On a
             # healthy end, a validation that already ended keeps its result for the call after training. A
-            # cancelled validation is never logged, and its groups stay pinned in the generators. Its rollouts
-            # keep running until close() if the rollouter shields them (the base Rollouter does).
-            # TODO: abort a cancelled validation's rollouts and release its groups. The generators have no abort
+            # cancelled validation is never logged, but it releases its groups. Its rollouts keep running until
+            # their next generate call fails (admission) or close() (the base Rollouter shields them).
+            # TODO: abort a cancelled group's rollouts, training or validation. The generators have no abort
             # path yet.
             await self._group_buffer.close()
             # TODO: cancelling stops only the controller's waits. The remote pull can still run
@@ -1537,9 +1540,11 @@ class Controller(Configurable):
                 )
             except asyncio.CancelledError:
                 if asyncio.current_task().cancelling():
-                    # Shutdown cancelled this loop: stop waiting for the group too, then exit.
+                    # Shutdown cancelled this loop: stop waiting for the group too, then exit. Release the
+                    # group, or admission keeps its KV room from the validation after training.
                     generation_task.cancel()
                     await asyncio.wait([generation_task])
+                    await self.generator_router.release_groups.call_one([work.group_id])
                     raise
                 if not work.cancelled:
                     # Not the buffer's cancel: propagate it.

@@ -1323,6 +1323,44 @@ def test_validation_renames_turn_metrics_and_uses_fresh_group_ids() -> None:
     assert "math_verify/timeouts/sum" not in keys
 
 
+def test_a_validation_cancelled_at_shutdown_releases_its_groups() -> None:
+    """Shutdown cancels a running validation; its groups are released, so admission frees their KV room
+    for the validation after training."""
+    group_started = asyncio.Event()
+
+    async def run_group_rollouts(**kwargs) -> RolloutGroup:
+        group_started.set()
+        await asyncio.Event().wait()  # long rollouts, still running at shutdown
+
+    controller = object.__new__(Controller)
+    controller._validation_group_ids = itertools.count(start=-1, step=-1)
+    controller._make_generate_fn = lambda: None
+    controller._make_release_session_fn = lambda: None
+    controller._rollouter = SimpleNamespace(run_group_rollouts=run_group_rollouts)
+    release_groups = AsyncMock()
+    controller.generator_router = SimpleNamespace(
+        acquire_group=SimpleNamespace(call_one=AsyncMock()),
+        release_groups=SimpleNamespace(call_one=release_groups),
+    )
+
+    async def main() -> None:
+        validation = asyncio.create_task(
+            controller._collect_validation_rollouts(
+                samples=["prompt 1", "prompt 2"],
+                sampling=SamplingConfig(),
+                num_samples_per_prompt=1,
+                step=8,
+            )
+        )
+        await asyncio.wait_for(group_started.wait(), timeout=5)
+        validation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await validation
+
+    asyncio.run(main())
+    release_groups.assert_awaited_once_with([-1, -2])
+
+
 def _scored_group(group_id: int, rewards: list[float | None]) -> RolloutGroup:
     return RolloutGroup(
         group_id=group_id,
@@ -2163,10 +2201,11 @@ def test_rollout_loop_exits_when_shutdown_lands_with_a_buffer_cancel() -> None:
         assert events == []
         loop.cancel()
 
-        # The loop exits without cancelling g0 on its worker: `Rollouter.close` waits for that call
+        # The loop exits without cancelling g0 on its worker (`Rollouter.close` waits for that call), and
+        # releases g0, so admission frees its KV room for the validation after training.
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(loop, timeout=5)
-        assert events == [("generation_cancelled", 0)]
+        assert events == [("generation_cancelled", 0), ("release_groups", [0])]
         controller._rollouter.cancel_group.assert_not_awaited()
 
         await buffer.close()
