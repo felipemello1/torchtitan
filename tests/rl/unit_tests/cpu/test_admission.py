@@ -193,3 +193,192 @@ def test_rejects_data_parallel_generators():
     )
     with pytest.raises(ValueError, match="data_parallel_size=1"):
         _policy(budget)
+
+
+def _idle_sessions(
+    policy: KVRoomAdmission, sizes: list[int], *, group_id: int = 0, validation=False
+) -> None:
+    """Place a group with one idle session per size (in tokens), named f"g{group_id}/s{i}"."""
+    policy.add_group(group_id, num_sessions=len(sizes), validation=validation)
+    policy.place()
+    for i, size in enumerate(sizes):
+        request_id = f"g{group_id}/r{i}"
+        policy.start_call(
+            request_id,
+            session_id=f"g{group_id}/s{i}",
+            group_id=group_id,
+            num_prompt_tokens=size,
+        )
+        policy.end_call(request_id, num_tokens=size)
+
+
+# 21 idle sessions of 145 attention blocks each hold 21 x 148 = 3,108 > 3,030 usable blocks.
+_OVER_H = [240_000 - i for i in range(21)]
+
+
+def test_pause_drains_to_90_percent_then_resumes_the_longest_paused_up_to_95():
+    policy = _policy()
+    _idle_sessions(policy, _OVER_H)
+
+    assert policy.rebalance(now=0.0) == []
+
+    # Pause the 3 smallest (g0/s20, s19, s18): 3,108 - 3 x 148 = 2,664 <= 90% of 3,030. Then the
+    # first-paused one fits back under 95% (2,878): 2,812.
+    assert policy.num_paused_sessions == 2
+    assert policy.ledger(0) == 2812
+    assert policy.start_call(
+        "next18", session_id="g0/s18", group_id=0, num_prompt_tokens=1
+    )
+    assert not policy.start_call(
+        "next20", session_id="g0/s20", group_id=0, num_prompt_tokens=241_000
+    )
+
+
+def test_validation_sessions_pause_after_training_sessions():
+    policy = _policy()
+    _seed_first_prompt(policy)
+    _idle_sessions(policy, [100_000] * 2, group_id=-1, validation=True)
+    _idle_sessions(policy, [240_000] * 20)
+
+    policy.rebalance(now=0.0)
+
+    # 2 x 64 + 20 x 148 = 3,088: training sessions pause, though the validation ones are smaller.
+    assert policy.num_paused_sessions == 2
+    assert policy.start_call("v", session_id="g-1/s0", group_id=-1, num_prompt_tokens=1)
+
+
+def test_running_sessions_pause_when_their_call_returns():
+    budget = _budget()
+    policy = _policy(budget)
+    policy.add_group(0, num_sessions=19, validation=False)
+    policy.place()
+    for i in range(19):  # 19 running x 164 = 3,116, none idle
+        policy.start_call(
+            f"r{i}", session_id=f"s{i}", group_id=0, num_prompt_tokens=240_000 + i
+        )
+
+    policy.rebalance(now=0.0)
+    assert policy.num_paused_sessions == 0
+
+    # s0 was picked (smallest); it pauses as its call returns, and leaves the ledger.
+    policy.end_call("r0", num_tokens=241_000)
+    assert policy.num_paused_sessions == 1
+    assert policy.ledger(0) == 18 * budget.running_session_blocks(240_018)
+
+
+def test_resume_goes_longest_paused_first_and_runs_the_waiting_call():
+    budget = _budget()
+    policy = _policy(budget)
+    _idle_sessions(policy, _OVER_H)
+    policy.rebalance(now=0.0)  # g0/s19 and s20 stay paused, ledger 2,812
+    assert not policy.start_call(
+        "waiting", session_id="g0/s20", group_id=0, num_prompt_tokens=241_000
+    )
+
+    # Two releases free 296 blocks: 2,516 + 148 (s19) + 164 (s20, running) = 2,828 <= 2,878.
+    policy.release_session("g0/s0")
+    policy.release_session("g0/s1")
+
+    assert policy.rebalance(now=10.0) == ["waiting"]
+    assert policy.num_paused_sessions == 0
+    assert policy.ledger(0) == 2516 + 148 + budget.running_session_blocks(241_000)
+
+
+def test_a_generator_with_paused_sessions_takes_no_new_group():
+    policy = _policy(_budget(), _budget())
+    _idle_sessions(policy, _OVER_H)
+    policy.rebalance(now=0.0)
+
+    policy.add_group(1, num_sessions=1, validation=False)
+
+    assert policy.place() == {1: 1}
+
+
+def test_a_generator_with_only_paused_sessions_resumes_them_at_once():
+    policy = _policy()
+    _idle_sessions(policy, _OVER_H)
+    policy.rebalance(now=0.0)
+    for i in range(19):  # every unpaused session ends
+        policy.release_session(f"g0/s{i}")
+
+    policy.rebalance(now=1.0)
+
+    assert policy.num_paused_sessions == 0
+
+
+def _call_again(
+    policy: KVRoomAdmission, session_ids: list[str], *, num_tokens: int
+) -> None:
+    for session_id in session_ids:
+        policy.start_call(
+            "again", session_id=session_id, group_id=0, num_prompt_tokens=num_tokens
+        )
+        policy.end_call("again", num_tokens=num_tokens)
+
+
+def test_a_session_paused_past_the_bound_swaps_in_for_idle_sessions():
+    policy = _policy()
+    _idle_sessions(policy, _OVER_H)
+    policy.rebalance(now=0.0)  # g0/s19 and s20 paused, ledger 2,812
+    # g0/s0-s4 grow to 161 blocks: 2,877. A paused session (148) no longer fits under 2,878.
+    _call_again(policy, [f"g0/s{i}" for i in range(5)], num_tokens=262_000)
+    unpaused = [f"g0/s{i}" for i in range(19)]
+    for now in (500.0, 1000.0, 1500.0):
+        assert policy.rebalance(now=now) == []
+        _call_again(
+            policy, unpaused[5:], num_tokens=240_000
+        )  # active, so not reclaimed as hung
+        _call_again(policy, unpaused[:5], num_tokens=262_000)
+    assert policy.num_paused_sessions == 2
+    for session_id in ("g0/s19", "g0/s20"):  # their next calls wait
+        assert not policy.start_call(
+            session_id, session_id=session_id, group_id=0, num_prompt_tokens=240_000
+        )
+
+    # Past 1,800 s each swaps in for the smallest idle sessions, never going over 2,878:
+    # 2,877 - 2 x 148 + 164 = 2,745 (s19 running), then 2,745 - 148 + 164 = 2,761 (s20).
+    assert policy.rebalance(now=1801.0) == ["g0/s19", "g0/s20"]
+
+    assert policy.num_swaps == 2
+    assert policy.ledger(0) == 2761
+    assert not policy.start_call(
+        "s5", session_id="g0/s5", group_id=0, num_prompt_tokens=1
+    )
+
+
+def test_a_hung_session_pauses_while_a_group_waits():
+    policy = _policy()
+    _seed_first_prompt(policy)
+    _idle_sessions(policy, [240_000] * 10)  # 1,480
+    policy.add_group(1, num_sessions=80, validation=False)  # 80 x 22 = 1,760: waits
+    assert policy.place() == {}
+    policy.rebalance(now=0.0)
+    for i in range(9):  # every session but g0/s9 runs again: 1,624, under H
+        policy.start_call(
+            f"again{i}", session_id=f"g0/s{i}", group_id=0, num_prompt_tokens=240_000
+        )
+
+    policy.rebalance(now=601.0)
+
+    # It stays paused, not charged, until it calls: then it resumes when it fits.
+    assert policy.num_paused_sessions == 1
+    assert policy.ledger(0) == 9 * 164
+    assert not policy.start_call(
+        "back", session_id="g0/s9", group_id=0, num_prompt_tokens=240_000
+    )
+    assert policy.rebalance(now=602.0) == ["back"]
+
+
+def test_a_cancelled_waiting_call_is_forgotten():
+    policy = _policy()
+    _idle_sessions(policy, _OVER_H)
+    policy.rebalance(now=0.0)
+    policy.start_call(
+        "waiting", session_id="g0/s20", group_id=0, num_prompt_tokens=241_000
+    )
+
+    policy.cancel_call("waiting")
+    policy.release_session("g0/s0")
+    policy.release_session("g0/s1")
+
+    assert policy.rebalance(now=10.0) == []

@@ -1226,6 +1226,39 @@ def test_generate_fn_forwards_the_session_and_releases_on_failure() -> None:
     release.assert_called_once_with("r0", num_tokens=None)
 
 
+def test_generate_fn_cancels_a_reserve_its_caller_left() -> None:
+    """A caller cancelled while admission holds its call tells the router, which drops the parked call
+    (or the reservation made after a resume)."""
+
+    async def reserve(*args, **kwargs) -> None:
+        await asyncio.Event().wait()  # the session stays paused
+
+    cancel_reserve = Mock()
+    controller = object.__new__(Controller)
+    controller.generator_router = SimpleNamespace(
+        reserve=SimpleNamespace(call_one=reserve),
+        cancel_reserve=SimpleNamespace(broadcast=cancel_reserve),
+    )
+    generate = controller._make_generate_fn()
+
+    async def main() -> None:
+        call = asyncio.create_task(
+            generate(
+                Prompt(token_ids=[1, 2]),
+                request_id="r0",
+                group_id=0,
+                routing_session_id="s0",
+            )
+        )
+        await asyncio.sleep(0)
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+
+    asyncio.run(main())
+    cancel_reserve.assert_called_once_with("r0")
+
+
 def test_validation_renames_turn_metrics_and_uses_fresh_group_ids() -> None:
     """Validation prefixes its turns' metrics with `validation_` (`generator/x` -> `validation_generator/x`,
     `math_verify/x` -> `validation_math_verify/x`). Two validations never share a group id."""

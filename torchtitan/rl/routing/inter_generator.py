@@ -9,7 +9,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -24,9 +25,17 @@ from torchtitan.rl.routing.strategies import (
 )
 from torchtitan.rl.routing.types import RoutingCandidate, RoutingContext
 
-# How often waiting groups retry placement: calls and session ends change the ledger without a group
-# release.
+# How often admission pauses, resumes and places groups: calls change the ledger between releases.
 _ADMISSION_TICK_S = 1.0
+
+
+@dataclass(kw_only=True, slots=True)
+class _ParkedCall:
+    """A call of a paused session, waiting in ``reserve`` until admission resumes the session."""
+
+    session_id: str
+    group_id: int
+    resumed: asyncio.Future[None]
 
 
 @dataclass(kw_only=True, slots=True)
@@ -138,8 +147,11 @@ class InterGeneratorRouter(Configurable):
         self._admission: KVRoomAdmission | None = None
         self._admission_task: asyncio.Task | None = None
         self._waiting_groups: dict[int, asyncio.Future[None]] = {}
+        self._parked_calls: dict[str, _ParkedCall] = {}
+        # Admission counters at the last `admission_metrics`, to report each step's increase.
+        self._reported_counts = (0, 0, 0)
 
-    def reserve(
+    async def reserve(
         self,
         request_id: str,
         *,
@@ -148,8 +160,10 @@ class InterGeneratorRouter(Configurable):
         num_prompt_tokens: int,
     ) -> Any:
         """Pick a generator for one generate call, reserve one load unit on it, and
-        return its rank-0 handle. A group admission placed goes to its generator; the
-        strategy routes the rest."""
+        return its rank-0 handle. A group admission placed goes to its generator, after
+        its session resumes if admission paused it; the strategy routes the rest.
+
+        A caller cancelled while this waits sends ``cancel_reserve``."""
         assert (
             request_id not in self._reservations
         ), f"request_id {request_id!r} already has a reservation"
@@ -167,12 +181,16 @@ class InterGeneratorRouter(Configurable):
                     f"admission charges sessions, but call {request_id!r} of group {group_id} "
                     "has no routing_session_id"
                 )
-            self._admission.start_call(
+            runs_now = self._admission.start_call(
                 request_id,
                 session_id=routing_session_id,
                 group_id=group_id,
                 num_prompt_tokens=num_prompt_tokens,
             )
+            if not runs_now:
+                await self._wait_until_resumed(
+                    request_id, session_id=routing_session_id, group_id=group_id
+                )
             # Skip the strategy: a repin would recompute the context on a generator whose ledger
             # doesn't hold it. A draining generator holds the call until its load is applied.
             h = self._generators[placed]
@@ -195,6 +213,46 @@ class InterGeneratorRouter(Configurable):
         # Returning the handle keeps callers simple. If router CPU becomes a bottleneck,
         #   return the generator index and have callers keep the handle list.
         return h.rank0_actor
+
+    async def _wait_until_resumed(
+        self, request_id: str, *, session_id: str, group_id: int
+    ) -> None:
+        """Park a paused session's call until `_admission_tick` resumes the session.
+
+        resumed                                   return; the call runs
+        caller cancelled (`cancel_reserve`)       raise CancelledError; nothing stays charged
+        its session or group released             raise RuntimeError
+        """
+        resumed = asyncio.get_running_loop().create_future()
+        self._parked_calls[request_id] = _ParkedCall(
+            session_id=session_id, group_id=group_id, resumed=resumed
+        )
+        try:
+            await resumed
+        except asyncio.CancelledError:
+            self._parked_calls.pop(request_id, None)
+            if resumed.cancelled():
+                self._admission.cancel_call(request_id)
+            else:
+                # Resumed, then this task was cancelled: the call is charged as running.
+                self._admission.end_call(request_id, num_tokens=None)
+            raise
+        if self._parked_calls.pop(request_id, None) is None:
+            # `cancel_reserve` came between the resume and this wake-up: nobody sends the call.
+            self._admission.end_call(request_id, num_tokens=None)
+            raise asyncio.CancelledError
+
+    def cancel_reserve(self, request_id: str) -> None:
+        """Undo ``reserve`` for a caller cancelled while it waited: drop its parked call, or release the
+        reservation made after a resume. Unknown ids are ignored: an exception would fail the actor on
+        this broadcast."""
+        parked = self._parked_calls.pop(request_id, None)
+        if parked is not None:
+            # Not yet resumed: `_wait_until_resumed` uncharges it. Resumed: it ends the call on wake-up.
+            if not parked.resumed.done():
+                parked.resumed.cancel()
+        elif request_id in self._reservations:
+            self.release_reservation(request_id, num_tokens=None)
 
     def release_reservation(self, request_id: str, *, num_tokens: int | None) -> None:
         """Free the load unit ``reserve`` placed for ``request_id``. Routing
@@ -238,7 +296,15 @@ class InterGeneratorRouter(Configurable):
         if self._admission is None:
             return []
         self._raise_if_admission_failed()
-        fractions = self._admission.ledger_fractions()
+        admission = self._admission
+        fractions = admission.ledger_fractions()
+        paused_fractions = admission.paused_fractions()
+        counts = (admission.num_pauses, admission.num_resumes, admission.num_swaps)
+        new_pauses, new_resumes, new_swaps = (
+            count - reported
+            for count, reported in zip(counts, self._reported_counts, strict=True)
+        )
+        self._reported_counts = counts
         return [
             m.Metric(
                 "admission/ledger_fraction/mean",
@@ -246,13 +312,34 @@ class InterGeneratorRouter(Configurable):
             ),
             m.Metric("admission/ledger_fraction/max", m.NoReduce(max(fractions))),
             m.Metric(
-                "admission/groups_waiting",
-                m.NoReduce(self._admission.num_waiting_groups),
+                "admission/paused_fraction/mean",
+                m.NoReduce(sum(paused_fractions) / len(paused_fractions)),
             ),
+            m.Metric(
+                "admission/paused_fraction/max", m.NoReduce(max(paused_fractions))
+            ),
+            m.Metric(
+                "admission/groups_waiting", m.NoReduce(admission.num_waiting_groups)
+            ),
+            m.Metric(
+                "admission/paused_sessions", m.NoReduce(admission.num_paused_sessions)
+            ),
+            m.Metric(
+                "admission/longest_pause_s", m.NoReduce(admission.longest_pause_s())
+            ),
+            m.Metric("admission/pauses", m.Sum(new_pauses)),
+            m.Metric("admission/resumes", m.Sum(new_resumes)),
+            m.Metric("admission/swaps", m.Sum(new_swaps)),
         ]
 
     def _admission_tick(self) -> None:
-        """Place waiting groups that fit now and wake their ``acquire_group``."""
+        """Pause and resume sessions, wake resumed calls, then place waiting groups that fit and wake
+        their ``acquire_group``."""
+        for request_id in self._admission.rebalance(now=time.monotonic()):
+            # Absent if its caller was cancelled during this tick's resume.
+            parked = self._parked_calls.get(request_id)
+            if parked is not None and not parked.resumed.done():
+                parked.resumed.set_result(None)
         for group_id in self._admission.place():
             placed = self._waiting_groups.pop(group_id)
             # Done if its caller was cancelled; `release_groups` still forgets the group.
@@ -368,6 +455,10 @@ class InterGeneratorRouter(Configurable):
             placed = self._admission.release_session(routing_session_id)
             if placed is not None:
                 pinned = self._generators[placed]
+            self._fail_parked_calls(
+                lambda parked: parked.session_id == routing_session_id,
+                reason=f"session {routing_session_id!r} was released",
+            )
             self._admission_tick()
         # Without a pin (non-sticky routing), `release_groups` frees the held KV at group end.
         if pinned is not None:
@@ -388,8 +479,25 @@ class InterGeneratorRouter(Configurable):
                 waiting = self._waiting_groups.pop(group_id, None)
                 if waiting is not None:
                     waiting.cancel()
+            released = set(group_ids)
+            self._fail_parked_calls(
+                lambda parked: parked.group_id in released,
+                reason=f"groups {group_ids} were released",
+            )
             self._admission_tick()
         await self._fanout("release_groups", group_ids)
+
+    def _fail_parked_calls(
+        self, released: Callable[[_ParkedCall], bool], *, reason: str
+    ) -> None:
+        """Fail the parked calls of released sessions or groups: they will never resume."""
+        for request_id, parked in list(self._parked_calls.items()):
+            if released(parked):
+                del self._parked_calls[request_id]
+                if not parked.resumed.done():
+                    parked.resumed.set_exception(
+                        RuntimeError(f"{reason} while call {request_id!r} waited")
+                    )
 
     async def close_generators(self) -> list[Any | BaseException]:
         """Close every generator, returning each one's result or exception."""

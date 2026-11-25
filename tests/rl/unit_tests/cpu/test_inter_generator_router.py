@@ -88,8 +88,10 @@ def _router(
 
 def _reserve(router, request_id: str, *, session_id: str | None = None) -> str:
     """Reserve a generator for one generate call of group 0; return its name."""
-    return router.reserve(
-        request_id, routing_session_id=session_id, group_id=0, num_prompt_tokens=1
+    return asyncio.run(
+        router.reserve(
+            request_id, routing_session_id=session_id, group_id=0, num_prompt_tokens=1
+        )
     ).name
 
 
@@ -302,7 +304,7 @@ def test_drain_marks_generator_draining_for_its_load():
         assert [h.draining for h in router._generators] == [True, False]
         # Even when gen1 is busier, an unpinned call skips the draining gen0.
         router._generators[1].reserved_load = 2
-        assert _route(router) == "gen1"
+        assert await _reserve_call(router, "r0", session_id=None, group_id=0) == "gen1"
 
         actors[0].load_model_state_dict.release.set()
         await pull_task
@@ -423,14 +425,22 @@ def test_wait_engine_loop_returns_once_every_rank_exits():
     asyncio.run(_run())
 
 
-def _reserve_call(router, request_id: str, *, session_id: str, group_id: int) -> str:
-    """Reserve a generator for one 4,000-token call of `group_id`; return its name."""
-    return router.reserve(
+async def _reserve_call(
+    router,
+    request_id: str,
+    *,
+    session_id: str | None,
+    group_id: int,
+    num_prompt_tokens: int = 4000,
+) -> str:
+    """Reserve a generator for one call of `group_id`; return its name."""
+    generator = await router.reserve(
         request_id,
         routing_session_id=session_id,
         group_id=group_id,
-        num_prompt_tokens=4000,
-    ).name
+        num_prompt_tokens=num_prompt_tokens,
+    )
+    return generator.name
 
 
 def test_admission_holds_a_group_until_room_and_routes_its_calls_to_its_generator():
@@ -449,8 +459,12 @@ def test_admission_holds_a_group_until_room_and_routes_its_calls_to_its_generato
         assert not waiting.done()
 
         # Group 1 sits on gen1, though least-loaded routing would pick idle gen0 here.
-        assert _reserve_call(router, "r0", session_id="g0/s0", group_id=0) == "gen0"
-        assert _reserve_call(router, "r1", session_id="g1/s0", group_id=1) == "gen1"
+        assert (
+            await _reserve_call(router, "r0", session_id="g0/s0", group_id=0) == "gen0"
+        )
+        assert (
+            await _reserve_call(router, "r1", session_id="g1/s0", group_id=1) == "gen1"
+        )
         # The release goes to the generator the group was placed on.
         router.release_reservation("r1", num_tokens=4100)
         await router.release_session("g1/s0")
@@ -459,7 +473,9 @@ def test_admission_holds_a_group_until_room_and_routes_its_calls_to_its_generato
         # The first calls showed 4,000-token prompts, so a group now charges 16 x 22 = 352 and
         # group 2 fits: on gen1, which has more room (15 sessions not started vs 16 on gen0).
         await asyncio.wait_for(waiting, timeout=5)
-        assert _reserve_call(router, "r2", session_id="g2/s0", group_id=2) == "gen1"
+        assert (
+            await _reserve_call(router, "r2", session_id="g2/s0", group_id=2) == "gen1"
+        )
         await router.close_generators()
 
     asyncio.run(main())
@@ -503,6 +519,117 @@ def test_admission_metrics_raise_once_the_tick_task_died(monkeypatch):
 
         with pytest.raises(RuntimeError, match="place failed"):
             router.admission_metrics()
+        await router.close_generators()
+
+    asyncio.run(main())
+
+
+async def _router_over_its_kv_cache(actor) -> InterGeneratorRouter:
+    """One generator over its 3,030 usable blocks: 21 idle sessions of ~240k tokens, 148 blocks each.
+    A tick pauses the smallest ones; g0/s19 and g0/s20 stay paused (`KVRoomAdmission.rebalance`)."""
+    router = _router([actor], admission=KVRoomAdmission.Config())
+    await router.start_engine_loop()
+    await router.acquire_group(0, group_size=21, validation=False)
+    for i in range(21):
+        await _reserve_call(
+            router,
+            f"r{i}",
+            session_id=f"g0/s{i}",
+            group_id=0,
+            num_prompt_tokens=240_000 - i,
+        )
+        router.release_reservation(f"r{i}", num_tokens=240_000 - i)
+    router._admission_tick()
+    return router
+
+
+def test_a_paused_sessions_call_waits_until_the_session_resumes():
+    actor = _Actor("gen0")
+
+    async def main():
+        router = await _router_over_its_kv_cache(actor)
+        call = asyncio.create_task(
+            _reserve_call(router, "next", session_id="g0/s20", group_id=0)
+        )
+        await asyncio.sleep(0)
+        assert not call.done()
+
+        # Two rollouts end: the paused sessions fit again, and the waiting call runs.
+        await router.release_session("g0/s0")
+        await router.release_session("g0/s1")
+
+        assert await asyncio.wait_for(call, timeout=5) == "gen0"
+        await router.close_generators()
+
+    asyncio.run(main())
+
+
+def test_cancel_reserve_drops_a_waiting_call():
+    async def main():
+        router = await _router_over_its_kv_cache(_Actor("gen0"))
+        call = asyncio.create_task(
+            _reserve_call(router, "next", session_id="g0/s20", group_id=0)
+        )
+        await asyncio.sleep(0)
+
+        router.cancel_reserve("next")
+        router.cancel_reserve("unknown")  # ignored
+
+        with pytest.raises(asyncio.CancelledError):
+            await call
+        await router.release_session("g0/s0")
+        await router.release_session("g0/s1")
+        # The session resumes idle: no call was left to run, and nothing is reserved.
+        assert router._reservations == {}
+        assert router._generators[0].reserved_load == 0
+        await router.close_generators()
+
+    asyncio.run(main())
+
+
+def test_cancel_reserve_after_the_resume_leaves_no_reservation():
+    async def main():
+        router = await _router_over_its_kv_cache(_Actor("gen0"))
+        call = asyncio.create_task(
+            _reserve_call(
+                router,
+                "next",
+                session_id="g0/s20",
+                group_id=0,
+                num_prompt_tokens=240_000,
+            )
+        )
+        await asyncio.sleep(0)
+        ledger_before = router._admission.ledger(0)
+
+        # The resume and the cancel land before the waiting call wakes up.
+        router._admission.release_session("g0/s0")
+        router._admission.release_session("g0/s1")
+        router._admission_tick()
+        router.cancel_reserve("next")
+
+        with pytest.raises(asyncio.CancelledError):
+            await call
+        assert router._reservations == {}
+        # g0/s20 resumed idle, not running: 296 freed, 148 + 148 back (g0/s19 and s20).
+        assert router._admission.ledger(0) == ledger_before
+        await router.close_generators()
+
+    asyncio.run(main())
+
+
+def test_releasing_a_paused_session_fails_its_waiting_call():
+    async def main():
+        router = await _router_over_its_kv_cache(_Actor("gen0"))
+        call = asyncio.create_task(
+            _reserve_call(router, "next", session_id="g0/s20", group_id=0)
+        )
+        await asyncio.sleep(0)
+
+        await router.release_groups([0])
+
+        with pytest.raises(RuntimeError, match="released while call 'next' waited"):
+            await call
         await router.close_generators()
 
     asyncio.run(main())

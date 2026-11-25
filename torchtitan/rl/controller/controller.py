@@ -839,12 +839,20 @@ class Controller(Configurable):
             #   and a caller that dies never releases. Only `Rollouter.cancel_group` (the
             #   adaptive buffer's too-old groups) cancels a generate call; a dead rollout
             #   worker fails the run.
-            generator = await generator_router.reserve.call_one(
-                request_id,
-                routing_session_id=routing_session_id,
-                group_id=group_id,
-                num_prompt_tokens=len(prompt.token_ids),
-            )
+            reserve_start = time.perf_counter()
+            try:
+                generator = await generator_router.reserve.call_one(
+                    request_id,
+                    routing_session_id=routing_session_id,
+                    group_id=group_id,
+                    num_prompt_tokens=len(prompt.token_ids),
+                )
+            except asyncio.CancelledError:
+                # Admission may still hold the call parked, or its reservation after a resume.
+                generator_router.cancel_reserve.broadcast(request_id)
+                raise
+            # How long admission held the call while its session was paused, plus the round trip.
+            reserve_wait_ms = (time.perf_counter() - reserve_start) * 1000
             completion = None
             try:
                 completion = await generator.generate.call_one(
@@ -854,6 +862,10 @@ class Controller(Configurable):
                     routing_session_id=routing_session_id,
                     sampling_config=sampling_config,
                 )
+                if completion is not None:
+                    completion.metrics.append(
+                        m.Metric("generator/reserve_wait_ms", m.Mean(reserve_wait_ms))
+                    )
                 return completion
             finally:
                 # The session's size after this turn, for admission's ledger.

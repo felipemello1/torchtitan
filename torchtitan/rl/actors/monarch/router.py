@@ -42,12 +42,16 @@ class _InterGeneratorRouterActorEndpoints:
         group_id: int,
         num_prompt_tokens: int,
     ) -> Any:
-        return super().reserve(
+        return await super().reserve(
             request_id,
             routing_session_id=routing_session_id,
             group_id=group_id,
             num_prompt_tokens=num_prompt_tokens,
         )
+
+    @concurrent_endpoint
+    async def cancel_reserve(self, request_id: str) -> None:
+        super().cancel_reserve(request_id)
 
     @concurrent_endpoint
     async def release_reservation(
