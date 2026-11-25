@@ -204,6 +204,13 @@ With `VLLMEngine.Config.session_kv_holder`, the logger also exports what the hol
   `SimpleCPUOffloadConnector`): full blocks of a session's last turn that its next prompt continues, and
   the part of them the GPU and CPU caches did not serve at admission. Lost / prompt tokens is the share of
   prompt tokens recomputed although computed before.
+- `vllm.session_kv.idle_held_blocks` (gauge): distinct held blocks of sessions with no request in vLLM:
+  live histories waiting for their next turn. Next to `vllm.kv.num_gpu_blocks` (gauge, the GPU pool's
+  size) it shows how much of the cache idle histories take.
+- `vllm.waiting_requests{history=yes|no}` (gauge): requests waiting in vLLM whose session ran a turn
+  before, and first turns. With history, a wait risks the holder releasing the session's prefix.
+
+The last two refresh every `VLLM_LOG_STATS_INTERVAL` seconds.
 
 With `SimpleCPUOffloadConnector`, it exports what the CPU KV cache stores and fails to serve:
 
@@ -215,6 +222,14 @@ With `SimpleCPUOffloadConnector`, it exports what the CPU KV cache stores and fa
   state was missing. A next block still on the GPU counts toward neither cause.
 - `vllm.cpu_kv.stored_blocks` (counter): blocks copied to the CPU cache.
 - `vllm.cpu_kv.gdn_state_blocks` (gauge): CPU cache blocks of GDN state groups (vLLM `MambaSpec`).
+- `vllm.cpu_kv.copy_time{direction=load|store}` (counter, s) and `vllm.cpu_kv.copied_blocks{direction}`
+  (counter): time the copy streams spent copying, from timing events around each copy batch, and the
+  blocks copied. `load` is CPU to GPU. Rate of time / rate of blocks is the time per block.
+- `vllm.cpu_kv.load_wait` (histogram, s): per request with a CPU hit, from its admission to its load
+  done: what the turn waits for its history.
+- `vllm.cpu_kv.block_lifetime`, `vllm.cpu_kv.block_idle_before_evict` (histograms, s): vLLM's sampled
+  `KVCacheMetricsCollector` on the CPU pool. A block is born at a store, accessed at a CPU hit and dies
+  when overwritten.
 
 #### Prefix-cache hit rate
 

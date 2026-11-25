@@ -196,6 +196,8 @@ class VllmOtelStatLogger(Configurable, StatLoggerBase):
         self._kv_cache_usage_last = 0.0
         self._num_running_last = 0
         self._num_waiting_last = 0
+        # Set by `observe_kv_reuse`; `record` drains its load waits and CPU block lifetimes.
+        self._kv_connector: SimpleCPUOffloadConnector | None = None
 
         configured_exporter = os.environ.get("OTEL_METRICS_EXPORTER", "none")
         exporter_kind = configured_exporter.strip().lower()
@@ -371,17 +373,24 @@ class VllmOtelStatLogger(Configurable, StatLoggerBase):
         *,
         holder: VLLMSessionKVHolder | None,
         connector: SimpleCPUOffloadConnector | None,
+        worker_connector: SimpleCPUOffloadConnector | None = None,
     ) -> None:
         """Export what the session KV holder keeps and what the CPU KV cache stores and fails to serve.
 
-        Both keep plain ints (or dicts of ints) on the engine thread; the exporter thread reads
-        them in these callbacks. Names and meanings: observability/metrics/README.md.
+        All three keep plain ints (or dicts of ints) on the engine thread; the exporter thread reads
+        them in these callbacks. `record` drains the connector's load waits and CPU block lifetimes
+        into histograms. Names and meanings: observability/metrics/README.md.
 
         Example:
 
             logger.observe_kv_reuse(holder=holder, connector=None)
-            # an engine with the holder and no CPU offload: exports only
-            # vllm.session_kv.held_blocks and vllm.session_kv.evicted_sessions
+            # an engine with the holder and no CPU offload: exports only the vllm.session_kv.*
+            # gauges and counters, and vllm.kv.num_gpu_blocks
+
+        Args:
+            holder: The engine's session KV holder.
+            connector: The scheduler side of the CPU offload connector.
+            worker_connector: Its worker side, which times the copies.
         """
         if not self._enabled:
             return
@@ -409,6 +418,21 @@ class VllmOtelStatLogger(Configurable, StatLoggerBase):
                 "vllm.session_kv.evicted_sessions",
                 callbacks=read(lambda: holder.num_evicted),
                 unit="session",
+            )
+            meter.create_observable_gauge(
+                "vllm.session_kv.idle_held_blocks",
+                callbacks=read(lambda: holder.num_idle_held_blocks),
+                unit="block",
+            )
+            meter.create_observable_gauge(
+                "vllm.kv.num_gpu_blocks",
+                callbacks=read(lambda: holder.num_gpu_blocks),
+                unit="block",
+            )
+            meter.create_observable_gauge(
+                "vllm.waiting_requests",
+                callbacks=read_by(holder.num_waiting_requests, "history"),
+                unit="request",
             )
         # The holder counts lost prefix only with the connector's admission record.
         if holder is not None and connector is not None:
@@ -447,6 +471,28 @@ class VllmOtelStatLogger(Configurable, StatLoggerBase):
             meter.create_observable_gauge(
                 "vllm.cpu_kv.gdn_state_blocks",
                 callbacks=read(lambda: connector.num_cpu_gdn_state_blocks),
+                unit="block",
+            )
+            self._kv_connector = connector
+            self._h_cpu_load_wait = meter.create_histogram(
+                "vllm.cpu_kv.load_wait", unit="s"
+            )
+            self._h_cpu_block_lifetime = meter.create_histogram(
+                "vllm.cpu_kv.block_lifetime", unit="s"
+            )
+            self._h_cpu_block_idle = meter.create_histogram(
+                "vllm.cpu_kv.block_idle_before_evict", unit="s"
+            )
+
+        if worker_connector is not None:
+            meter.create_observable_counter(
+                "vllm.cpu_kv.copy_time",
+                callbacks=read_by(worker_connector.copy_time_s, "direction"),
+                unit="s",
+            )
+            meter.create_observable_counter(
+                "vllm.cpu_kv.copied_blocks",
+                callbacks=read_by(worker_connector.copied_blocks, "direction"),
                 unit="block",
             )
 
@@ -492,6 +538,16 @@ class VllmOtelStatLogger(Configurable, StatLoggerBase):
                 self._h_decode.record(finished.decode_time_ms)
                 self._h_queue.record(finished.queue_time_ms)
                 self._h_e2e.record(finished.e2e_latency_ms)
+
+            # The connector appends these on this (the engine) thread.
+            connector = self._kv_connector
+            if connector is not None:
+                load_waits, connector.load_waits_s = connector.load_waits_s, []
+                for load_wait in load_waits:
+                    self._h_cpu_load_wait.record(load_wait)
+                for eviction in connector.cpu_block_metrics.drain_events():
+                    self._h_cpu_block_lifetime.record(eviction.lifetime_seconds)
+                    self._h_cpu_block_idle.record(eviction.idle_seconds)
         except Exception as e:
             logger.warning(
                 "%s disabled for the rest of the run: record() failed "

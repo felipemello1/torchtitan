@@ -606,3 +606,28 @@ def test_lost_prefix_counts_history_the_next_turn_recomputes(manager):
     assert holder.num_sessions == 0
     holder.release(group_ids=[0])
     assert not holder._last_turns
+
+
+def test_stats_count_idle_held_blocks_and_waiting_turns_by_history(manager):
+    requests = {}
+    waiting = []
+    holder = _holder(manager, requests, waiting=waiting)
+    _finished_turn(manager, holder, requests, "s", list(range(50)))
+    held_blocks = holder.num_held_blocks
+    # s's next turn and a new session's first turn wait in vLLM.
+    for request_id, session_id in (("s/turn2", "s"), ("new/turn1", "new")):
+        requests[request_id] = _request(request_id, list(range(60)))
+        waiting.append(requests[request_id])
+        holder.track(request_id, session_id=session_id, group_id=0)
+
+    holder._refresh_stats()
+
+    assert holder.num_waiting_requests == {"yes": 1, "no": 1}
+    # s has a request in vLLM again: its held blocks are no longer idle.
+    assert holder.num_idle_held_blocks == 0
+    holder.release(session_ids=["new"])
+    del requests["s/turn2"], requests["new/turn1"]
+    waiting.clear()
+    holder.after_step()
+    holder._refresh_stats()
+    assert holder.num_idle_held_blocks == held_blocks

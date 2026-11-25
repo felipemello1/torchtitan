@@ -8,11 +8,13 @@
 
 from __future__ import annotations
 
+import time
 from collections import Counter, OrderedDict
 from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Any, NamedTuple, TYPE_CHECKING
 
+from vllm import envs
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_utils import BlockHash, get_block_hash
 from vllm.v1.request import Request, RequestStatus
@@ -130,6 +132,14 @@ class VLLMSessionKVHolder(Configurable):
         # Distinct held blocks: GRPO siblings hold their shared prompt blocks once each.
         self.num_held_blocks = 0
         self._held_block_refs: Counter[int] = Counter()
+        # Refreshed every VLLM_LOG_STATS_INTERVAL seconds (`_refresh_stats`): distinct held blocks of
+        # sessions with no request in vLLM, and waiting requests by whether their session ran a turn.
+        self.num_gpu_blocks = self._block_pool.num_gpu_blocks
+        self.num_idle_held_blocks = 0
+        self.num_waiting_requests = {"yes": 0, "no": 0}
+        self._next_stats_time = 0.0
+        # Requests in vLLM whose session ran a turn before (internal ids).
+        self._requests_with_history: set[str] = set()
         # Lost-prefix accounting (with an offload connector only): see `_count_lost_prefix`.
         self.num_reusable_prefix_tokens = 0
         self.num_lost_prefix_tokens = 0
@@ -148,6 +158,9 @@ class VLLMSessionKVHolder(Configurable):
         """Hold this request's prefix once its prefill finishes."""
         request = self._scheduler.requests[internal_request_id]
         self._live[internal_request_id] = (request, session_id, group_id, False)
+        # A held session, or one with CPU copies, ran a turn; released ones under pressure keep these.
+        if session_id in self._held or session_id in self._cpu_sessions:
+            self._requests_with_history.add(internal_request_id)
         if self._offload_connector is not None:
             group, _ = self._cpu_sessions.setdefault(session_id, (group_id, set()))
             assert group == group_id
@@ -166,6 +179,7 @@ class VLLMSessionKVHolder(Configurable):
             self._live.items()
         ):
             if internal_id not in self._scheduler.requests:
+                self._requests_with_history.discard(internal_id)
                 if internal_id in aborted_request_ids:
                     del self._live[internal_id]
                     self._drop_aborted_turn(request, session_id)
@@ -207,6 +221,31 @@ class VLLMSessionKVHolder(Configurable):
                 if self._block_pool.get_num_free_blocks() > free_before:
                     break
         self._evict_until_free()
+
+        now = time.monotonic()
+        if now >= self._next_stats_time:
+            self._next_stats_time = now + envs.VLLM_LOG_STATS_INTERVAL
+            self._refresh_stats()
+
+    def _refresh_stats(self) -> None:
+        """Count idle sessions' held blocks and waiting requests by history, for the stat logger."""
+        live_sessions = {session for _, session, _, _ in self._live.values()}
+        self.num_idle_held_blocks = len(
+            {
+                block.block_id
+                for session_id, blocks in self._held.items()
+                if session_id not in live_sessions
+                for block in blocks
+            }
+        )
+        scheduler = self._scheduler
+        waiting = [*scheduler.skipped_waiting, *scheduler.waiting]
+        with_history = sum(
+            request.request_id in self._requests_with_history for request in waiting
+        )
+        # In place: the stat logger holds this dict.
+        self.num_waiting_requests["yes"] = with_history
+        self.num_waiting_requests["no"] = len(waiting) - with_history
 
     def _evict_until_free(self) -> None:
         """Release sessions with no running request, idle longest first, until enough blocks are free.

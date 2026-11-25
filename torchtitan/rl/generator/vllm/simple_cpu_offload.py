@@ -9,8 +9,12 @@
 from __future__ import annotations
 
 import time
+from collections import deque
+from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING
 
+import torch
+import vllm.v1.simple_kv_offload.worker as simple_kv_offload_worker
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed import get_tp_group
@@ -18,6 +22,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload_connector import (
     SimpleCPUOffloadConnector as VllmSimpleCPUOffloadConnector,
 )
+from vllm.platforms import current_platform
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -27,6 +32,8 @@ from vllm.v1.core.kv_cache_utils import (
     make_block_hash_with_group_id,
 )
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend
+from vllm.v1.simple_kv_offload.cuda_mem_ops import copy_blocks
 
 from torchtitan.rl.generator.vllm.session_kv_holder import cached_block_ids
 
@@ -34,6 +41,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.outputs import KVConnectorOutput
     from vllm.v1.request import Request
     from vllm.v1.simple_kv_offload.metadata import SimpleCPUOffloadMetadata
 
@@ -52,6 +60,13 @@ class SimpleCPUOffloadConnector(VllmSimpleCPUOffloadConnector):
         num_stored_blocks                    blocks copied to the CPU
         num_cpu_gdn_state_blocks             CPU blocks of GDN state groups (vLLM `MambaSpec`),
                                              scanned every VLLM_LOG_STATS_INTERVAL seconds
+        load_waits_s                         per request with a CPU hit: admission to load done
+        cpu_block_metrics                    vLLM's sampled block lifetimes, on the CPU pool
+
+    The worker side, a separate object in the same process, times the copies:
+
+        copy_time_s{"load"|"store"}          seconds the copy streams spent copying blocks
+        copied_blocks{"load"|"store"}        blocks copied
     """
 
     def __init__(
@@ -76,6 +91,43 @@ class SimpleCPUOffloadConnector(VllmSimpleCPUOffloadConnector):
         self._gpu_block_pool: BlockPool | None = None
         # Prefix tokens the GPU and CPU caches served at admission, by request id.
         self._cached_tokens_at_admission: dict[str, int] = {}
+        # When each request with a CPU hit was admitted, until its load finishes.
+        self._load_start_times: dict[str, float] = {}
+        # The stat logger drains these on the engine thread.
+        self.load_waits_s: list[float] = []
+        self.cpu_block_metrics: KVCacheMetricsCollector | None = None
+        # Worker side: timed copy batches, oldest first, appended by vLLM's copy thread.
+        self.copy_time_s = {"load": 0.0, "store": 0.0}
+        self.copied_blocks = {"load": 0, "store": 0}
+        self._timed_copies: deque[_TimedCopy] = deque()
+
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
+        """Have vLLM's worker build a copy backend that times each copy batch."""
+        # TODO: delete when the vLLM pin includes vllm-project/vllm#41790, which times these copies
+        # in vLLM's own connector stats.
+        original_backend = simple_kv_offload_worker.DmaCopyBackend
+        simple_kv_offload_worker.DmaCopyBackend = lambda: _TimedDmaCopyBackend(
+            self._timed_copies
+        )
+        try:
+            super().register_kv_caches(kv_caches)
+        finally:
+            simple_kv_offload_worker.DmaCopyBackend = original_backend
+
+    def get_finished(
+        self, finished_req_ids: set[str]
+    ) -> tuple[set[str] | None, set[str] | None]:
+        """Report finished loads, and add the time of each finished copy batch."""
+        finished = super().get_finished(finished_req_ids)
+        # Batches finish in order on each stream; one still copying holds back later ones.
+        while self._timed_copies and self._timed_copies[0].end.query():
+            timed_copy = self._timed_copies.popleft()
+            direction = "store" if timed_copy.is_store else "load"
+            self.copy_time_s[direction] += (
+                timed_copy.start.elapsed_time(timed_copy.end) / 1000
+            )
+            self.copied_blocks[direction] += timed_copy.num_blocks
+        return finished
 
     def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
         """Count GPU block reuse through the pool's `metrics_collector` hook."""
@@ -93,12 +145,18 @@ class SimpleCPUOffloadConnector(VllmSimpleCPUOffloadConnector):
             cpu_block_pool=self.scheduler_manager.cpu_block_pool,
             counts=self.gpu_evicted_blocks,
         )
+        # vLLM's own collector, sampled: a store allocates a CPU block, a hit accesses it, and an
+        # overwrite evicts it.
+        self.cpu_block_metrics = KVCacheMetricsCollector()
+        self.scheduler_manager.cpu_block_pool.metrics_collector = self.cpu_block_metrics
 
     def update_state_after_alloc(
         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
     ) -> None:
-        """Record the prefix tokens cached at admission; count a broken prefix chain."""
+        """Record the prefix tokens cached at admission and a CPU load's start; count a broken prefix chain."""
         super().update_state_after_alloc(request, blocks, num_external_tokens)
+        if num_external_tokens > 0:
+            self._load_start_times.setdefault(request.request_id, time.monotonic())
 
         # vLLM calls this again once a CPU load finishes; only the first call admits.
         stats = request.prefill_stats
@@ -120,7 +178,17 @@ class SimpleCPUOffloadConnector(VllmSimpleCPUOffloadConnector):
     ) -> tuple[bool, dict[str, Any] | None]:
         # vLLM calls this one, not `request_finished`: this connector supports the hybrid allocator.
         self._cached_tokens_at_admission.pop(request.request_id, None)
+        self._load_start_times.pop(request.request_id, None)
         return super().request_finished_all_groups(request, block_ids)
+
+    def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
+        """Record how long each finished CPU load kept its request waiting."""
+        super().update_connector_output(connector_output)
+        now = time.monotonic()
+        for request_id in connector_output.finished_recving or ():
+            start = self._load_start_times.pop(request_id, None)
+            if start is not None:
+                self.load_waits_s.append(now - start)
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
@@ -279,8 +347,94 @@ class SimpleCPUOffloadConnector(VllmSimpleCPUOffloadConnector):
         gpu_pool.metrics_collector = counter
 
         cpu_pool = manager.cpu_block_pool
+        collector, cpu_pool.metrics_collector = cpu_pool.metrics_collector, None
         cpu_pool.evict_blocks(cached_block_ids(cpu_pool, block_hashes))
+        cpu_pool.metrics_collector = collector
         return not gpu_block_ids & saving
+
+
+@dataclass(frozen=True, slots=True)
+class _TimedCopy:
+    """One copy batch's timing events on its copy stream."""
+
+    start: torch.Event
+    end: torch.Event
+    num_blocks: int
+    is_store: bool
+
+
+class _TimedDmaCopyBackend(DmaCopyBackend):
+    """vLLM's DMA copy backend, with a timing event before and after each copy batch.
+
+    `get_finished` reads `start.elapsed_time(end)` once `end` is done, without a host sync.
+    """
+
+    def __init__(self, timed_copies: deque[_TimedCopy]) -> None:
+        super().__init__()
+        self._timed_copies = timed_copies
+
+    def launch_copy(
+        self,
+        src_blocks: list[int],
+        dst_blocks: list[int],
+        is_store: bool,
+        event_idx: int,
+        events_list: list[tuple[int, torch.Event]],
+        wait_event: torch.Event | None = None,
+    ) -> None:
+        params = self._store_params if is_store else self._load_params
+        # `_copy_loop` is a staticmethod: it gets the timing deque in the queue item.
+        self._queue.put(
+            (
+                src_blocks,
+                dst_blocks,
+                params,
+                is_store,
+                event_idx,
+                events_list,
+                wait_event,
+                self._timed_copies,
+            )
+        )
+
+    @staticmethod
+    def _copy_loop(
+        q,
+        device: torch.device,
+        load_stream: torch.cuda.Stream,
+        store_stream: torch.cuda.Stream,
+    ) -> None:
+        """vLLM's `DmaCopyBackend._copy_loop`, plus the two timing events."""
+        current_platform.set_device(device)
+        while True:
+            item = q.get()
+            if item is None:
+                return
+            (
+                src_blocks,
+                dst_blocks,
+                params,
+                is_store,
+                event_idx,
+                events_list,
+                wait_event,
+                timed_copies,
+            ) = item
+            stream = store_stream if is_store else load_stream
+            if wait_event is not None:
+                stream.wait_event(wait_event)
+            # After the wait for compute, so the time is the copy's own.
+            start = torch.Event(enable_timing=True)
+            start.record(stream)
+            copy_blocks(src_blocks, dst_blocks, params)
+            end = torch.Event(enable_timing=True)
+            end.record(stream)
+            events_list.append((event_idx, end))
+            timed_copies.append(
+                _TimedCopy(
+                    start=start, end=end, num_blocks=len(src_blocks), is_store=is_store
+                )
+            )
 
 
 class _CPUCopyEvictionCounter(KVCacheMetricsCollector):

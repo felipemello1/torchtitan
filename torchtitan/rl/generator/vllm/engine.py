@@ -24,6 +24,7 @@ import torch.distributed as dist
 from vllm import EngineArgs, LLMEngine, SamplingParams
 from vllm.config import AttentionConfig, KVTransferConfig
 from vllm.distributed import get_world_group
+from vllm.distributed.kv_transfer import get_kv_transfer_group
 from vllm.exceptions import VLLMClientError
 from vllm.inputs import EngineInput
 from vllm.outputs import RequestOutput
@@ -538,8 +539,14 @@ class VLLMEngine(GenerationEngine):
                 scheduler=scheduler, offload_connector=offload_connector
             )
         if self._otel_stat_logger is not None:
+            # With external_launcher the worker runs in this process: its side of the connector
+            # (the KV transfer group) times the CPU copies.
             self._otel_stat_logger.observe_kv_reuse(
-                holder=self._session_kv_holder, connector=offload_connector
+                holder=self._session_kv_holder,
+                connector=offload_connector,
+                worker_connector=(
+                    get_kv_transfer_group() if offload_connector is not None else None
+                ),
             )
 
     @staticmethod

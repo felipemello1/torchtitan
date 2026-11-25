@@ -462,6 +462,9 @@ def test_observe_kv_reuse_exports_holder_and_connector_counters(
         num_evicted=2,
         num_reusable_prefix_tokens=640,
         num_lost_prefix_tokens=64,
+        num_idle_held_blocks=5,
+        num_gpu_blocks=3411,
+        num_waiting_requests={"yes": 1, "no": 2},
     )
     connector = SimpleNamespace(
         gpu_evicted_blocks={"yes": 5, "no": 1},
@@ -470,8 +473,15 @@ def test_observe_kv_reuse_exports_holder_and_connector_counters(
         num_stored_blocks=9,
         num_cpu_gdn_state_blocks=3,
     )
+    worker_connector = SimpleNamespace(
+        copy_time_s={"load": 0.5, "store": 1.5}, copied_blocks={"load": 4, "store": 9}
+    )
 
-    log.observe_kv_reuse(holder=holder, connector=connector if with_connector else None)
+    log.observe_kv_reuse(
+        holder=holder,
+        connector=connector if with_connector else None,
+        worker_connector=worker_connector if with_connector else None,
+    )
     # Plain ints change on the engine thread; the exporter reads them at collection.
     holder.num_evicted = 3
     connector.gpu_evicted_blocks["no"] = 4
@@ -485,7 +495,11 @@ def test_observe_kv_reuse_exports_holder_and_connector_counters(
             name
             for name in points
             if name.startswith(("vllm.session_kv.", "vllm.cpu_kv."))
-        } == {"vllm.session_kv.held_blocks", "vllm.session_kv.evicted_sessions"}
+        } == {
+            "vllm.session_kv.held_blocks",
+            "vllm.session_kv.evicted_sessions",
+            "vllm.session_kv.idle_held_blocks",
+        }
         return
 
     values = {
@@ -521,3 +535,9 @@ def test_observe_kv_reuse_exports_holder_and_connector_counters(
         "hole": 48,
         "no_state": 0,
     }
+    assert by_attribute("vllm.waiting_requests", "history") == {"yes": 1, "no": 2}
+    assert by_attribute("vllm.cpu_kv.copy_time", "direction") == {
+        "load": 0.5,
+        "store": 1.5,
+    }
+    assert points["vllm.kv.num_gpu_blocks"][0]["value"] == 3411
