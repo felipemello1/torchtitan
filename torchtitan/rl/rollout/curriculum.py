@@ -12,6 +12,7 @@ from typing import Any
 from torch.distributed.checkpoint.stateful import Stateful
 
 from torchtitan.config import Configurable
+from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout.types import RolloutGroup
 
 
@@ -22,6 +23,7 @@ class Curriculum(Stateful, Configurable):
     1. `prepare` rewrites a sample right before its group is rolled out.
     2. `summarize` keeps what `update` needs from the finished group.
     3. `update` gets the summaries of the groups each train step trained, right before the checkpoint.
+    4. `metrics` returns what to log with that train step.
     All hooks run on the controller's event loop; keep them cheap.
 
     Example:
@@ -84,6 +86,10 @@ class Curriculum(Stateful, Configurable):
 
         Zero-std groups left out of the loss count as trained; a group whose rollout raised has no summary.
         """
+
+    def metrics(self) -> list[m.Metric]:
+        """Metrics for the train step `update` last ran for, e.g. how many tasks each difficulty holds."""
+        return []
 
     def state_dict(self) -> dict[str, Any]:
         return {}

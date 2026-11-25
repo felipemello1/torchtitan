@@ -121,6 +121,9 @@ def _controller(
     controller._rollouter = SimpleNamespace(
         sync_log_step=sync_log_step,
         commit_training_sample_ids=lambda group_ids: None,
+        curriculum_metrics=lambda: [
+            m.Metric("curriculum/pool/solved", m.NoReduce(3.0))
+        ],
         state_dict=lambda: {},
     )
     controller._group_buffer = SimpleNamespace(
@@ -194,6 +197,16 @@ def test_push_then_pull_then_release_after_each_optimizer_step() -> None:
         "pull 2",
         "release 5 trained",
     ]
+
+
+def test_each_step_logs_the_curriculum_metrics() -> None:
+    controller = _controller([])
+    _run(controller, num_training_steps=2)
+
+    assert [
+        "curriculum/pool/solved" in step_metrics
+        for step_metrics in controller.logged_metrics
+    ] == [True, True]
 
 
 def test_forward_backward_waits_for_the_previous_push() -> None:
