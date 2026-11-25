@@ -192,6 +192,12 @@ class DAPOLoss(Loss[torch.Tensor]):
                     global_loss_token_counts,
                 ),
                 "bit_wise/logprob_diff/max": diff_for_metrics.abs().max(),
+                # Share of loss tokens whose trainer-generator logprob gap is above 4 nats: one model
+                # gives the token over 50x (e^4) the probability the other gives.
+                "bit_wise/logprob_diff/frac_above_4_nats/mean": normalize(
+                    (diff_for_metrics.abs() > 4.0).float().sum(),
+                    global_loss_token_counts,
+                ),
                 # Mean entropy of softmax(logits / temperature) over tokens used by the loss.
                 "trainer/entropy/mean": normalize(
                     (token_entropy * effective_loss_mask).sum(),

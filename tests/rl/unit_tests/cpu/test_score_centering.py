@@ -275,6 +275,9 @@ def test_score_centering_skips_masked_and_non_finite_tokens() -> None:
     loss_inputs["generator_topk_logprobs"][:2] = 0.0
     loss_inputs["generator_logprobs"][2] = float("nan")
     loss_inputs["generator_topk_logprobs"][2] = float("nan")
+    # Row 3's trainer logprob is 5 nats above the generator's.
+    trainer_logprob_3 = torch.log_softmax(logits.detach()[3], dim=-1)[labels[3]]
+    loss_inputs["generator_logprobs"][3] = trainer_logprob_3 - 5.0
 
     loss, metrics = ScoreCenteringLoss.Config().build()(
         logits, labels, torch.tensor(3), **loss_inputs
@@ -285,6 +288,10 @@ def test_score_centering_skips_masked_and_non_finite_tokens() -> None:
     assert has_grad.tolist() == [False, False, False, True, True, True]
     assert torch.isfinite(loss)
     assert all(torch.isfinite(value) for value in metrics.values())
+    # Of the 3 loss tokens, only row 3 is above 4 nats; the NaN row doesn't count.
+    assert metrics[
+        "bit_wise/logprob_diff/frac_above_4_nats/mean"
+    ].item() == pytest.approx(1 / 3)
 
 
 def test_score_centering_through_chunked_loss_wrapper_matches_unchunked() -> None:

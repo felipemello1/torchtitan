@@ -97,6 +97,10 @@ def test_ratio_mask_drops_tokens_outside_band(config_cls) -> None:
     # Masked tokens stay in the denominator, so kept tokens' gradients are unchanged.
     assert torch.equal(grad_on[4:], grad_off[4:])
     assert metrics_on.pop("loss/ratio_masked_frac").item() == pytest.approx(4 / 6)
+    # Only token 1 is above 4 nats (log 100 = 4.6); token 6 is not a loss token.
+    assert metrics_off[
+        "bit_wise/logprob_diff/frac_above_4_nats/mean"
+    ].item() == pytest.approx(1 / 6)
     # The other metrics still see every loss token.
     assert metrics_on.keys() == metrics_off.keys()
     for key in metrics_off.keys() - {"loss/mean"}:
