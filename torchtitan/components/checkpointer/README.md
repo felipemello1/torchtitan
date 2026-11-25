@@ -70,7 +70,19 @@ Remove it again afterwards. Left in place it cold-starts the EMA on *every*
 later resume, discarding all EMA history each time (this is logged as a
 warning).
 
-5. EXAMPLE CHECKPOINT CONFIGURATION
+5. WRITE EACH RANK'S SAVE WITH SEVERAL THREADS
+Each rank writes its save on one thread by default. When one write stream can't fill the storage, e.g. NFS with several connections, raise `file_write_workers`:
+```python
+checkpointer=CheckpointManager.Config(
+    interval=500,
+    file_write_workers=8,
+),
+```
+`CheckpointManager` then writes 8 files per rank, split by size. `TorchCheckpointingManager` writes one file per item (model, optimizer, ...), so it uses at most one thread per item.
+
+`TorchCheckpointingManager` also writes with O_DIRECT by default, which skips the page cache. On NFS, set `file_write_direct_io=False` for faster buffered writes.
+
+6. EXAMPLE CHECKPOINT CONFIGURATION
 ```python
 checkpointer=CheckpointManager.Config(
     interval=10,

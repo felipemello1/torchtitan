@@ -696,6 +696,15 @@ class BaseCheckpointManager(Configurable, ABC):
         """Save mode: synchronous, threaded async, or pinned-memory async. A
         checkpoint manager raises on a mode it does not support."""
 
+        file_write_workers: int = 1
+        """Threads that write one rank's save in parallel. Raise it (4-8) when one
+        write stream can't fill the storage, e.g. NFS with several connections.
+
+            CheckpointManager: N threads write N files per rank, split by size.
+            TorchCheckpointingManager: one thread per file and one file per item
+                (model, optimizer, ...), so threads past the item count add nothing.
+        """
+
         def __post_init__(self) -> None:
             async_lowered = self.async_mode.lower()
             if async_lowered not in ("disabled", "async", "async_with_pinned_mem"):
@@ -713,6 +722,10 @@ class BaseCheckpointManager(Configurable, ABC):
                 raise ValueError(
                     "We need to maintain at least 2 checkpoint replicas, "
                     "as the last one may be in the process of being saved."
+                )
+            if self.file_write_workers < 1:
+                raise ValueError(
+                    f"file_write_workers must be at least 1, got {self.file_write_workers}."
                 )
             if MODEL in self.exclude_from_loading:
                 raise ValueError(f"{MODEL} key shouldn't be in exclude_from_loading.")

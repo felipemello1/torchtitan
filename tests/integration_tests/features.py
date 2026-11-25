@@ -235,6 +235,7 @@ def llama3_debugmodel_full_checkpoint_save() -> Trainer.Config:
     config.checkpointer = CheckpointManager.Config(
         interval=10,
         last_save_model_only=False,
+        file_write_workers=4,
     )
     return config
 

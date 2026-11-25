@@ -19,7 +19,12 @@ from typing import Any, cast, TYPE_CHECKING
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
-from torch.distributed.checkpoint import HuggingFaceStorageWriter, Metadata
+from torch.distributed.checkpoint import (
+    FileSystemWriter,
+    FsspecWriter,
+    HuggingFaceStorageWriter,
+    Metadata,
+)
 from torch.distributed.checkpoint._consolidate_hf_safetensors import (
     consolidate_safetensors_files_on_every_rank,
 )
@@ -178,6 +183,7 @@ class CheckpointManager(BaseCheckpointManager):
         self.last_save_model_only = config.last_save_model_only
         self.last_save_in_hf = config.last_save_in_hf
         self.export_dtype = TORCH_DTYPE_MAP[config.export_dtype]
+        self.file_write_workers = config.file_write_workers
 
         self.sd_adapter = sd_adapter
         if self.last_save_in_hf and self.sd_adapter is None:
@@ -269,7 +275,7 @@ class CheckpointManager(BaseCheckpointManager):
 
         ret: Future | AsyncSaveResponse | Metadata | None = None
 
-        storage_writer: HuggingFaceStorageWriter | None = None
+        storage_writer: FileSystemWriter
         fqn_to_index_mapping: dict[Any, int] | None = None
 
         # HF Format Conversion
@@ -289,6 +295,7 @@ class CheckpointManager(BaseCheckpointManager):
                 save_distributed=True,
                 fqn_to_index_mapping=fqn_to_index_mapping,
                 enable_consolidation=not fqn_to_index_mapping,
+                thread_count=self.file_write_workers,
             )
             # NOTE: If `fqn_to_index_mapping` is absent, all FQNs are saved into a
             # single unified file. In this case, the StorageWriter can handle
@@ -297,6 +304,16 @@ class CheckpointManager(BaseCheckpointManager):
             # The internal consolidation is disabled here and instead
             # `consolidate_safetensors_files_on_every_rank` is used later to manage
             # the multi-file merging process.
+        else:
+            # The writer DCP picks for this path, with `file_write_workers` threads.
+            writer_class = (
+                FsspecWriter
+                if filesystem.is_remote(checkpoint_id)
+                else FileSystemWriter
+            )
+            storage_writer = writer_class(
+                checkpoint_id, thread_count=self.file_write_workers
+            )
 
         # Execution Dispatch
         checkpoint_save_id = (
@@ -304,12 +321,27 @@ class CheckpointManager(BaseCheckpointManager):
         )  # for HF the storage_writer handles the path
 
         if async_mode == AsyncMode.ASYNC:
+            # Stage with the stager DCP builds when given no writer. Given a writer,
+            # async_save stages with it (FileSystemWriter is also a stager), which
+            # copies each DTensor ~3x and keeps 0-d DTensors by reference.
+            stager = DefaultStager(
+                StagingOptions(
+                    use_pinned_memory=False,
+                    use_shared_memory=False,
+                    use_async_staging=False,
+                    use_non_blocking_copy=False,
+                )
+            )
             ret = dcp.async_save(
                 state_dict,
                 storage_writer=storage_writer,
                 checkpoint_id=checkpoint_save_id,
                 process_group=self.pg,
+                async_stager=stager,
             )
+            # Drop the stager's cache of the CPU copies. Staging ran synchronously,
+            # and the background write holds its own references to the copies.
+            stager.close()
         elif async_mode == AsyncMode.ASYNC_WITH_PINNED_MEM:
             ret = dcp.async_save(
                 state_dict,
@@ -395,6 +427,9 @@ class CheckpointManager(BaseCheckpointManager):
             )
             states[MODEL].load_state_dict(state_dict)
         else:
+            # TODO: read with several threads, as `file_write_workers` does for
+            # saves, once DCP's FileSystemReader takes a thread count. It has none
+            # on PyTorch main (94957ce4146).
             dcp.load(state_dict, checkpoint_id=checkpoint_id)
 
             # TODO: Since we flatten the model states in state_dict, we need to
