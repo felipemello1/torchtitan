@@ -528,6 +528,10 @@ class Generator(Configurable):
 
         A no-op with ``model_state_dict_load_mode="gpu_fetch"``: the load reads the weights.
         """
+        # TODO: requests vLLM admits from its waiting queue during this prefetch prefill on the
+        #   old weights, one policy version older than needed. Pausing that queue on every TP rank
+        #   meanwhile (vLLM's PauseState.PAUSED_NEW) stops it; needs an engine method, an engine
+        #   loop decision and an SGLang path.
         if self.config.model_state_dict_load_mode == "gpu_fetch":
             return
         if self._model_state_dict_transport is not None:
