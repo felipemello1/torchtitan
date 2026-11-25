@@ -15,7 +15,6 @@ from typing import Any, cast, Literal
 
 from renderers import Message, ToolSpec
 
-from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.checkpointer.torch_checkpointing import (
     TorchCheckpointingManager,
 )
@@ -323,16 +322,13 @@ def muse_spark_816b_a42b(
             disable_accelerator_graphs=True,
         ),
         parallelism=parallelism,
-        checkpointer=cast(
-            CheckpointManager.Config,
-            TorchCheckpointingManager.Config(
-                folder="muse_spark_816b_a42b",
-                interval=2000,
-                initial_load_model_only=True,
-                initial_load_in_hf=True,
-                last_save_model_only=False,
-                keep_latest_k=2,
-            ),
+        checkpointer=TorchCheckpointingManager.Config(
+            folder="muse_spark_816b_a42b",
+            interval=2000,
+            initial_load_model_only=True,
+            initial_load_in_hf=True,
+            last_save_model_only=False,
+            keep_latest_k=2,
         ),
         activation_remat=DefaultActivationRematConfig(),
         override=OverrideConfig(
@@ -744,23 +740,20 @@ def muse_spark_816b_a42b_ultradata_lora_sft_cp16_128k() -> Trainer.Config:
         dtype="bfloat16", param_dtype="bfloat16", reduce_dtype="float32"
     )
     config.debug.seed = 42
-    config.checkpointer = cast(
-        CheckpointManager.Config,
-        TorchCheckpointingManager.Config(
-            folder=os.environ.get(
-                "MUSE_SPARK_CHECKPOINT_FOLDER",
-                "muse_spark_ultradata_lora_cp16_128k",
-            ),
-            initial_load_path=os.path.abspath(config.hf_assets_path),
-            initial_load_model_only=True,
-            initial_load_in_hf=True,
-            interval=100,
-            load_only=False,
-            keep_latest_k=2,
-            last_save_model_only=False,
-            last_save_in_hf=False,
-            export_dtype="bfloat16",
+    config.checkpointer = TorchCheckpointingManager.Config(
+        folder=os.environ.get(
+            "MUSE_SPARK_CHECKPOINT_FOLDER",
+            "muse_spark_ultradata_lora_cp16_128k",
         ),
+        initial_load_path=os.path.abspath(config.hf_assets_path),
+        initial_load_model_only=True,
+        initial_load_in_hf=True,
+        interval=100,
+        load_only=False,
+        keep_latest_k=2,
+        last_save_model_only=False,
+        last_save_in_hf=False,
+        export_dtype="bfloat16",
     )
     config = apply_gb300_lora_dist_moe(config, _ultradata_lora_sft_transform())
     # VarlenInnerAttention defaults to cuDNN first; on the 128k global layers it is ~13% slower than FA4.

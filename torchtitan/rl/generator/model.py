@@ -23,7 +23,7 @@ from torch.distributed.tensor import DTensor
 # Registers the "loss" local-compile region. The generator shares the trainer's
 # model config, whose local_compile.regions may name it, but never builds a loss.
 from torchtitan.components import loss as _loss  # noqa: F401
-from torchtitan.components.checkpointer import CheckpointManager
+from torchtitan.components.checkpointer import BaseCheckpointManager
 from torchtitan.components.checkpointer.utils import canonical_fqn
 from torchtitan.config import PrecisionConfig, TORCH_DTYPE_MAP
 from torchtitan.distributed.fsdp import maybe_store_frozen_params_in_param_dtype_
@@ -390,11 +390,11 @@ def validate_ep_token_dispatcher_capacity(
 
 def _load_initial_weights(
     model: Decoder,
-    checkpointer_config: CheckpointManager.Config,
+    checkpointer_config: BaseCheckpointManager.Config,
     *,
     hf_assets_path: str,
 ) -> None:
-    """Load the initial weights of ``model`` with a model-only ``CheckpointManager``."""
+    """Load the initial weights of ``model`` with a model-only checkpoint manager."""
     adapter_cls = type(model).state_dict_adapter_cls
     sd_adapter = None
     if adapter_cls is not None:
@@ -404,7 +404,7 @@ def _load_initial_weights(
             hf_assets_path=checkpointer_config.initial_load_path or hf_assets_path,
         )
 
-    # Model-only CheckpointManager: initial_load_model_only=True (default)
+    # Model-only checkpoint manager: initial_load_model_only=True (default)
     # ensures only MODEL state is loaded, so None optimizer/lr_scheduler
     # are never accessed.
     checkpointer = checkpointer_config.build(
@@ -452,7 +452,7 @@ class ModelStateDictLoader:
         self,
         model: Decoder,
         *,
-        checkpointer_config: CheckpointManager.Config | None,
+        checkpointer_config: BaseCheckpointManager.Config | None,
         model_state_dict_load_mode: ModelStateDictLoadMode,
         frozen_param_keys: frozenset[str],
         hf_assets_path: str,

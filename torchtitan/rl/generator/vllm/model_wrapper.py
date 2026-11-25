@@ -24,7 +24,7 @@ from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.utils import torch_utils as _torch_utils
 
-from torchtitan.components.checkpointer import CheckpointManager
+from torchtitan.components.checkpointer import BaseCheckpointManager
 from torchtitan.config import PrecisionConfig, TORCH_DTYPE_MAP
 from torchtitan.distributed import maybe_apply_numa_binding
 from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
@@ -274,7 +274,7 @@ class VLLMModelWrapper(Module):
         model_config: Decoder.Config,
         parallelism: InferenceParallelismConfig,
         precision: PrecisionConfig,
-        checkpointer_config: CheckpointManager.Config | None,
+        checkpointer_config: BaseCheckpointManager.Config | None,
         vllm_config: VllmConfig,
         prefix: str = "",
         dist_moe_runtime: DistMoeRuntime.Config | None = None,

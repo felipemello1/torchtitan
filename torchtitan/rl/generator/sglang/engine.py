@@ -44,7 +44,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils.common import next_power_of_2
 
-from torchtitan.components.checkpointer import CheckpointManager
+from torchtitan.components.checkpointer import BaseCheckpointManager
 from torchtitan.components.data.multimodal.vision_processor import VisionProcessor
 from torchtitan.config import DebugConfig, PrecisionConfig
 from torchtitan.models.common.attention.kda import KDA
@@ -218,7 +218,7 @@ class SGLangEngine(GenerationEngine):
         precision: PrecisionConfig,
         gpu_memory_limit: float,
         max_num_batched_tokens: int | None,
-        checkpointer: CheckpointManager.Config | None,
+        checkpointer: BaseCheckpointManager.Config | None,
         dist_moe_runtime: DistMoeRuntime.Config | None,
         debug: DebugConfig,
         reset_kv_cache_on_model_state_dict_load: bool,

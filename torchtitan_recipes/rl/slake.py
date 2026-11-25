@@ -15,9 +15,6 @@ Run with ``--module torchtitan_recipes.rl.slake --config rl_muse_spark_816b_a42b
 
 from __future__ import annotations
 
-from typing import cast
-
-from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.checkpointer.torch_checkpointing import (
     TorchCheckpointingManager,
 )
@@ -132,9 +129,8 @@ def rl_muse_spark_816b_a42b_slake_lora_gb300(
         seq_len=max_total_tokens,
         attn_backend="varlen",
     )
-    hf_checkpoint = cast(
-        CheckpointManager.Config,
-        TorchCheckpointingManager.Config(initial_load_in_hf=True, load_only=True),
+    hf_checkpoint = TorchCheckpointingManager.Config(
+        initial_load_in_hf=True, load_only=True
     )
     config = Controller.Config(
         hf_assets_path=hf_assets_path,

@@ -30,7 +30,7 @@ import logging
 import os
 from typing import Any, TYPE_CHECKING
 
-from torchtitan.components.checkpointer import CheckpointManager
+from torchtitan.components.checkpointer import BaseCheckpointManager
 from torchtitan.config import PrecisionConfig
 from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
 from torchtitan.models.common.attention import (
@@ -220,7 +220,7 @@ def register_to_vllm(
     *,
     parallelism: InferenceParallelismConfig,
     precision: PrecisionConfig,
-    checkpointer_config: CheckpointManager.Config | None,
+    checkpointer_config: BaseCheckpointManager.Config | None,
     dist_moe_runtime: DistMoeRuntime.Config | None = None,
     model_state_dict_load_mode: ModelStateDictLoadMode,
     vision_processor: VisionProcessor.Config | None = None,
@@ -260,7 +260,7 @@ def register_to_vllm(
             layout matches.
         precision: The trainer's dtypes, which the wrapper's model mirrors. The
             caller passes ``precision.param_dtype`` as ``EngineArgs.dtype``.
-        checkpointer_config: Optional CheckpointManager configuration for
+        checkpointer_config: Optional checkpoint manager configuration for
             initial weight loading. Pass ``None`` for the RL loop, where
             weights arrive from TorchStore.
         dist_moe_runtime: ``DistMoeRuntime.Config(inference=True)`` for models

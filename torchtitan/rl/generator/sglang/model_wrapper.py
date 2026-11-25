@@ -21,7 +21,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner_utils.forward_batch import set_forward_batch
 from sglang.srt.runtime_context import get_parallel, get_schedule
 
-from torchtitan.components.checkpointer import CheckpointManager
+from torchtitan.components.checkpointer import BaseCheckpointManager
 from torchtitan.config import PrecisionConfig
 from torchtitan.distributed import maybe_apply_numa_binding
 from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
@@ -336,7 +336,7 @@ class SGLangModelWrapper(Module):
         model_config: Decoder.Config,
         parallelism: InferenceParallelismConfig,
         precision: PrecisionConfig,
-        checkpointer_config: CheckpointManager.Config | None,
+        checkpointer_config: BaseCheckpointManager.Config | None,
         dist_moe_runtime: DistMoeRuntime.Config | None,
         model_state_dict_load_mode: ModelStateDictLoadMode,
         hf_assets_path: str,

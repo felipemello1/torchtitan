@@ -13,7 +13,6 @@ from typing import Any, cast, Literal
 
 from renderers import CustomRendererConfig, Message
 
-from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.checkpointer.torch_checkpointing import (
     TorchCheckpointingManager,
 )
@@ -376,16 +375,13 @@ def _muse_glimmer_30b_slake_sft(variant: _SlakeVariant) -> Trainer.Config:
     config.metrics.log_freq = 1
     config.metrics.loggers = [TensorBoardLogger.Config()]
     config.optim = _slake_lora_optim(variant)
-    config.checkpointer = cast(
-        CheckpointManager.Config,
-        TorchCheckpointingManager.Config(
-            folder=f"muse_glimmer_slake_{variant}",
-            interval=2000,
-            initial_load_model_only=True,
-            initial_load_in_hf=True,
-            last_save_model_only=False,
-            keep_latest_k=2,
-        ),
+    config.checkpointer = TorchCheckpointingManager.Config(
+        folder=f"muse_glimmer_slake_{variant}",
+        interval=2000,
+        initial_load_model_only=True,
+        initial_load_in_hf=True,
+        last_save_model_only=False,
+        keep_latest_k=2,
     )
     root = os.environ.get("MUSE_GLIMMER_SLAKE_PATH", _SLAKE_DATASET_PATH)
     dataset = _slake_dataset(
