@@ -367,7 +367,8 @@ class VLLMEngine(GenerationEngine):
           default for drafts (see `_build_engine_args`).
         - With `cuda_graph.mode="FULL"`, every target step replays a FULL graph and the
           drafter replays piecewise graphs (`VLLMCudaGraphConfig.mode`).
-        - Not supported with `debug.batch_invariant` or models with a vision encoder."""
+        - Not supported with `debug.batch_invariant`, generator data parallelism > 1, or
+          models with a vision encoder."""
 
     def __init__(
         self,
@@ -427,6 +428,13 @@ class VLLMEngine(GenerationEngine):
                 f"num_speculative_tokens={config.num_speculative_tokens} needs "
                 "debug.batch_invariant=False: the target verifies 1 + k tokens per step "
                 "with kernels the trainer does not run"
+            )
+        if config.num_speculative_tokens > 0 and parallelism.data_parallel_degree > 1:
+            raise ValueError(
+                f"num_speculative_tokens={config.num_speculative_tokens} needs "
+                f"data_parallel_degree=1, got {parallelism.data_parallel_degree}: drafts at "
+                "DP > 1 are untested (verify graphs padded to a peer rank's size, idle ranks' "
+                "dummy batches)"
             )
 
         if config.kv_cache_dtype == "fp8":
