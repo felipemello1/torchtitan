@@ -33,6 +33,7 @@ from torchtitan.rl.model_state_dict_transport import (
     TensorShard,
     TrainerSource,
 )
+from torchtitan.rl.observability.metrics import host_memory_available_gib
 from torchtitan.rl.trainer.batcher import TrainingMicrobatch
 from torchtitan.rl.trainer.rdma_microbatch import (
     RDMAMicrobatch,
@@ -410,6 +411,11 @@ class Trainer(Configurable):
         engine.step_profiler()
         device_mem_stats = engine.device_memory_monitor.get_peak_stats()
         engine.device_memory_monitor.reset_peak_stats()
+        # The smallest over the trainer's hosts (min = -max(-x)): the controller logs rank 0's metrics only.
+        min_host_memory_available_gib = -dist_utils.dist_max(
+            torch.tensor(-host_memory_available_gib(), device=engine.device),
+            engine.parallelism_context.world_mesh,
+        )
 
         logger.debug(
             f"{os.getpid()=} Trainer optim_step done, "
@@ -434,6 +440,7 @@ class Trainer(Configurable):
                     device_mem_stats.num_alloc_retries
                 ),
                 "trainer/memory/num_ooms": float(device_mem_stats.num_ooms),
+                "trainer/host_memory_available_gib": min_host_memory_available_gib,
                 **collect_aux_loss_metrics(engine.parallelism_context),
                 **(
                     {"trainer/mfu_percent": performance["mfu_percent"]}
