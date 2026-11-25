@@ -14,7 +14,10 @@ from unittest.mock import patch
 import pytest
 import torch
 from torchtitan.rl.generator.vllm import simple_cpu_offload
-from torchtitan.rl.generator.vllm.session_kv_holder import VLLMSessionKVHolder
+from torchtitan.rl.generator.vllm.session_kv_holder import (
+    cached_block_ids,
+    VLLMSessionKVHolder,
+)
 from vllm.config import (
     CacheConfig,
     DeviceConfig,
@@ -35,7 +38,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
 )
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
 from vllm.v1.simple_kv_offload.metadata import SimpleCPUOffloadWorkerMetadata
 from vllm.v1.structured_output import StructuredOutputManager
 
@@ -134,10 +137,15 @@ def scheduler(tmp_path, monkeypatch) -> Scheduler:
 
 
 def _step(
-    scheduler: Scheduler, holder: VLLMSessionKVHolder, loads_in_flight: set[str]
+    scheduler: Scheduler,
+    holder: VLLMSessionKVHolder,
+    loads_in_flight: set[str],
+    abort_request_id: str | None = None,
 ) -> set[str]:
     """One engine step. The fake model runner samples token 7, finishes this step's CPU stores,
     and finishes the CPU loads of the step before, so loading blocks stay pinned for a step.
+    `abort_request_id` is aborted at its first token, as `VLLMEngine.step` aborts a request whose
+    logprob is not finite.
 
     Returns the requests whose CPU load starts this step.
     """
@@ -170,7 +178,12 @@ def _step(
             ),
         ),
     )
-    holder.after_step()
+    aborted_request_ids = set()
+    request = scheduler.requests.get(abort_request_id)
+    if request is not None and request.num_output_tokens > 0:
+        scheduler.finish_requests(abort_request_id, RequestStatus.FINISHED_ABORTED)
+        aborted_request_ids.add(abort_request_id)
+    holder.after_step(aborted_request_ids)
     return new_loads
 
 
@@ -205,3 +218,98 @@ def test_fresh_prompt_and_full_gpu_hit_count_no_broken_chain(scheduler):
     assert holder.num_reusable_prefix_tokens > 0 and holder.num_lost_prefix_tokens == 0
     assert connector.broken_chain_requests == {"hole": 0, "no_state": 0}
     assert connector.broken_chain_tokens == {"hole": 0, "no_state": 0}
+
+
+def test_non_finite_abort_uncaches_the_sessions_kv_and_keeps_other_sessions(
+    scheduler, monkeypatch
+):
+    # GRPO siblings s0 and s1 share a 32-token prompt; s2 has its own. The engine aborts s0's
+    # second turn at its first token, after it loaded its history from the CPU.
+    connector = scheduler.connector
+    holder = VLLMSessionKVHolder.Config().build(
+        scheduler=scheduler, offload_connector=connector
+    )
+    gpu_pool = scheduler.kv_cache_manager.block_pool
+    cpu_pool = connector.scheduler_manager.cpu_block_pool
+    block_hasher = get_request_block_hasher(BLOCK, sha256)
+    loads_in_flight: set[str] = set()
+
+    # Prefix tokens the GPU and CPU served each turn at admission (the holder pops them at prefill).
+    cached_tokens = {}
+    pop_cached_tokens = connector.pop_cached_tokens
+
+    def recording_pop_cached_tokens(request_id: str) -> int | None:
+        cached_tokens[request_id] = pop_cached_tokens(request_id)
+        return cached_tokens[request_id]
+
+    monkeypatch.setattr(connector, "pop_cached_tokens", recording_pop_cached_tokens)
+
+    # The GPU and CPU copies of s1's and s2's KV just before and after the step that drops s0's.
+    other_hashes: set[bytes] = set()
+    other_copies = []
+    after_step = holder.after_step
+
+    def cached_other_copies() -> tuple[set[int], set[int]]:
+        return (
+            cached_block_ids(gpu_pool, other_hashes),
+            cached_block_ids(cpu_pool, other_hashes),
+        )
+
+    def after_step_recording_other_copies(aborted_request_ids=()):
+        if aborted_request_ids:
+            other_copies.append(cached_other_copies())
+        after_step(aborted_request_ids)
+        if aborted_request_ids:
+            other_copies.append(cached_other_copies())
+
+    monkeypatch.setattr(holder, "after_step", after_step_recording_other_copies)
+
+    def run_turn(request_id, session_id, group_id, prompt, abort=False) -> Request:
+        nonlocal loads_in_flight
+        request = Request(
+            request_id=request_id,
+            prompt_token_ids=list(prompt),
+            sampling_params=SamplingParams(max_tokens=4, ignore_eos=True),
+            pooling_params=None,
+            block_hasher=block_hasher,
+        )
+        scheduler.add_request(request)
+        holder.track(request_id, session_id=session_id, group_id=group_id)
+        while request_id in scheduler.requests:
+            loads_in_flight = _step(
+                scheduler, holder, loads_in_flight, request_id if abort else None
+            )
+        return request
+
+    shared = list(range(100, 132))
+    s0_first = run_turn("s0/t0", "s0", 0, shared + list(range(200, 240)))
+    s1_first = run_turn("s1/t0", "s1", 0, shared + list(range(400, 440)))
+    s2_first = run_turn("s2/t0", "s2", 1, list(range(600, 672)))
+    # A long prompt makes the holder evict the three sessions, and their KV goes to the CPU.
+    run_turn("f/t0", "f", 2, list(range(800, 1300)))
+    s0_only_hashes = set(s0_first.block_hashes) - set(s1_first.block_hashes)
+    assert cached_block_ids(cpu_pool, s0_only_hashes)
+    assert not cached_block_ids(gpu_pool, s0_only_hashes)
+
+    other_hashes.update(s1_first.block_hashes, s2_first.block_hashes)
+    aborted = run_turn(
+        "s0/t1",
+        "s0",
+        0,
+        list(s0_first.all_token_ids) + list(range(300, 348)),
+        abort=True,
+    )
+    s0_only_hashes |= set(aborted.block_hashes) - set(s1_first.block_hashes)
+    assert not cached_block_ids(gpu_pool, s0_only_hashes)
+    assert not cached_block_ids(cpu_pool, s0_only_hashes)
+    assert not holder.has_pending_work
+    before, after = other_copies
+    assert before == after and before[0] and before[1]
+
+    # s0's next turn reuses at most the shared prompt; its sibling s1 reuses all of its last turn.
+    run_turn("s0/t2", "s0", 0, list(aborted.prompt_token_ids) + list(range(500, 520)))
+    assert cached_tokens["s0/t2"] <= len(shared)
+    run_turn("s1/t1", "s1", 0, list(s1_first.all_token_ids) + list(range(900, 920)))
+    assert cached_tokens["s1/t1"] == 64
+    # s0's recompute is on purpose, not a lost prefix.
+    assert holder.num_lost_prefix_tokens == 0

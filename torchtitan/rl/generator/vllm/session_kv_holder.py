@@ -9,14 +9,18 @@
 from __future__ import annotations
 
 from collections import Counter, OrderedDict
+from collections.abc import Collection
 from dataclasses import dataclass
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, TYPE_CHECKING
 
 from vllm.utils.math_utils import cdiv
-from vllm.v1.core.kv_cache_utils import BlockHash
+from vllm.v1.core.kv_cache_utils import BlockHash, get_block_hash
 from vllm.v1.request import Request, RequestStatus
 
 from torchtitan.config import Configurable
+
+if TYPE_CHECKING:
+    from vllm.v1.core.block_pool import BlockPool
 
 
 class VLLMSessionKVHolder(Configurable):
@@ -33,6 +37,7 @@ class VLLMSessionKVHolder(Configurable):
         tool call            ->  held: no other request can take them
         turn 2 prefill done  ->  hold the blocks turn 3 would hit, drop turn 1's hold
         rollout ends         ->  release: the blocks go back to vLLM's free queue, still cached
+        turn 2 aborted       ->  drop: release the hold, uncache the KV only this session has
 
     It holds at prefill, not at the turn's end: in vLLM's hybrid "align" mode the prompt-end GDN
     state leaves the request when decode starts.
@@ -66,7 +71,8 @@ class VLLMSessionKVHolder(Configurable):
     Args:
         scheduler: The vLLM v1 scheduler of this rank's in-process engine.
         offload_connector: Optional connector with ``get_pending_save_ids()``,
-            ``release_session_cache(released_hashes, active_hashes)`` and
+            ``release_session_cache(released_hashes, active_hashes)``,
+            ``drop_session_cache(block_hashes)`` and
             ``pop_cached_tokens(request_id)``.
     """
 
@@ -135,6 +141,8 @@ class VLLMSessionKVHolder(Configurable):
         self._released_hashes: set[BlockHash] = set()
         self._eviction_hashes: set[BlockHash] = set()
         self._pending_saves: set[int] = set()
+        # Hashes of aborted turns whose cached copies are not all dropped yet: see `_drop_cached_copies`.
+        self._dropped_hashes: set[BlockHash] = set()
 
     def track(self, internal_request_id: str, session_id: str, group_id: int) -> None:
         """Hold this request's prefix once its prefill finishes."""
@@ -144,13 +152,25 @@ class VLLMSessionKVHolder(Configurable):
             group, _ = self._cpu_sessions.setdefault(session_id, (group_id, set()))
             assert group == group_id
 
-    def after_step(self) -> None:
+    def after_step(self, aborted_request_ids: Collection[str] = ()) -> None:
         """After each engine step: hold the prefix of requests whose prefill finished, mark sessions
-        whose request left, and process GPU pressure and CPU release hints."""
+        whose request left, drop aborted turns, and process GPU pressure and CPU release hints.
+
+        `aborted_request_ids`: vLLM's ids of aborted requests whose cached KV must not be read again.
+        """
+        # A drop left from an earlier step: its GPU blocks' saves to the CPU may be done now.
+        if self._dropped_hashes:
+            self._drop_cached_copies()
+
         for internal_id, (request, session_id, group_id, held) in list(
             self._live.items()
         ):
             if internal_id not in self._scheduler.requests:
+                if internal_id in aborted_request_ids:
+                    del self._live[internal_id]
+                    self._drop_aborted_turn(request, session_id)
+                    continue
+
                 if self._offload_connector is not None:
                     self._cpu_sessions[session_id][1].update(request.block_hashes)
                     self._last_turns[session_id] = _LastTurn(
@@ -245,9 +265,13 @@ class VLLMSessionKVHolder(Configurable):
 
     @property
     def has_pending_work(self) -> bool:
-        """Whether CPU release still needs engine steps to finish requests or saves."""
+        """Whether CPU release or an aborted turn's drop still needs engine steps to finish requests
+        or saves."""
         return bool(
-            self._released_sessions or self._released_hashes or self._eviction_hashes
+            self._released_sessions
+            or self._released_hashes
+            or self._eviction_hashes
+            or self._dropped_hashes
         )
 
     def _release_cpu_cache(self) -> None:
@@ -316,6 +340,65 @@ class VLLMSessionKVHolder(Configurable):
             self.num_held_blocks = len(self._held_block_refs)
             self._block_pool.free_blocks(reversed(blocks))
 
+    def _drop_aborted_turn(self, request: Request, session_id: str) -> None:
+        """Release the session's hold and uncache the KV of a turn aborted for a non-finite logprob,
+        so the session's next turn recomputes that KV instead of reading it again.
+
+        Hashes another session still uses stay cached, e.g. a GRPO group's shared prompt:
+
+            s0 aborts; its sibling s1 shares the prompt blocks p0, p1
+            s0's hashes:  p0 p1 a2 a3 a4  ->  every GPU and CPU copy of a2, a3, a4 uncached
+            next turns:   s0 hits at most p0 p1 and recomputes the rest; s1 keeps all its hits
+        """
+        # TODO: delete once the first non-finite logprob's cause is fixed (TODO in
+        # `VLLMEngine._abort_running_requests_with_non_finite_logprobs`; not found yet: a write into
+        # a cached block, GDN state bookkeeping with MTP drafts, or a kernel). Without this drop,
+        # each later turn of the session reads the same bad KV and aborts at its first token.
+        other_sessions_hashes: set[BlockHash] = set()
+        for other_request, other_session_id, _, _ in self._live.values():
+            if other_session_id != session_id:
+                other_sessions_hashes.update(other_request.block_hashes)
+        for other_session_id, blocks in self._held.items():
+            if other_session_id != session_id:
+                other_sessions_hashes.update(
+                    get_block_hash(block.block_hash)
+                    for block in blocks
+                    if block.block_hash is not None
+                )
+        for other_session_id, (_, hashes) in self._cpu_sessions.items():
+            if other_session_id != session_id:
+                other_sessions_hashes |= hashes
+
+        self._dropped_hashes.update(
+            block_hash
+            for block_hash in request.block_hashes
+            if block_hash not in other_sessions_hashes
+        )
+        # Uncache first, so `_release` returns the held blocks to the front of the free queue.
+        self._drop_cached_copies()
+        self._release(session_id)
+        # The next turn recomputes this prefix on purpose, so lost-prefix accounting skips it.
+        self._last_turns.pop(session_id, None)
+
+    def _drop_cached_copies(self) -> None:
+        """Uncache every GPU and CPU copy of `_dropped_hashes`.
+
+        With an offload connector, a GPU block still being saved to the CPU keeps its hash until the
+        save completes; the hashes stay in `_dropped_hashes`, and `after_step` calls this again.
+        The retry finds copies by hash, so it also uncaches a copy the session's next turn computed
+        in between: one more recompute, never a read of the dropped KV.
+        """
+        # TODO: blocks vLLM freed while still hashed keep their place near the keep end of the GPU
+        # and CPU free queues. Moving them to the evict end, as `release_session_cache` does, would
+        # need a second private free-queue access, for at most one turn of blocks per abort.
+        if self._offload_connector is None:
+            self._block_pool.evict_blocks(
+                cached_block_ids(self._block_pool, self._dropped_hashes)
+            )
+            self._dropped_hashes.clear()
+        elif self._offload_connector.drop_session_cache(self._dropped_hashes):
+            self._dropped_hashes.clear()
+
     def _count_lost_prefix(self, request: Request, session_id: str) -> None:
         """Count prefix tokens this turn recomputes although the session's last turn computed them.
 
@@ -365,3 +448,26 @@ class _LastTurn(NamedTuple):
     group_id: int
     num_block_hashes: int
     last_block_hash: BlockHash | None
+
+
+def cached_block_ids(pool: BlockPool, block_hashes: set[BlockHash]) -> set[int]:
+    """Return the ids of the blocks `pool` caches under any of `block_hashes`, in any KV cache group.
+
+    Example: the GPU caches h2 in block 7 (attention) and block 31 (GDN state), and h3 twice
+    (blocks 9 and 12):
+
+        cached_block_ids(gpu_block_pool, {h2, h3})  # -> {7, 9, 12, 31}
+    """
+    return {
+        block.block_id
+        for block in pool.blocks
+        if any(
+            get_block_hash(block_hash) in block_hashes
+            # A block may also be cached under extra hashes.
+            for block_hash in (
+                block.block_hash,
+                *pool.cached_block_hashes_by_block.get(block.block_id, ()),
+            )
+            if block_hash is not None
+        )
+    }

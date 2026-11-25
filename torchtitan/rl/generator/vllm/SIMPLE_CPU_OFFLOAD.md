@@ -80,6 +80,11 @@ active sessions on the local DP replica are protected. This is a one-shot hint;
 later requests can cache the prefix again. GPU pressure alone does not release
 CPU KV.
 
+When the engine aborts a turn for a non-finite logprob, the holder releases that
+session's GPU hold and uncaches every GPU and CPU copy of the turn's blocks that
+no other session uses (`connector.drop_session_cache(block_hashes)`).
+The session's next turn then recomputes that KV instead of reading it again.
+
 ## Multi-GPU coordination
 
 Each TP scheduler queries its local CPU cache. The
