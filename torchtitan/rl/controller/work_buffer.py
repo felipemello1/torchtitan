@@ -362,10 +362,10 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
     Same callers and lifecycle as `RolloutGroupWorkBuffer`; three rules differ:
 
     1. Demand. At every step start the buffer counts the groups that are not ready (generating, or the batch
-       being trained) and hands the count to `StallDrivenDemand`: demand = one batch + the value that count stays
-       under on 95% of steps + one spare group, moved up half the gap or down one group per step, never above the
-       mean-age ceiling (see `adaptive_demand.py`). Admission also stops at `generation_capacity` groups
-       generating, so demand cannot enlarge vLLM concurrency.
+       being trained) and hands the count to `StallDrivenDemand`: demand = `ready_batches` batches (default 1) + the
+       value that count stays under on 95% of steps + one spare group, moved up half the gap or down one group per
+       step, never above the mean-age ceiling (see `adaptive_demand.py`). Admission also stops at
+       `generation_capacity` groups generating, so demand cannot enlarge vLLM concurrency.
     2. Selection. `take_finalized` returns the oldest FINALIZED group wherever it sits; a slow group never
        blocks younger finished ones and keeps its slot until it finishes.
     3. Age. A finalized group that would be consumed more than `max_offpolicy_steps` versions after it was
@@ -415,7 +415,12 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
         """How many of the most recent step starts the demand rule looks back over; older values are forgotten."""
 
         stall_probability: float = 0.05
-        """Share of steps allowed to stall; the demand covers the unavailable count on 1 - stall_probability of steps."""
+        """Share of step starts allowed to find fewer than `ready_batches` batches ready (a stall, with 1.0); the
+        demand covers the unavailable count on 1 - stall_probability of steps."""
+
+        ready_batches: float = 1.0
+        """Batches of P the demand aims to have ready at each step start. 1.0 is just enough to train; 1.5 keeps
+        half a batch spare, so fewer steps wait for generation."""
 
         start_batches: int = 3
         """Demand at the first step, in batches of P; the rule learns the rest from the run itself."""
@@ -448,6 +453,10 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
                 raise ValueError(
                     f"stall_probability must be in (0, 0.5), got {self.stall_probability}"
                 )
+            if self.ready_batches < 1:
+                raise ValueError(
+                    f"ready_batches must be >= 1, got {self.ready_batches}"
+                )
             if self.start_batches < 1:
                 raise ValueError(
                     f"start_batches must be >= 1, got {self.start_batches}"
@@ -471,6 +480,7 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
             target_offpolicy_steps=config.target_offpolicy_steps,
             lookback_steps=config.lookback_steps,
             stall_probability=config.stall_probability,
+            ready_batches=config.ready_batches,
             start_batches=config.start_batches,
             damping_factor=config.damping_factor,
         )

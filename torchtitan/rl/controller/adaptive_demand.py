@@ -23,9 +23,10 @@ The rule
 --------
 At a step start, `demand - ready` of the slots hold groups that are not ready. Call that `unavailable`. The trainer
 stalls when fewer than P groups are ready, so the demand that would have avoided a stall at that step is exactly
-`unavailable + P`. Keep the last `lookback_steps` values of `unavailable` and set
+`unavailable + P`. The rule aims for `ready_batches` batches ready at a step start: 1 is just enough to train, 1.5
+keeps half a batch spare. Keep the last `lookback_steps` values of `unavailable` and set
 
-    demand_needed = P + quantile(unavailable over the last lookback_steps, 1 - stall_probability) + 1
+    demand_needed = ceil(ready_batches * P) + quantile(those values, 1 - stall_probability) + 1
 
 then move toward it: up by `damping_factor` of the gap, down by one group per step. `+ 1` is one spare group.
 Nothing is assumed about how long groups take: the count already contains everything (slow groups, refills of
@@ -48,13 +49,14 @@ the batch in training, plus the slots the rejected groups occupy while they gene
 with A = `target_offpolicy_steps` if given, else `max_offpolicy_steps` if given; with neither there is no ceiling. When
 the ceiling binds the trainer may stall rather than train on older data; a log line says so.
 
-Example (P = 8, lookback 10, stall probability 5%):
+Example (P = 8, lookback 10, stall probability 5%, ready_batches 1):
 
     unavailable over the last 10 step starts = [44, 46, 41, 48, 45, 47, 50, 43, 46, 45]
     mean 45.5, sd 2.55, t = 1.92                 ->  quantile = 45.5 + 1.92 x 2.55 = 50.4 -> 51
     demand_needed = 8 + 51 + 1 = 60
     demand was 56 -> half the gap up: 56 + ceil(4 x 0.5) = 58
     demand was 64 -> one group down: 63
+    with ready_batches 1.5: demand_needed = ceil(1.5 x 8) + 51 + 1 = 64
 """
 
 import logging
@@ -68,7 +70,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class StallDrivenDemand:
-    """Demand = P + quantile of the unavailable count + 1, up a share of the gap or down one group per step, under a ceiling.
+    """Demand = ceil(ready_batches x P) + quantile of the unavailable count + 1, smoothed per step, under a ceiling.
 
     Args:
         num_prompts_per_train_step: P, groups the trainer consumes per step.
@@ -78,10 +80,12 @@ class StallDrivenDemand:
             stalling: demand is capped at the mean-age ceiling for this age. None: the ceiling is applied at
             `max_offpolicy_steps`, if given; with neither there is no ceiling.
         lookback_steps: how many of the most recent step starts the quantile is taken over; older values are forgotten.
-        stall_probability: the share of steps allowed to stall; the quantile is taken at 1 - stall_probability. This
-            is what the rule aims for when nothing else limits the demand. It cannot be met when the age ceiling or
-            the generators' capacity caps the demand below what the workload needs, and it assumes some finished
-            groups are trainable.
+        stall_probability: the share of step starts allowed to find fewer than `ready_batches` batches ready (a stall,
+            with 1.0); the quantile is taken at 1 - stall_probability. This is what the rule aims for when nothing
+            else limits the demand. It cannot be met when the age ceiling or the generators' capacity caps the demand
+            below what the workload needs, and it assumes some finished groups are trainable.
+        ready_batches: batches of P the demand aims to have ready at each step start. 1.0 is just enough to train;
+            1.5 keeps half a batch spare, so fewer steps wait for generation.
         start_batches: demand at the first step, in batches of P; the rule learns the rest from the run itself.
         damping_factor: how much of the gap between the current demand and `demand_needed` is closed per step going
             up, or coming down to the mean-age ceiling; otherwise demand comes down one group per step. 0.5 moves
@@ -102,6 +106,7 @@ class StallDrivenDemand:
     target_offpolicy_steps: int | None = None
     lookback_steps: int = 10
     stall_probability: float = 0.05
+    ready_batches: float = 1.0
     start_batches: int = 3
     damping_factor: float = 0.5
     demand: int = field(init=False)
@@ -149,12 +154,13 @@ class StallDrivenDemand:
         self._completed.append(completed)
         self._trainable.append(trainable)
 
-        # The value unavailable stays under with probability 1 - stall_probability, plus the batch and one spare group
+        # The value unavailable stays under with probability 1 - stall_probability, plus the ready batches and one
+        # spare group
         unavailable_upper_bound = estimate_next_unavailable_upper_bound(
             history=list(self._unavailable),
             probability=1 - self.stall_probability,
         )
-        demand_needed = P + unavailable_upper_bound + 1
+        demand_needed = math.ceil(self.ready_batches * P) + unavailable_upper_bound + 1
 
         # At most one group down per step, so a large shelf cannot stop admission; the ceiling below can cut faster
         demand_needed = max(demand_needed, self.demand - 1)
