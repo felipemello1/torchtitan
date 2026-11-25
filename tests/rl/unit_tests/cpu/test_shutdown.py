@@ -485,7 +485,10 @@ def test_spawn_proc_mesh_on_this_host_follows_the_visible_devices_mask(
         monkeypatch.setenv(get_visible_devices_env_var(), visible)
 
     provisioning.spawn_proc_mesh(
-        trainer_world_size=2, per_generator_world_size=1, num_generators=2
+        trainer_world_size=2,
+        per_generator_world_size=1,
+        num_generators=2,
+        generator_env={},
     )
 
     assert host.visible_devices == expected
@@ -508,7 +511,10 @@ def test_spawn_proc_mesh_on_this_host_needs_enough_visible_devices(
 
     with pytest.raises(ValueError, match=match):
         provisioning.spawn_proc_mesh(
-            trainer_world_size=2, per_generator_world_size=1, num_generators=2
+            trainer_world_size=2,
+            per_generator_world_size=1,
+            num_generators=2,
+            generator_env={},
         )
     assert host.visible_devices == []
 
