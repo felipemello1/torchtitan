@@ -179,7 +179,8 @@ def test_rollout_loop_keeps_the_metrics_a_worker_sent_with_its_group() -> None:
 
     controller = object.__new__(Controller)
     controller.config = SimpleNamespace(
-        async_loop=SimpleNamespace(num_samples_per_prompt=1)
+        async_loop=SimpleNamespace(num_samples_per_prompt=1),
+        generator_router=SimpleNamespace(admission=None),
     )
     controller._sampling = SamplingConfig()
     controller._rollouter = SimpleNamespace(run_group_rollouts=run_group_rollouts)
@@ -1212,7 +1213,9 @@ def test_generate_fn_forwards_the_session_and_releases_on_failure() -> None:
         )
 
     # The session reaches both routing layers: the router and the generator's DP routing.
-    reserve.assert_awaited_once_with("r0", routing_session_id="s0")
+    reserve.assert_awaited_once_with(
+        "r0", routing_session_id="s0", group_id=0, num_prompt_tokens=2
+    )
     generate_call.assert_awaited_once_with(
         prompt,
         request_id="r0",
@@ -1220,7 +1223,7 @@ def test_generate_fn_forwards_the_session_and_releases_on_failure() -> None:
         routing_session_id="s0",
         sampling_config=None,
     )
-    release.assert_called_once_with("r0")
+    release.assert_called_once_with("r0", num_tokens=None)
 
 
 def test_validation_renames_turn_metrics_and_uses_fresh_group_ids() -> None:
@@ -1251,6 +1254,9 @@ def test_validation_renames_turn_metrics_and_uses_fresh_group_ids() -> None:
         return RolloutGroup(group_id=group_id, rollouts=[rollout])
 
     controller = object.__new__(Controller)
+    controller.config = SimpleNamespace(
+        generator_router=SimpleNamespace(admission=None)
+    )
     controller._validation_group_ids = itertools.count(start=-1, step=-1)
     controller._make_generate_fn = lambda: None
     controller._make_release_session_fn = lambda: None
@@ -1322,7 +1328,8 @@ def test_validate_rolls_out_each_prompt_n_times(
                 top_p=0.95,
                 top_k=20,
             )
-        )
+        ),
+        generator_router=SimpleNamespace(admission=None),
     )
     controller._sampling = SamplingConfig(temperature=0.8, seed=7, stop_token_ids=[1])
     controller._validation_group_ids = itertools.count(start=-1, step=-1)
@@ -1924,7 +1931,8 @@ def _controller_for_rollout_loops(
 
     controller = object.__new__(Controller)
     controller.config = SimpleNamespace(
-        async_loop=SimpleNamespace(num_samples_per_prompt=2)
+        async_loop=SimpleNamespace(num_samples_per_prompt=2),
+        generator_router=SimpleNamespace(admission=None),
     )
     controller._sampling = None
     controller.generator_router = SimpleNamespace(

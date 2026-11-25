@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import abc
+import math
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Literal
@@ -140,6 +141,84 @@ class GenerationEngine(Configurable, abc.ABC):
     def log_stats(self, step: int) -> None:
         """Log the engine's own per-step stats, if any."""
 
+    def kv_cache_budget(self) -> KVCacheBudget:
+        """Return the KV cache size and what a session holds in it, for the inter-generator router's
+        admission (``InterGeneratorRouter.Config.admission``). Called from the actor's thread, so it
+        reads only what the build fixed."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not report its KV cache size, which admission needs"
+        )
+
     @abc.abstractmethod
     def shutdown(self) -> None:
         """Release engine-local resources; process teardown is the actor framework's."""
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class KVCacheBudget:
+    """One generator's KV cache size, and the blocks a session holds in it while idle or running.
+
+    Example (Qwen3.8-27B with MTP-3 on one GB300: 1 attention group of 1,664-token blocks and
+    3 Gated-DeltaNet groups, each a vLLM `MambaSpec` in "align" mode):
+
+        budget = KVCacheBudget(
+            num_blocks=3411, free_floor_blocks=381, attention_block_sizes=(1664,),
+            num_mamba_groups=3, mamba_blocks_per_running_request=4, max_model_len=262144,
+            data_parallel_size=1,
+        )
+        budget.usable_blocks                  # 3411 - 381 = 3030
+        budget.idle_session_blocks(5000)      # ceil(5000 / 1664) + 3 = 7
+        budget.running_session_blocks(5000)   # 7 + 3 x 4 + 4 = 23
+    """
+
+    num_blocks: int
+    """GPU KV cache blocks of one data-parallel replica."""
+
+    free_floor_blocks: int
+    """Blocks the session KV holder keeps free: vLLM's watermark plus one prefill chunk per KV
+    cache group (`VLLMSessionKVHolder.free_floor_blocks`)."""
+
+    attention_block_sizes: tuple[int, ...]
+    """Tokens per block of each full-attention KV cache group. A session holds one block per
+    `block_size` tokens of its context in each."""
+
+    num_mamba_groups: int
+    """Mamba KV cache groups (Gated-DeltaNet layers) in vLLM's "align" mode. An idle session holds one
+    state block in each: the state at its prompt's end, which the holder keeps."""
+
+    mamba_blocks_per_running_request: int
+    """More blocks per Mamba group while a request runs: `1 + num_speculative_blocks +
+    num_prefill_checkpoint_blocks`. vLLM's align-mode maximum is one more, the prompt-end state that
+    `idle_session_blocks` already counts."""
+
+    max_model_len: int
+    """Longest context the engine accepts, in tokens."""
+
+    data_parallel_size: int
+    """Data-parallel replicas of the generator, each with `num_blocks`."""
+
+    @property
+    def num_kv_cache_groups(self) -> int:
+        return len(self.attention_block_sizes) + self.num_mamba_groups
+
+    @property
+    def usable_blocks(self) -> int:
+        """Blocks sessions may hold before the session KV holder starts releasing idle ones."""
+        return self.num_blocks - self.free_floor_blocks
+
+    def idle_session_blocks(self, num_tokens: int) -> int:
+        """Blocks the session KV holder keeps for a session of `num_tokens` tokens between turns."""
+        attention_blocks = sum(
+            math.ceil(num_tokens / block_size)
+            for block_size in self.attention_block_sizes
+        )
+        return attention_blocks + self.num_mamba_groups
+
+    def running_session_blocks(self, num_tokens: int) -> int:
+        """Blocks a session of `num_tokens` tokens holds while its request runs, plus the one block per
+        KV cache group the holder keeps free for each running request."""
+        return (
+            self.idle_session_blocks(num_tokens)
+            + self.num_mamba_groups * self.mamba_blocks_per_running_request
+            + self.num_kv_cache_groups
+        )

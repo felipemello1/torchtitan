@@ -30,6 +30,7 @@ from vllm.outputs import RequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.utils.cache import LRUCache
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.data.multimodal.vision_processor import VisionProcessor
@@ -39,7 +40,11 @@ from torchtitan.models.common.attention.kda import KDA
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.dist_moe import DistMoeRuntime
 from torchtitan.rl.generator.attention.attention import fa4_takes_query_len_in_heads
-from torchtitan.rl.generator.engine import GenerationEngine, ModelStateDictLoadMode
+from torchtitan.rl.generator.engine import (
+    GenerationEngine,
+    KVCacheBudget,
+    ModelStateDictLoadMode,
+)
 from torchtitan.rl.generator.model import validate_ep_token_dispatchers
 from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
 from torchtitan.rl.generator.types import (
@@ -1001,6 +1006,50 @@ class VLLMEngine(GenerationEngine):
             return
         if self._session_kv_holder is not None:
             self._session_kv_holder.release(session_ids, group_ids)
+
+    def kv_cache_budget(self) -> KVCacheBudget:
+        """Read the KV cache size and each KV cache group's spec from the scheduler:
+
+        FullAttentionSpec                      a block per block_size tokens of context
+        MambaSpec, mamba_cache_mode="align"    a state block while idle, more while running
+        any other spec                         ValueError: admission doesn't count it
+        """
+        if self._session_kv_holder is None:
+            raise ValueError(
+                "admission needs session_kv_holder: its charge counts the blocks the holder keeps "
+                "for idle sessions"
+            )
+        kv_cache_manager = (
+            self._engine.engine_core.engine_core.scheduler.kv_cache_manager
+        )
+        attention_block_sizes, num_mamba_groups, mamba_blocks_per_running_request = (
+            [],
+            0,
+            0,
+        )
+        for kv_cache_group in kv_cache_manager.kv_cache_config.kv_cache_groups:
+            spec = kv_cache_group.kv_cache_spec
+            if isinstance(spec, FullAttentionSpec):
+                attention_block_sizes.append(spec.block_size)
+            elif isinstance(spec, MambaSpec) and spec.mamba_cache_mode == "align":
+                num_mamba_groups += 1
+                mamba_blocks_per_running_request = (
+                    1 + spec.num_speculative_blocks + spec.num_prefill_checkpoint_blocks
+                )
+            else:
+                raise ValueError(
+                    f"admission counts full attention and align-mode Mamba KV cache groups, got "
+                    f"{type(spec).__name__} (mamba_cache_mode={getattr(spec, 'mamba_cache_mode', None)})"
+                )
+        return KVCacheBudget(
+            num_blocks=kv_cache_manager.kv_cache_config.num_blocks,
+            free_floor_blocks=self._session_kv_holder.free_floor_blocks,
+            attention_block_sizes=tuple(attention_block_sizes),
+            num_mamba_groups=num_mamba_groups,
+            mamba_blocks_per_running_request=mamba_blocks_per_running_request,
+            max_model_len=self._engine.vllm_config.model_config.max_model_len,
+            data_parallel_size=self.data_parallel_size,
+        )
 
     def log_stats(self, step: int) -> None:
         if self._session_kv_holder is not None:

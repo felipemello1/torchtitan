@@ -9,6 +9,8 @@ import asyncio
 import pytest
 
 from torchtitan.rl.actors.system import ServiceHandle
+from torchtitan.rl.generator.engine import KVCacheBudget
+from torchtitan.rl.routing.admission import KVRoomAdmission
 from torchtitan.rl.routing.inter_generator import InterGeneratorRouter
 from torchtitan.rl.routing.strategies import (
     LeastLoadedRoutingStrategy,
@@ -18,8 +20,9 @@ from torchtitan.rl.routing.strategies import (
 
 
 class _Endpoint:
-    def __init__(self, *, wait: bool = False, raises: bool = False):
+    def __init__(self, *, wait: bool = False, raises: bool = False, returns=None):
         self.raises = raises
+        self.returns = returns
         self.calls = []
         self.started = asyncio.Event()
         self.release = asyncio.Event()
@@ -32,6 +35,7 @@ class _Endpoint:
         await self.release.wait()
         if self.raises:
             raise RuntimeError("endpoint failed")
+        return self.returns
 
     async def call(self, *args, **kwargs):
         return await self.call_one(*args, **kwargs)
@@ -52,38 +56,63 @@ class _Actor:
         self.prefetch_model_state_dict = _Endpoint(wait=wait_prefetch)
         self.load_model_state_dict = _Endpoint(wait=wait_pull, raises=raises_pull)
         self.release_sessions = _Endpoint()
+        self.release_groups = _Endpoint()
+        self.start_engine_loop = _Endpoint()
+        self.close = _Endpoint()
+        # r8's engine: 3,030 usable blocks; a max-length session charges 177, a 4,000-token one 22.
+        self.kv_cache_budget = _Endpoint(
+            returns=KVCacheBudget(
+                num_blocks=3411,
+                free_floor_blocks=381,
+                attention_block_sizes=(1664,),
+                num_mamba_groups=3,
+                mamba_blocks_per_running_request=4,
+                max_model_len=262144,
+                data_parallel_size=1,
+            )
+        )
 
 
-def _router(actors, *, strategy=None, hot_swap=False) -> InterGeneratorRouter:
+def _router(
+    actors, *, strategy=None, hot_swap=False, admission=None
+) -> InterGeneratorRouter:
     return InterGeneratorRouter(
         InterGeneratorRouter.Config(
             strategy=strategy or LeastLoadedRoutingStrategy.Config(),
             hot_swap=hot_swap,
+            admission=admission,
         ),
         generators=[ServiceHandle(all_ranks=actor, rank0=actor) for actor in actors],
     )
 
 
+def _reserve(router, request_id: str, *, session_id: str | None = None) -> str:
+    """Reserve a generator for one generate call of group 0; return its name."""
+    return router.reserve(
+        request_id, routing_session_id=session_id, group_id=0, num_prompt_tokens=1
+    ).name
+
+
 def _route(router, *, session_id: str | None = None) -> str:
     """Route one generate call that finishes at once; return its generator's name."""
-    name = router.reserve("probe", routing_session_id=session_id).name
-    router.release_reservation("probe")
+    name = _reserve(router, "probe", session_id=session_id)
+    router.release_reservation("probe", num_tokens=None)
     return name
 
 
 def test_least_loaded_routes_to_lowest_reserved_load():
     router = _router([_Actor("gen0"), _Actor("gen1")])
-    assert router.reserve("r0", routing_session_id=None).name == "gen0"
-    assert router.reserve("r1", routing_session_id=None).name == "gen1"
+    assert _reserve(router, "r0") == "gen0"
+    assert _reserve(router, "r1") == "gen1"
 
     # Releasing r1 frees gen1, the generator it reserved.
-    router.release_reservation("r1")
+    router.release_reservation("r1", num_tokens=None)
     assert [h.reserved_load for h in router._generators] == [1, 0]
     # The tie-break alone would pick gen0 (least recently chosen); load picks idle gen1.
-    assert router.reserve("r2", routing_session_id=None).name == "gen1"
+    assert _reserve(router, "r2") == "gen1"
 
-    router.release_reservation("r0")
-    router.release_reservation("r2")
+    router.release_reservation("r0", num_tokens=None)
+    router.release_reservation("r2", num_tokens=None)
     assert [h.reserved_load for h in router._generators] == [0, 0]
 
 
@@ -124,9 +153,9 @@ def test_sticky_session_reuses_generator_for_same_session():
         actors, strategy=StickySessionRoutingStrategy.Config(repin_load_ratio=None)
     )
 
-    assert router.reserve("r0", routing_session_id="s0").name == "gen0"
+    assert _reserve(router, "r0", session_id="s0") == "gen0"
     # gen0 is busier than idle gen1, yet s0's next call stays on gen0.
-    assert router.reserve("r1", routing_session_id="s0").name == "gen0"
+    assert _reserve(router, "r1", session_id="s0") == "gen0"
 
 
 def test_sticky_session_spreads_new_sessions_started_on_idle_generators():
@@ -169,9 +198,7 @@ def test_new_sessions_spread_over_generators_that_all_drain():
         h.draining = True
 
     # Every generator drains, so new sessions go to them anyway, spread by load.
-    chosen = [
-        router.reserve(f"r{i}", routing_session_id=f"s{i}").name for i in range(4)
-    ]
+    chosen = [_reserve(router, f"r{i}", session_id=f"s{i}") for i in range(4)]
     assert sorted(chosen) == ["gen0", "gen0", "gen1", "gen1"]
 
 
@@ -225,7 +252,7 @@ def test_sticky_session_respects_max_sessions():
         ),
     )
 
-    assert router.reserve("r0", routing_session_id="s0").name == "gen0"
+    assert _reserve(router, "r0", session_id="s0") == "gen0"
     # s0 is pinned to gen0 and still in flight, so the least-loaded fallback
     # assigns the new s1 session to gen1. Since max_sessions=1, s1 evicts s0.
     assert _route(router, session_id="s1") == "gen1"
@@ -239,7 +266,7 @@ def test_release_session_unpins_it_and_frees_its_kv_on_its_generator():
     router = _router(
         actors, strategy=StickySessionRoutingStrategy.Config(repin_load_ratio=None)
     )
-    assert router.reserve("r0", routing_session_id="s0").name == "gen0"
+    assert _reserve(router, "r0", session_id="s0") == "gen0"
 
     asyncio.run(router.release_session("s0"))
 
@@ -394,3 +421,88 @@ def test_wait_engine_loop_returns_once_every_rank_exits():
         await asyncio.wait_for(router.wait_engine_loop(), timeout=5)
 
     asyncio.run(_run())
+
+
+def _reserve_call(router, request_id: str, *, session_id: str, group_id: int) -> str:
+    """Reserve a generator for one 4,000-token call of `group_id`; return its name."""
+    return router.reserve(
+        request_id,
+        routing_session_id=session_id,
+        group_id=group_id,
+        num_prompt_tokens=4000,
+    ).name
+
+
+def test_admission_holds_a_group_until_room_and_routes_its_calls_to_its_generator():
+    actors = [_Actor("gen0"), _Actor("gen1")]
+    router = _router(actors, admission=KVRoomAdmission.Config())
+
+    async def main():
+        await router.start_engine_loop()
+        # No first prompt seen yet: each generator takes one group (16 x 177 = 2,832 of 2,878).
+        await router.acquire_group(0, group_size=16, validation=False)
+        await router.acquire_group(1, group_size=16, validation=False)
+        waiting = asyncio.create_task(
+            router.acquire_group(2, group_size=16, validation=False)
+        )
+        await asyncio.sleep(0)
+        assert not waiting.done()
+
+        # Group 1 sits on gen1, though least-loaded routing would pick idle gen0 here.
+        assert _reserve_call(router, "r0", session_id="g0/s0", group_id=0) == "gen0"
+        assert _reserve_call(router, "r1", session_id="g1/s0", group_id=1) == "gen1"
+        # The release goes to the generator the group was placed on.
+        router.release_reservation("r1", num_tokens=4100)
+        await router.release_session("g1/s0")
+        assert actors[1].release_sessions.calls == [((["g1/s0"],), {})]
+
+        # The first calls showed 4,000-token prompts, so a group now charges 16 x 22 = 352 and
+        # group 2 fits: on gen1, which has more room (15 sessions not started vs 16 on gen0).
+        await asyncio.wait_for(waiting, timeout=5)
+        assert _reserve_call(router, "r2", session_id="g2/s0", group_id=2) == "gen1"
+        await router.close_generators()
+
+    asyncio.run(main())
+
+
+def test_release_groups_drops_a_group_still_waiting():
+    router = _router([_Actor("gen0")], admission=KVRoomAdmission.Config())
+
+    async def main():
+        await router.start_engine_loop()
+        await router.acquire_group(0, group_size=16, validation=False)
+        waiting = asyncio.create_task(
+            router.acquire_group(1, group_size=16, validation=False)
+        )
+        await asyncio.sleep(0)
+
+        await router.release_groups([1])
+
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
+        metrics = {
+            metric.key: metric.value.value for metric in router.admission_metrics()
+        }
+        assert metrics["admission/groups_waiting"] == 0
+        await router.close_generators()
+
+    asyncio.run(main())
+
+
+def test_admission_metrics_raise_once_the_tick_task_died(monkeypatch):
+    router = _router([_Actor("gen0")], admission=KVRoomAdmission.Config())
+
+    async def main():
+        await router.start_engine_loop()
+
+        def broken_place():
+            raise RuntimeError("place failed")
+
+        monkeypatch.setattr(router._admission, "place", broken_place)
+        await asyncio.wait_for(asyncio.wait([router._admission_task]), timeout=5)
+
+        with pytest.raises(RuntimeError, match="place failed"):
+            router.admission_metrics()
+        await router.close_generators()
+
+    asyncio.run(main())

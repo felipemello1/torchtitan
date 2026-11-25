@@ -263,11 +263,10 @@ class AsyncLoopConfig(Configurable.Config):
     `target_offpolicy_steps + n`. A value of 1 is FIFO by batch. See
     ``torchtitan/rl/controller/WINDOWED_FIFO.md``."""
 
-    # TODO: when KV-room admission (pytorch/torchtitan#6008) lands, run its gate inside these loops to decide when a
-    # claimed group starts; keep this cap as the bound on the loops, vLLM's max_num_seqs and the worker pool.
     max_concurrent_rollout_groups: int | None = None
     """Groups that roll out at once; None: every active slot, `(S + 1) * P`. Set it when `(S + 1) * P * G`
-    rollouts would not fit in the generators' KV cache at once.
+    rollouts would not fit in the generators' KV cache at once, or set `generator_router.admission`, which
+    holds each group in `acquire_group` until a generator has KV room for it.
 
         P=32, S=8, None -> all 288 groups (4,608 rollouts) roll out at the cold start
         P=32, S=8, 64   -> 64 groups roll out; the other 224 slots hold groups that wait to
@@ -841,18 +840,31 @@ class Controller(Configurable):
             #   adaptive buffer's too-old groups) cancels a generate call; a dead rollout
             #   worker fails the run.
             generator = await generator_router.reserve.call_one(
-                request_id, routing_session_id=routing_session_id
+                request_id,
+                routing_session_id=routing_session_id,
+                group_id=group_id,
+                num_prompt_tokens=len(prompt.token_ids),
             )
+            completion = None
             try:
-                return await generator.generate.call_one(
+                completion = await generator.generate.call_one(
                     prompt,
                     request_id=request_id,
                     group_id=group_id,
                     routing_session_id=routing_session_id,
                     sampling_config=sampling_config,
                 )
+                return completion
             finally:
-                generator_router.release_reservation.broadcast(request_id)
+                # The session's size after this turn, for admission's ledger.
+                num_tokens = (
+                    None
+                    if completion is None
+                    else len(prompt.token_ids) + len(completion.token_ids)
+                )
+                generator_router.release_reservation.broadcast(
+                    request_id, num_tokens=num_tokens
+                )
 
         return generate
 
@@ -1035,17 +1047,25 @@ class Controller(Configurable):
         release_session_fn = self._make_release_session_fn()
         # Each id is used once, so validations that run at the same time never share one.
         group_ids = [next(self._validation_group_ids) for _ in samples]
+
+        async def run_group(group_id: int, sample: object) -> RolloutGroup:
+            if self.config.generator_router.admission is not None:
+                await self.generator_router.acquire_group.call_one(
+                    group_id, group_size=num_samples_per_prompt, validation=True
+                )
+            return await self._rollouter.run_group_rollouts(
+                generate_fn=generate,
+                release_session_fn=release_session_fn,
+                sample=sample,
+                group_id=group_id,
+                group_size=num_samples_per_prompt,
+                sampling=sampling,
+            )
+
         # TODO(naming): reserve "sample" for TrainingSample; rename the rollouter's raw-prompt "sample" -> "prompt"/"data_input".
         group_results = await asyncio.gather(
             *(
-                self._rollouter.run_group_rollouts(
-                    generate_fn=generate,
-                    release_session_fn=release_session_fn,
-                    sample=sample,
-                    group_id=group_id,
-                    group_size=num_samples_per_prompt,
-                    sampling=sampling,
-                )
+                run_group(group_id, sample)
                 for group_id, sample in zip(group_ids, samples, strict=True)
             ),
             return_exceptions=True,
@@ -1422,10 +1442,41 @@ class Controller(Configurable):
         consumes: a WAITING RolloutGroupWork (group_buffer.claim_next)
             waits for:    a claimable WAITING entry
             unblocked by: _data_input_loop group_buffer.add_work()
+        acquires (with generator_router.admission): a generator for the group (acquire_group)
+            waits for:    KV room on a generator, after the groups ahead of it
+            unblocked by: other groups' release_groups, or their sessions ending
         produces: RolloutGroup (group_buffer.finalize_work)
             waits for:    nothing (admits its own claimed slot)
             unblocked by: n/a
         """
+
+        async def acquire_and_run_group(work: RolloutGroupWork) -> RolloutGroup:
+            # Wait for KV room before the group builds its envs, inside the group's task, so the
+            # buffer's cancel also stops a waiting group.
+            admission_wait_s = None
+            if self.config.generator_router.admission is not None:
+                acquire_start = time.perf_counter()
+                with sl.log_trace_span("acquire_group"):
+                    await self.generator_router.acquire_group.call_one(
+                        work.group_id,
+                        group_size=self.config.async_loop.num_samples_per_prompt,
+                        validation=False,
+                    )
+                admission_wait_s = time.perf_counter() - acquire_start
+            group = await self._rollouter.run_group_rollouts(
+                generate_fn=generate_fn,
+                release_session_fn=release_session_fn,
+                sample=work.sample,
+                group_id=work.group_id,
+                group_size=self.config.async_loop.num_samples_per_prompt,
+                sampling=self._sampling,
+            )
+            if admission_wait_s is not None:
+                group.metrics.append(
+                    m.Metric("rollout/admission_wait_s", m.Mean(admission_wait_s))
+                )
+            return group
+
         while True:
             work = await group_buffer.claim_next()
             if work is None:  # group_buffer closed/shutdown signal
@@ -1435,15 +1486,7 @@ class Controller(Configurable):
             # A task of its own, so the buffer can cancel this group (too old to ever train) without
             # cancelling this loop.
             generation_task = asyncio.create_task(
-                self._rollouter.run_group_rollouts(
-                    generate_fn=generate_fn,
-                    release_session_fn=release_session_fn,
-                    sample=work.sample,
-                    group_id=work.group_id,
-                    group_size=self.config.async_loop.num_samples_per_prompt,
-                    sampling=self._sampling,
-                ),
-                name=f"rollout_group_{work.group_id}",
+                acquire_and_run_group(work), name=f"rollout_group_{work.group_id}"
             )
             group_buffer.track_generation(work, generation_task)
             group: RolloutGroup | None = None
@@ -1723,6 +1766,12 @@ class Controller(Configurable):
             # TODO(metrics): See if metrics are being computed at the right place. E.g. should we put all
             # rollout related metrics here, or move all of them to the rollouter.
             time_metrics = step_timer.flush()
+            # Also raises if the router's admission stopped placing groups.
+            admission_metrics = (
+                await self.generator_router.admission_metrics.call_one()
+                if self.config.generator_router.admission is not None
+                else []
+            )
             with sl.log_trace_span("metrics_log"):
                 self.metrics_processor.log(
                     step=step,
@@ -1738,6 +1787,7 @@ class Controller(Configurable):
                             for key, value in optimizer_result.metrics.items()
                         ],
                         *self._group_buffer.metrics(),
+                        *admission_metrics,
                         *self._rollouter.curriculum_metrics(),
                         *time_metrics,
                         # The event loop's longest delay, and how many ms late it ran per second

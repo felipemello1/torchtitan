@@ -46,6 +46,7 @@ from torchtitan.rl.generator.dispatcher import (
     OutstandingGeneration,
     RequestDispatcher,
 )
+from torchtitan.rl.generator.engine import KVCacheBudget
 from torchtitan.rl.generator.generator import Generator
 from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
 from torchtitan.rl.generator.types import EngineRequest, SamplingConfig
@@ -88,6 +89,12 @@ from vllm.utils.cache import LRUCache
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.engine.output_processor import OutputProcessor
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    MambaSpec,
+)
 from vllm.v1.outputs import LogprobsLists
 from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 
@@ -259,6 +266,51 @@ def _dispatcher(*, rank=0, dp_degree=1, tp_degree=1, dp_routing_strategy=None):
         intra_generator_router=IntraGeneratorRouter.Config(
             strategy=dp_routing_strategy or LeastLoadedRoutingStrategy.Config()
         ),
+    )
+
+
+def test_kv_cache_budget_reads_the_kv_cache_groups():
+    # Qwen3.8-27B with MTP-3: 1 attention group and 3 Gated-DeltaNet groups in align mode.
+    attention = FullAttentionSpec(
+        block_size=1664, num_kv_heads=2, head_size=256, dtype=torch.bfloat16
+    )
+    gdn = MambaSpec(
+        block_size=1664,
+        shapes=((2, 4, 8192), (32, 128, 128)),
+        dtypes=(torch.bfloat16, torch.float32),
+        mamba_cache_mode="align",
+        num_speculative_blocks=3,
+    )
+    groups = [KVCacheGroupSpec(layer_names=["attn"], kv_cache_spec=attention)] + [
+        KVCacheGroupSpec(layer_names=[f"gdn{i}"], kv_cache_spec=gdn) for i in range(3)
+    ]
+    kv_cache_config = KVCacheConfig(
+        num_blocks=3411, kv_cache_tensors=[], kv_cache_groups=groups
+    )
+    engine = VLLMEngine.__new__(VLLMEngine)
+    engine._session_kv_holder = SimpleNamespace(free_floor_blocks=381)
+    engine._engine = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(max_model_len=262144),
+            parallel_config=SimpleNamespace(data_parallel_size=1),
+        ),
+        engine_core=SimpleNamespace(
+            engine_core=SimpleNamespace(
+                scheduler=SimpleNamespace(
+                    kv_cache_manager=SimpleNamespace(kv_cache_config=kv_cache_config)
+                )
+            )
+        ),
+    )
+
+    assert engine.kv_cache_budget() == KVCacheBudget(
+        num_blocks=3411,
+        free_floor_blocks=381,
+        attention_block_sizes=(1664,),
+        num_mamba_groups=3,
+        mamba_blocks_per_running_request=4,
+        max_model_len=262144,
+        data_parallel_size=1,
     )
 
 
