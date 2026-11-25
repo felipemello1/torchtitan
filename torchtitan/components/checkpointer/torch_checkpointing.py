@@ -138,6 +138,10 @@ def _init_subprocess_logging(
         backend_logger.setLevel(logging.INFO)
 
 
+# TODO: torch_checkpointing writes one file per item, so write threads stop at the
+# item count, and OPTIMIZER (2/3 of the bytes with Adam) is one stream. Split it
+# into parts once the library can (a num_parts layout). If it can't, splitting
+# OPTIMIZER by state name here works too, but changes TorchTitan's on-disk format.
 def _item_specs() -> dict[str, ItemSpec]:
     resharder = DefaultResharder()
     return {
@@ -162,9 +166,6 @@ def _item_specs() -> dict[str, ItemSpec]:
 def _writer_config(
     *, use_barrier: bool, file_write_workers: int
 ) -> CheckpointWriterConfig:
-    # TODO: torch_checkpointing writes one file per item, so threads stop at the
-    # item count, and the optimizer item (2/3 of the bytes with Adam) is one
-    # stream. Pass the library's split option once it has one.
     return CheckpointWriterConfig(
         checkpoint_write_barrier_timeout_sec=_DEFAULT_BARRIER_TIMEOUT_SEC,
         file_write_max_threads=file_write_workers,

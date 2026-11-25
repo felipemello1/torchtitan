@@ -427,6 +427,9 @@ class CheckpointManager(BaseCheckpointManager):
             )
             states[MODEL].load_state_dict(state_dict)
         else:
+            # TODO: read with several threads, as `file_write_workers` does for
+            # saves, once DCP's FileSystemReader takes a thread count. It has none
+            # on PyTorch main (94957ce4146).
             dcp.load(state_dict, checkpoint_id=checkpoint_id)
 
             # TODO: Since we flatten the model states in state_dict, we need to
