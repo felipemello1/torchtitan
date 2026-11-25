@@ -14,6 +14,7 @@ from typing import Any
 
 from monarch.actor import concurrent_endpoint, current_size
 
+from torchtitan.observability.logging import init_logger
 from torchtitan.rl.actors.monarch.actor import Actor
 from torchtitan.rl.actors.system import ServiceHandle
 from torchtitan.rl.observability import metrics as m
@@ -27,6 +28,7 @@ class _InterGeneratorRouterActorEndpoints:
         *,
         generators: Sequence[ServiceHandle],
     ) -> None:
+        init_logger()
         num_actors = math.prod(current_size().values())
         assert (
             num_actors == 1
