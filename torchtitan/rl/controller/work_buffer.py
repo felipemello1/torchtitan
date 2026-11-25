@@ -279,6 +279,13 @@ class RolloutGroupWorkBuffer(Configurable):
             trainer_policy_version: Version of the weights that will train the batch being waited for.
         """
 
+    def state_dict(self) -> dict[str, object]:
+        """State the controller saves in each checkpoint. This buffer has none: its slots come from its arguments."""
+        return {}
+
+    def load_state_dict(self, state_dict: dict[str, object]) -> None:
+        """Restore what `state_dict` returned, before the data input loop starts. This buffer has no state."""
+
     def pop_dropped_group_ids(self) -> list[int]:
         """Trainer loop, at the optimizer step: groups dropped since the last call, so the dataloader
         stops replaying them. This buffer drops nothing; the adaptive buffer drops groups too old to train.
@@ -415,12 +422,13 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
         """How many of the most recent step starts the demand rule looks back over; older values are forgotten."""
 
         stall_probability: float = 0.05
-        """Share of step starts allowed to find fewer than `ready_batches` batches ready (a stall, with 1.0); the
-        demand covers the unavailable count on 1 - stall_probability of steps."""
+        """Share of step starts allowed to find fewer than `ready_batches` batches ready; with 1.0, that is a stall.
+        The demand covers the unavailable count on 1 - stall_probability of steps."""
 
         ready_batches: float = 1.0
-        """Batches of P the demand aims to have ready at each step start. 1.0 is just enough to train; 1.5 keeps
-        half a batch spare, so fewer steps wait for generation."""
+        """Batches of P the demand aims to have ready at each step start. 1.0 is just enough to train. 1.5 keeps
+        half a batch spare, so fewer steps wait while generation keeps up; the buffer then holds more groups, and
+        they train older."""
 
         start_batches: int = 3
         """Demand at the first step, in batches of P; the rule learns the rest from the run itself."""
@@ -691,6 +699,25 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
             self._max_active_rollout_groups = self._demand.demand
             if grew:
                 self._condition.notify_all()
+
+    def state_dict(self) -> dict[str, object]:
+        """The demand rule's state (`StallDrivenDemand.state_dict`). Only `record_step_start` changes it."""
+        return self._demand.state_dict()
+
+    def load_state_dict(self, state_dict: dict[str, object]) -> None:
+        """Restore the demand rule and make its demand the active-slot cap. Call it before the data input loop starts.
+
+        Example:
+            buffer.load_state_dict({"demand": 150, "state": "ok", "unavailable": [130, 128], ...})
+            # active-slot cap 150; the first `record_step_start` keeps it, the later ones read that history
+            buffer.load_state_dict({})
+            # the fixed buffer's checkpoint state: cap start_batches x P, as in a fresh run
+        """
+        if not state_dict:
+            return
+        self._demand.load_state_dict(state_dict)
+        self._max_active_rollout_groups = self._demand.demand
+        logger.info(f"Rollout buffer: resumed at demand {self._demand.demand} groups")
 
     def metrics(self) -> list[m.Metric]:
         generating = sum(

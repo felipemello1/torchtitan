@@ -28,6 +28,7 @@ RolloutGroupWorkBuffer
 | active slots = (target_offpolicy_steps + 1) * num_prompts_per_train_step, or the adaptive buffer's demand           |
 |                                                                                                                     |
 | caller            group_buffer call                                            state / active slot                  |
+| run()             load_state_dict(resume_state["group_buffer"])                adaptive: demand + slot cap restored |
 | _data_input_loop  add_work(RolloutGroupWork)                                   WAITING; slot acquired               |
 | _rollout_loop[N]  claim_next()                                                 WAITING -> CLAIMED                   |
 | _rollout_loop[N]  finalize_work(RolloutGroup)                                  CLAIMED -> FINALIZED                 |
@@ -36,6 +37,7 @@ RolloutGroupWorkBuffer
 | _rollout_loop[N]  release_cancelled(group_id)                                  cancelled group stopped; slot freed  |
 | _batcher_loop     release_active_groups(1, "untrainable_group")                slot released                        |
 | _trainer_loop     record_step_start(trainer_policy_version)                    adaptive: demand updated             |
+| _trainer_loop     state_dict() -> optim_step(resume_state=...)                 saved in the trainer checkpoint      |
 | _trainer_loop     release_active_groups(num_prompts_per_train_step, "trained")  slots released after state dict pull |
 +---------------------------------------------------------------------------------------------------------------------+
                                                   |
@@ -930,13 +932,21 @@ class Controller(Configurable):
                 await actor_system.initialize_torchstore()
 
         # Resume: __init__ ran CheckpointManager.load(); read back the restored
-        # policy version and rollouter state.
+        # policy version and the controller's resume state (rollouter and group buffer).
         self.start_step, resume_state = await asyncio.gather(
             self.trainer.rank0.get_policy_version.call_one(),
             self.trainer.rank0.get_resume_state.call_one(),
         )
+        # run() restores the group buffer from this, once it builds the buffer
+        self._restored_buffer_state: dict[str, object] | None = None
         if resume_state is not None:
+            if "group_buffer" not in resume_state:
+                raise ValueError(
+                    "The checkpoint's resume state has no 'group_buffer' key, so the group buffer cannot resume; "
+                    f"its keys: {sorted(resume_state)}"
+                )
             self._rollouter.load_state_dict(resume_state)
+            self._restored_buffer_state = resume_state["group_buffer"]
             logger.info("Restored RL dataloader state")
             # TODO: Replay cached finished rollouts instead of regenerating all
             # pending prompts after resume.
@@ -1147,6 +1157,9 @@ class Controller(Configurable):
                 max_active_rollout_groups=max_active_rollout_groups,
                 window_size=window_size,
             )
+        # Before the data input loop starts, so a resumed demand caps the first admissions.
+        if self._restored_buffer_state is not None:
+            self._group_buffer.load_state_dict(self._restored_buffer_state)
 
         # training_batch_queue
         training_batch_queue: asyncio.Queue[
@@ -1207,8 +1220,9 @@ class Controller(Configurable):
             generator_task,
         ]
         try:
-            # TODO: on resume, restart the validation that was still running when the previous run
-            # stopped. The checkpoint doesn't record it, so it is lost unless the start step is due.
+            # TODO: on resume, restart the validation still running when the run stopped. The checkpoint doesn't
+            # record it, so it is lost unless the resume step is due, e.g. a requeue mid-validation with checkpoints
+            # every 2 steps. Save the last validation step that ended in the resume state; validate a missed one.
             self._maybe_start_validation(step=self.start_step)
             done, _ = await asyncio.wait(
                 [trainer_task, *background_tasks], return_when=asyncio.FIRST_COMPLETED
@@ -1609,9 +1623,14 @@ class Controller(Configurable):
                     self._rollouter.commit_training_sample_ids(
                         [*self._group_buffer.pop_dropped_group_ids(), *packed.group_ids]
                     )
+                    # One dict: the rollouter's keys and "group_buffer", the buffer's state as of this step's start,
+                    # which is what the next step start reads.
                     optimizer_result = self._get_rank_0_value(
                         await self.trainer.all_ranks.optim_step.call(
-                            resume_state=self._rollouter.state_dict(),
+                            resume_state={
+                                **self._rollouter.state_dict(),
+                                "group_buffer": self._group_buffer.state_dict(),
+                            },
                             last_step=(step == num_training_steps),
                         )
                     )
