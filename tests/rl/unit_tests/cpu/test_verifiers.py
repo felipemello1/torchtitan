@@ -1929,7 +1929,10 @@ def test_worker_metrics_count_the_topk_rows_it_holds() -> None:
         finished = asyncio.get_running_loop().create_future()
         finished.set_result(finished_rollout)
         running = asyncio.get_running_loop().create_future()
-        worker._rollout_tasks_by_group = {5: [finished, running]}
+        # A rollout of group 6 raised: it holds no rows, and its error stays in its own group.
+        failed = asyncio.get_running_loop().create_future()
+        failed.set_exception(TypeError("rollout of group 6 failed"))
+        worker._rollout_tasks_by_group = {5: [finished, running], 6: [failed]}
         validation_metrics = await worker.flush_process_metrics(group_id=-1)
         training_metrics = await worker.flush_process_metrics(group_id=0)
         running.cancel()

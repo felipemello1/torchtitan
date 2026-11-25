@@ -259,7 +259,12 @@ class VerifiersRolloutWorker(BaseRolloutWorker):
         # Each top-k array of 256 KiB or more (k = 32: a generation of 2,048+ tokens) gets its own
         # mmap, so freeing it returns its RAM. glibc's default threshold climbs to 32 MiB after big
         # frees, and then freed rows stay in the process.
-        _LIBC.mallopt(_M_MMAP_THRESHOLD, 256 * 1024)
+        mmap_threshold = 256 * 1024
+        if _LIBC.mallopt(_M_MMAP_THRESHOLD, mmap_threshold) != 1:
+            raise RuntimeError(
+                f"glibc's mallopt(M_MMAP_THRESHOLD, {mmap_threshold}) failed, so freed top-k rows "
+                "would stay in this process"
+            )
 
         if not isinstance(renderer_config, RenderersConfigAdapter):
             raise ValueError(
@@ -364,7 +369,8 @@ class VerifiersRolloutWorker(BaseRolloutWorker):
                                                plus those of finished rollouts whose siblings still run
             rollout_worker/malloc_in_use_gib   heap bytes in use: heap chunks plus mmapped ones
         """
-        # Off the event loop: it walks every free page of a heap that can reach tens of GiB.
+        # In a thread, so the GIL is free; the loop's own mallocs still wait while the trim walks the
+        # main arena (~45 ms on an 8 GiB heap).
         await asyncio.to_thread(_LIBC.malloc_trim, 0)
         if group_id < 0:
             return []
@@ -378,7 +384,8 @@ class VerifiersRolloutWorker(BaseRolloutWorker):
             array
             for tasks in self._rollout_tasks_by_group.values()
             for task in tasks
-            if task.done() and not task.cancelled()
+            # A task that raised fails its own group; reading it here would fail this one too.
+            if task.done() and not task.cancelled() and task.exception() is None
             for turn in task.result().turns
             for array in (turn.completion_topk_token_ids, turn.completion_topk_logprobs)
             if array is not None
