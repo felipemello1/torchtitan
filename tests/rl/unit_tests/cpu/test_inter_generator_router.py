@@ -707,6 +707,39 @@ def test_a_cancel_before_a_resume_leaves_the_session_idle():
     asyncio.run(main())
 
 
+def test_a_tick_between_a_task_cancel_and_its_wake_up_skips_the_cancelled_call():
+    """Monarch cancels a parked `reserve`, and a tick resumes its session before the task wakes up: the
+    tick skips the cancelled call, and the task then uncharges it."""
+
+    async def main():
+        router = await _router_over_its_kv_cache(_Actor("gen0"))
+        call = asyncio.create_task(
+            _reserve_call(
+                router,
+                "next",
+                session_id="g0/s20",
+                group_id=0,
+                num_prompt_tokens=240_000,
+            )
+        )
+        await asyncio.sleep(0)
+
+        call.cancel()
+        # Room frees, and a tick runs before the cancelled task wakes up.
+        router._admission.release_session("g0/s0", group_id=0)
+        router._admission.release_session("g0/s1", group_id=0)
+        router._admission_tick()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+
+        # Both paused sessions resume idle: no call is left to run.
+        assert router._admission.ledger(0) == 2812
+        assert router._reservations == {}
+        await router.close_generators()
+
+    asyncio.run(main())
+
+
 def test_a_waiting_call_whose_task_is_cancelled_is_uncharged():
     async def main():
         router = await _router_over_its_kv_cache(_Actor("gen0"))

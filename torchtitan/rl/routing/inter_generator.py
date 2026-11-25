@@ -71,10 +71,10 @@ class InterGeneratorRouter(Configurable):
     then routes the request across that mesh's data-parallel ranks.
 
     Look-aside routing:
-        The router never sees a generate call's payload. ``reserve`` picks a
-        generator, adds one unit of load to it and returns its rank-0 handle; the
-        caller sends the generate call there directly, then calls
-        ``release_reservation``.
+        The router never sees a generate call's payload. `reserve` picks a
+        generator, adds one unit of load to it and returns its index in
+        `rank0_generators()`; the caller sends the generate call to that handle
+        directly, then calls `release_reservation`.
 
     Singleton:
         Routing decisions read and write mutable states such as
@@ -269,8 +269,8 @@ class InterGeneratorRouter(Configurable):
             self.release_reservation(request_id, num_tokens=None)
 
     def release_reservation(self, request_id: str, *, num_tokens: int | None) -> None:
-        """Free the load unit ``reserve`` placed for ``request_id``. Routing
-        bookkeeping only; unlike ``release_session``, it doesn't call a generator.
+        """Free the load unit `reserve` placed for `request_id`. Routing
+        bookkeeping only; unlike `release_session`, it doesn't call a generator.
 
         Unknown ids are ignored: an exception would fail the actor on this broadcast.
 
@@ -367,10 +367,10 @@ class InterGeneratorRouter(Configurable):
         # first, paused or not), tell the engine which to release first: a `release_first(session_ids)`
         # call. Not needed yet: 30 min of one-GB300 load tests with admission released no unpaused session.
         for request_id in self._admission.rebalance(now=time.monotonic()):
-            # Absent if its caller was cancelled during this tick's resume.
-            parked = self._parked_calls.get(request_id)
-            if parked is not None and not parked.resumed.done():
-                parked.resumed.set_result(None)
+            resumed = self._parked_calls[request_id].resumed
+            # Done if Monarch cancelled its `reserve`, which has not woken up yet to uncharge the call.
+            if not resumed.done():
+                resumed.set_result(None)
         for group_id in self._admission.place():
             placed = self._waiting_groups.pop(group_id)
             # Done if its caller was cancelled; `release_groups` still forgets the group.
