@@ -17,7 +17,7 @@ import torch
 import torch.distributed.checkpoint.stateful
 from torch.distributed.fsdp import FSDPModule
 
-from torchtitan.components.checkpointer import BaseCheckpointManager, CheckpointManager
+from torchtitan.components.checkpointer import BaseCheckpointManager
 from torchtitan.components.data.types import TrainingMicrobatch
 from torchtitan.components.loss import ChunkedLossWrapper, Loss
 from torchtitan.components.optim import Optim
@@ -142,7 +142,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             default_factory=GarbageCollector.Config
         )
         parallelism: ParallelismConfig = field(default_factory=ParallelismConfig)
-        checkpointer: CheckpointManager.Config | None = None
+        checkpointer: BaseCheckpointManager.Config | None = None
         activation_remat: ActivationRematConfig | None = field(
             default_factory=DefaultActivationRematConfig
         )

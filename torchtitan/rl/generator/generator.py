@@ -21,7 +21,7 @@ import torch.distributed as dist
 import torchstore as ts
 from torchstore import RankRole
 
-from torchtitan.components.checkpointer import CheckpointManager
+from torchtitan.components.checkpointer import BaseCheckpointManager
 from torchtitan.components.data.multimodal.vision_processor import VisionProcessor
 from torchtitan.config import Configurable, DebugConfig, PrecisionConfig
 from torchtitan.distributed.batch_invariant import set_batch_invariance
@@ -142,7 +142,7 @@ class Generator(Configurable):
         (prefill + decode, summed over the batch). ``None`` (default) leaves the
         engine's own default in place."""
 
-        checkpointer: CheckpointManager.Config | None = None
+        checkpointer: BaseCheckpointManager.Config | None = None
         """Optional initial-weight loader for the engine's model.
 
         In the RL loop this stays ``None`` because weights arrive from

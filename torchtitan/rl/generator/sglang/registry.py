@@ -17,7 +17,7 @@ import functools
 import logging
 from typing import Any
 
-from torchtitan.components.checkpointer import CheckpointManager
+from torchtitan.components.checkpointer import BaseCheckpointManager
 from torchtitan.config import PrecisionConfig
 from torchtitan.models.common.attention.gdn import GDN
 from torchtitan.models.common.attention.kda import KDA
@@ -188,7 +188,7 @@ def register_to_sglang(
     *,
     parallelism: InferenceParallelismConfig,
     precision: PrecisionConfig,
-    checkpointer_config: CheckpointManager.Config | None,
+    checkpointer_config: BaseCheckpointManager.Config | None,
     dist_moe_runtime: DistMoeRuntime.Config | None,
     model_state_dict_load_mode: ModelStateDictLoadMode,
     hf_assets_path: str,

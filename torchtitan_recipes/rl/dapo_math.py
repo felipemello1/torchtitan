@@ -8,7 +8,7 @@
 
 from __future__ import annotations
 
-from typing import cast, Literal
+from typing import Literal
 
 from renderers import Qwen3RendererConfig
 
@@ -339,12 +339,9 @@ def muse_spark_816b_a42b_dapo_math_gb300_config(
             # in device scratch; host-backed VMM scratch stays off.
             dist_moe_runtime=DistMoeRuntime.Config(scratch_capacity_factor=16.0),
             # Test run: load the HF weights, never write a checkpoint.
-            checkpointer=cast(
-                CheckpointManager.Config,
-                TorchCheckpointingManager.Config(
-                    initial_load_in_hf=True,
-                    load_only=True,
-                ),
+            checkpointer=TorchCheckpointingManager.Config(
+                initial_load_in_hf=True,
+                load_only=True,
             ),
             # Dist-MoE's eager expert-output callback (the trainable Muse norm)
             # rejects TorchDispatchMode-based checkpointing. torch_remat uses

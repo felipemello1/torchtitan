@@ -29,7 +29,7 @@ from vllm.sampling_params import RequestOutputKind
 from vllm.utils.cache import LRUCache
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-from torchtitan.components.checkpointer import CheckpointManager
+from torchtitan.components.checkpointer import BaseCheckpointManager
 from torchtitan.components.data.multimodal.vision_processor import VisionProcessor
 from torchtitan.config import DebugConfig, PrecisionConfig
 from torchtitan.models.common.attention.gdn import GDN
@@ -242,7 +242,7 @@ class VLLMEngine(GenerationEngine):
         precision: PrecisionConfig,
         gpu_memory_limit: float,
         max_num_batched_tokens: int | None,
-        checkpointer: CheckpointManager.Config | None,
+        checkpointer: BaseCheckpointManager.Config | None,
         dist_moe_runtime: DistMoeRuntime.Config | None,
         debug: DebugConfig,
         reset_kv_cache_on_model_state_dict_load: bool,
@@ -354,7 +354,7 @@ class VLLMEngine(GenerationEngine):
         *,
         parallelism: InferenceParallelismConfig,
         precision: PrecisionConfig,
-        checkpointer: CheckpointManager.Config | None,
+        checkpointer: BaseCheckpointManager.Config | None,
         dist_moe_runtime: DistMoeRuntime.Config | None,
         batch_invariant: bool,
         model_state_dict_load_mode: ModelStateDictLoadMode,
