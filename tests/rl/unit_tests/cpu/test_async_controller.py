@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 import numpy as np
 import pytest
 import torch
+from torchtitan.rl.controller import controller as controller_module
 from torchtitan.rl.controller.adaptive_demand import (
     estimate_next_unavailable_upper_bound,
     mean_age_ceiling,
@@ -1362,6 +1363,49 @@ def test_a_validation_cancelled_at_shutdown_releases_its_groups() -> None:
     release_groups.assert_awaited_once_with([-1, -2])
 
 
+async def _never_answers(*args, **kwargs) -> None:
+    await asyncio.Event().wait()  # e.g. a generator actor whose event loop is blocked
+
+
+def test_a_hung_release_fails_a_validation_cancelled_at_shutdown(monkeypatch) -> None:
+    """At shutdown, a release that never returns ends the cancelled validation with a TimeoutError, instead
+    of hanging teardown."""
+    monkeypatch.setattr(controller_module, "_SHUTDOWN_RELEASE_TIMEOUT_S", 0.01)
+    group_started = asyncio.Event()
+
+    async def run_group_rollouts(**kwargs) -> RolloutGroup:
+        group_started.set()
+        await asyncio.Event().wait()
+
+    controller = object.__new__(Controller)
+    controller._validation_group_ids = itertools.count(start=-1, step=-1)
+    controller._make_generate_fn = lambda: None
+    controller._make_release_session_fn = lambda: None
+    controller._rollouter = SimpleNamespace(run_group_rollouts=run_group_rollouts)
+    controller.generator_router = SimpleNamespace(
+        acquire_group=SimpleNamespace(call_one=AsyncMock()),
+        release_groups=SimpleNamespace(call_one=_never_answers),
+    )
+
+    async def main() -> None:
+        validation = asyncio.create_task(
+            controller._collect_validation_rollouts(
+                samples=["prompt 1"],
+                sampling=SamplingConfig(),
+                num_samples_per_prompt=1,
+                step=8,
+            )
+        )
+        await asyncio.wait_for(group_started.wait(), timeout=5)
+        validation.cancel()
+        # Unbounded, it would still be waiting after 5 s.
+        await asyncio.wait([validation], timeout=5)
+        assert validation.done()
+        assert isinstance(validation.exception(), TimeoutError)
+
+    asyncio.run(main())
+
+
 def _scored_group(group_id: int, rewards: list[float | None]) -> RolloutGroup:
     return RolloutGroup(
         group_id=group_id,
@@ -2241,6 +2285,47 @@ def test_rollout_loop_exits_when_shutdown_lands_with_a_buffer_cancel() -> None:
 
         await buffer.close()
         assert await taker is None
+
+    asyncio.run(run())
+
+
+def test_a_hung_release_fails_a_rollout_loop_at_shutdown(monkeypatch) -> None:
+    """At shutdown, a release that never returns ends the rollout loop with a TimeoutError, instead of
+    hanging teardown."""
+    monkeypatch.setattr(controller_module, "_SHUTDOWN_RELEASE_TIMEOUT_S", 0.01)
+
+    async def run() -> None:
+        buffer = _adaptive_buffer(
+            num_prompts=1, max_offpolicy_steps=1, generation_capacity=4
+        )
+        group_started = asyncio.Event()
+
+        async def run_group_rollouts(**kwargs) -> RolloutGroup:
+            group_started.set()
+            await asyncio.Event().wait()
+
+        controller = _controller_for_rollout_loops(
+            run_group_rollouts=run_group_rollouts,
+            cancel_group=AsyncMock(),
+            events=[],
+        )
+        controller.generator_router.release_groups = SimpleNamespace(
+            call_one=_never_answers
+        )
+        loop = asyncio.create_task(
+            controller._rollout_loop(
+                group_buffer=buffer, generate_fn=None, release_session_fn=None
+            )
+        )
+        await _admit(buffer, 0)
+        await asyncio.wait_for(group_started.wait(), timeout=5)
+
+        loop.cancel()
+        # Unbounded, it would still be waiting after 5 s.
+        await asyncio.wait([loop], timeout=5)
+        assert loop.done()
+        assert isinstance(loop.exception(), TimeoutError)
+        await buffer.close()
 
     asyncio.run(run())
 

@@ -150,6 +150,10 @@ from torchtitan.tools.garbage_collector import GarbageCollector
 
 logger = logging.getLogger(__name__)
 
+# How long a release of groups still in flight may take at shutdown. A generator that can't answer then fails
+# teardown with a TimeoutError instead of hanging it; a healthy release takes one router round trip.
+_SHUTDOWN_RELEASE_TIMEOUT_S = 30.0
+
 
 class _AcquireGroupError(RuntimeError):
     """`acquire_group` raised: admission can't place groups (e.g. its tick task stopped), so every later group
@@ -842,6 +846,8 @@ class Controller(Configurable):
         # TODO: so each group unpickles the router's and every generator's handle in its worker. If each leaks
         # like a handle in a reply (~84 KiB with torchmonarch 0.8.0, unmeasured for arguments), that is ~1.5 MiB
         # per group at 16 generators. Give each rollout worker the handles once at spawn, and ship no handles.
+        # Not done here: it crosses the controller, the worker spawn, the rollout worker actor and the
+        # GenerateFn contract, and Monarch's pickling can't be checked on CPU.
         generator_router = self.generator_router
         rank0_generators = self._rank0_generators
 
@@ -1107,7 +1113,11 @@ class Controller(Configurable):
         finally:
             # Drop the generators' pinned cache salts and held KV for these groups, and their admission charge:
             # also when shutdown cancels this validation, so the one after training gets the room.
-            await self.generator_router.release_groups.call_one(group_ids)
+            shutting_down = asyncio.current_task().cancelling() > 0
+            async with asyncio.timeout(
+                _SHUTDOWN_RELEASE_TIMEOUT_S if shutting_down else None
+            ):
+                await self.generator_router.release_groups.call_one(group_ids)
 
         # Keep the groups that succeeded; log + count the ones that raised.
         rollout_groups: list[RolloutGroup] = []
@@ -1546,7 +1556,10 @@ class Controller(Configurable):
                     # group, or admission keeps its KV room from the validation after training.
                     generation_task.cancel()
                     await asyncio.wait([generation_task])
-                    await self.generator_router.release_groups.call_one([work.group_id])
+                    async with asyncio.timeout(_SHUTDOWN_RELEASE_TIMEOUT_S):
+                        await self.generator_router.release_groups.call_one(
+                            [work.group_id]
+                        )
                     raise
                 if not work.cancelled:
                     # Not the buffer's cancel: propagate it.
