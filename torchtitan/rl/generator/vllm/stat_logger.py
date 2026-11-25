@@ -373,7 +373,7 @@ class VllmOtelStatLogger(Configurable, StatLoggerBase):
         *,
         holder: VLLMSessionKVHolder | None,
         connector: SimpleCPUOffloadConnector | None,
-        worker_connector: SimpleCPUOffloadConnector | None = None,
+        worker_connector: SimpleCPUOffloadConnector | None,
     ) -> None:
         """Export what the session KV holder keeps and what the CPU KV cache stores and fails to serve.
 
@@ -383,7 +383,7 @@ class VllmOtelStatLogger(Configurable, StatLoggerBase):
 
         Example:
 
-            logger.observe_kv_reuse(holder=holder, connector=None)
+            logger.observe_kv_reuse(holder=holder, connector=None, worker_connector=None)
             # an engine with the holder and no CPU offload: exports only the vllm.session_kv.*
             # gauges and counters, and vllm.kv.num_gpu_blocks
 

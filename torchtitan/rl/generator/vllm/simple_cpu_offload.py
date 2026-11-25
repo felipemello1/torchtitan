@@ -8,6 +8,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import inspect
+import logging
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -36,6 +39,15 @@ from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend
 from vllm.v1.simple_kv_offload.cuda_mem_ops import copy_blocks
 
 from torchtitan.rl.generator.vllm.session_kv_holder import cached_block_ids
+
+logger = logging.getLogger(__name__)
+
+# sha256 prefixes of the vLLM `DmaCopyBackend` methods `_TimedDmaCopyBackend` copies. Another vLLM keeps
+# vLLM's backend, untimed: a stale copy of `_copy_loop` could stop every CPU load.
+_COPIED_DMA_BACKEND_SOURCES = {
+    "launch_copy": "bbc7b61174213253",
+    "_copy_loop": "58080d0d3d55c562",
+}
 
 if TYPE_CHECKING:
     from vllm.v1.core.block_pool import BlockPool
@@ -102,9 +114,25 @@ class SimpleCPUOffloadConnector(VllmSimpleCPUOffloadConnector):
         self._timed_copies: deque[_TimedCopy] = deque()
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
-        """Have vLLM's worker build a copy backend that times each copy batch."""
+        """Have vLLM's worker build a copy backend that times each copy batch, if this vLLM's backend is
+        the one `_TimedDmaCopyBackend` copies."""
         # TODO: delete when the vLLM pin includes vllm-project/vllm#41790, which times these copies
         # in vLLM's own connector stats.
+        changed = [
+            name
+            for name, digest in _COPIED_DMA_BACKEND_SOURCES.items()
+            if hashlib.sha256(
+                inspect.getsource(getattr(DmaCopyBackend, name)).encode()
+            ).hexdigest()[:16]
+            != digest
+        ]
+        if changed:
+            logger.warning(
+                "vLLM's DmaCopyBackend.%s changed; CPU KV copies stay untimed (vllm.cpu_kv.copy_time)",
+                ", ".join(changed),
+            )
+            super().register_kv_caches(kv_caches)
+            return
         original_backend = simple_kv_offload_worker.DmaCopyBackend
         simple_kv_offload_worker.DmaCopyBackend = lambda: _TimedDmaCopyBackend(
             self._timed_copies
