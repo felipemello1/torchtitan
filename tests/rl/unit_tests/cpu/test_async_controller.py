@@ -1195,15 +1195,18 @@ def test_generate_fn_forwards_the_session_and_releases_on_failure() -> None:
         raise RuntimeError("generator failed")
 
     generate_call = AsyncMock(side_effect=generate_call)
-    reserve = AsyncMock(
-        return_value=SimpleNamespace(generate=SimpleNamespace(call_one=generate_call))
-    )
+    reserve = AsyncMock(return_value=1)
     release = Mock()
     controller = object.__new__(Controller)
     controller.generator_router = SimpleNamespace(
         reserve=SimpleNamespace(call_one=reserve),
         release_reservation=SimpleNamespace(broadcast=release),
     )
+    # `reserve` replies with an index into the handles the controller keeps.
+    controller._rank0_generators = [
+        SimpleNamespace(generate=SimpleNamespace(call_one=AsyncMock())),
+        SimpleNamespace(generate=SimpleNamespace(call_one=generate_call)),
+    ]
     generate = controller._make_generate_fn()
     prompt = Prompt(token_ids=[1, 2])
 
@@ -1239,6 +1242,7 @@ def test_generate_fn_cancels_a_reserve_its_caller_left() -> None:
         reserve=SimpleNamespace(call_one=reserve),
         cancel_reserve=SimpleNamespace(broadcast=cancel_reserve),
     )
+    controller._rank0_generators = []
     generate = controller._make_generate_fn()
 
     async def main() -> None:
@@ -1368,6 +1372,7 @@ def test_validate_rolls_out_each_prompt_n_times(
         acquire_group=SimpleNamespace(call_one=AsyncMock()),
         release_groups=SimpleNamespace(call_one=AsyncMock()),
     )
+    controller._rank0_generators = []
     controller.rollout_recorder = SimpleNamespace(record=lambda **kwargs: None)
     run_group_rollouts = AsyncMock(
         side_effect=[
@@ -1648,6 +1653,7 @@ def test_setup_keeps_the_buffer_state_and_refuses_a_resume_state_without_it() ->
 
     def fake_generator_router() -> MagicMock:
         generator_router = MagicMock()
+        generator_router.rank0_generators.call_one = AsyncMock(return_value=[])
         generator_router.start_engine_loop.call_one = AsyncMock()
         generator_router.pull_model_state_dict.call_one = AsyncMock()
         return generator_router

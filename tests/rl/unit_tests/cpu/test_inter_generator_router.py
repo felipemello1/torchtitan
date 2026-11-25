@@ -89,11 +89,12 @@ def _router(
 
 def _reserve(router, request_id: str, *, session_id: str | None = None) -> str:
     """Reserve a generator for one generate call of group 0; return its name."""
-    return asyncio.run(
+    index = asyncio.run(
         router.reserve(
             request_id, routing_session_id=session_id, group_id=0, num_prompt_tokens=1
         )
-    ).name
+    )
+    return router.rank0_generators()[index].name
 
 
 def _route(router, *, session_id: str | None = None) -> str:
@@ -101,6 +102,25 @@ def _route(router, *, session_id: str | None = None) -> str:
     name = _reserve(router, "probe", session_id=session_id)
     router.release_reservation("probe", num_tokens=None)
     return name
+
+
+def test_reserve_replies_with_an_index_so_calls_ship_no_actor_handle():
+    """A call gets an index into the `rank0_generators()` list its caller keeps: a reply that carried a
+    handle would build a new handle in the caller on every call (see `reserve`)."""
+    actors = [_Actor("gen0"), _Actor("gen1")]
+    router = _router(actors)
+
+    indices = [
+        asyncio.run(
+            router.reserve(
+                f"r{i}", routing_session_id=None, group_id=0, num_prompt_tokens=1
+            )
+        )
+        for i in range(2)
+    ]
+
+    assert [type(index) for index in indices] == [int, int]
+    assert [router.rank0_generators()[index] for index in indices] == actors
 
 
 def test_least_loaded_routes_to_lowest_reserved_load():
@@ -435,13 +455,13 @@ async def _reserve_call(
     num_prompt_tokens: int = 4000,
 ) -> str:
     """Reserve a generator for one call of `group_id`; return its name."""
-    generator = await router.reserve(
+    index = await router.reserve(
         request_id,
         routing_session_id=session_id,
         group_id=group_id,
         num_prompt_tokens=num_prompt_tokens,
     )
-    return generator.name
+    return router.rank0_generators()[index].name
 
 
 def test_admission_holds_a_group_until_room_and_routes_its_calls_to_its_generator():

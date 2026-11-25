@@ -3,7 +3,8 @@
 Two layers route each generate call:
 
 - `InterGeneratorRouter` (one actor per job) picks a generator mesh. It never sees the payload: `reserve`
-  returns the generator's handle, the caller sends the call there, then calls `release_reservation`.
+  returns the generator's index in `rank0_generators()`, which the caller fetched once; the caller sends
+  the call to that handle, then calls `release_reservation`.
 - `IntraGeneratorRouter` (rank 0 of each generator) picks a data-parallel rank inside the mesh.
 
 Both use a `RoutingStrategy` (`strategies.py`). The default keeps a session's calls (one multi-turn rollout)

@@ -726,6 +726,8 @@ class Controller(Configurable):
         self.actor_system: ActorSystem | None = None
         self.trainer: TrainerHandle | None = None
         self.generator_router: InterGeneratorRouter | None = None
+        # Each generator's rank-0 handle, indexed by `InterGeneratorRouter.reserve`'s reply.
+        self._rank0_generators: list[Any] = []
         # The batcher's single-actor handle.
         self.batcher: Any | None = None
         # Resume step (0 = fresh); set in setup_async from the loaded checkpoint.
@@ -835,10 +837,11 @@ class Controller(Configurable):
         routing on `routing_session_id` (a sample's turns reuse one generator's prefix KV), and call it
         directly."""
         # TODO: make this a pluggable config (a GenerateFn factory) so non-router generate backends can be swapped in.
-        # Bind the router handle to a local so the closure captures it instead of
+        # Bind the handles to locals so the closure captures them instead of
         # `self`. A GenerateFn may be shipped to another process, where an actor
         # handle serializes cheaply and the whole controller does not.
         generator_router = self.generator_router
+        rank0_generators = self._rank0_generators
 
         @sl.log_trace_span("generate")
         async def generate(
@@ -855,7 +858,7 @@ class Controller(Configurable):
             #   worker fails the run.
             reserve_start = time.perf_counter()
             try:
-                generator = await generator_router.reserve.call_one(
+                generator_index = await generator_router.reserve.call_one(
                     request_id,
                     routing_session_id=routing_session_id,
                     group_id=group_id,
@@ -869,7 +872,7 @@ class Controller(Configurable):
             reserve_wait_ms = (time.perf_counter() - reserve_start) * 1000
             completion = None
             try:
-                completion = await generator.generate.call_one(
+                completion = await rank0_generators[generator_index].generate.call_one(
                     prompt,
                     request_id=request_id,
                     group_id=group_id,
@@ -971,6 +974,9 @@ class Controller(Configurable):
                 output_dir=config.dump_folder,
                 vision_processor=config.vision_processor,
                 mooncake_master_address=mooncake_master_address,
+            )
+            self._rank0_generators = (
+                await self.generator_router.rank0_generators.call_one()
             )
             self.batcher = await actor_system.spawn_batcher(
                 async_loop.batcher,

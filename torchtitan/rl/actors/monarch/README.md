@@ -137,11 +137,12 @@ returns (see `ActorSystem`): `.call()` with `.get(rank)` on its result,
 `.call_one()`, `.choose()`, `.stream()` and `.broadcast()`. The trainer comes
 back as a `TrainerHandle` with all-ranks, rank-0 and per-DP-rank handles, and
 each generator as a `ServiceHandle` the router gets, so callers never slice
-meshes themselves. Generator handles come only from the router: its `reserve`
-returns the one a generate call goes to, and every other generator call goes
-through the router's endpoints. These calls appear in the controller (and its
-`GenerateFn`), the rollouter (`.choose()` on the worker pool) and the router (on
-generator handles). The batcher and the trainer see RDMA microbatches only
+meshes themselves. Generator handles come only from the router: the controller
+fetches `rank0_generators` once, `reserve` returns the index of the one a
+generate call goes to, and every other generator call goes through the router's
+endpoints. These calls appear in the controller (and its `GenerateFn`), the
+rollouter (`.choose()` on the worker pool) and the router (on generator
+handles). The batcher and the trainer see RDMA microbatches only
 through the `RDMAMicrobatch` interface.
 
 Another actor framework (e.g. Ray) would add its own `ActorSystem`

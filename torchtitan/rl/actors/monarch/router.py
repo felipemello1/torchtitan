@@ -41,13 +41,17 @@ class _InterGeneratorRouterActorEndpoints:
         routing_session_id: str | None,
         group_id: int,
         num_prompt_tokens: int,
-    ) -> Any:
+    ) -> int:
         return await super().reserve(
             request_id,
             routing_session_id=routing_session_id,
             group_id=group_id,
             num_prompt_tokens=num_prompt_tokens,
         )
+
+    @concurrent_endpoint
+    async def rank0_generators(self) -> list[Any]:
+        return super().rank0_generators()
 
     @concurrent_endpoint
     async def cancel_reserve(self, request_id: str) -> None:

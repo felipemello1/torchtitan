@@ -53,6 +53,9 @@ class _GeneratorHandle(RoutingCandidate):
     """Rank-0 handle of the same generator. Used for calls that only rank 0 needs
     to run."""
 
+    index: int
+    """Position in the router's generator list; `reserve` returns it."""
+
     reserved_load: int = 0
     """Number of in-flight generate calls reserved on this generator."""
 
@@ -136,8 +139,10 @@ class InterGeneratorRouter(Configurable):
     ):
         self._config = config
         self._generators = [
-            _GeneratorHandle(actor=generator.all_ranks, rank0_actor=generator.rank0)
-            for generator in generators
+            _GeneratorHandle(
+                actor=generator.all_ranks, rank0_actor=generator.rank0, index=index
+            )
+            for index, generator in enumerate(generators)
         ]
         if not self._generators:
             raise ValueError("InterGeneratorRouter requires at least one generator")
@@ -161,10 +166,13 @@ class InterGeneratorRouter(Configurable):
         routing_session_id: str | None,
         group_id: int,
         num_prompt_tokens: int,
-    ) -> Any:
+    ) -> int:
         """Pick a generator for one generate call, reserve one load unit on it, and
-        return its rank-0 handle. With admission, the call goes to its group's generator, after
-        its session resumes if admission paused it; without, the strategy routes it.
+        return its index in `rank0_generators()`. With admission, the call goes to its group's
+        generator, after its session resumes if admission paused it; without, the strategy routes it.
+
+        It returns an index because a reply that carries an actor handle builds a new handle in the
+        caller on every call, and torchmonarch 0.8.0 leaks ~84 KiB for each.
 
         A caller cancelled while this waits sends `cancel_reserve`."""
         assert (
@@ -216,9 +224,12 @@ class InterGeneratorRouter(Configurable):
         #   generator-reported KV usage, and stop sending to nearly full generators.
         h.reserved_load += 1
         self._reservations[request_id] = h
-        # Returning the handle keeps callers simple. If router CPU becomes a bottleneck,
-        #   return the generator index and have callers keep the handle list.
-        return h.rank0_actor
+        return h.index
+
+    def rank0_generators(self) -> list[Any]:
+        """Return each generator's rank-0 handle, in the order of `reserve`'s indices. Callers fetch it
+        once and keep it."""
+        return [h.rank0_actor for h in self._generators]
 
     async def _wait_until_resumed(
         self, request_id: str, *, session_id: str, group_id: int
