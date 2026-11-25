@@ -229,6 +229,23 @@ class TrainingSampleBuilder(Configurable):
                 m.Mean(1.0 if is_zero_std else 0.0),
             )
         )
+
+        # The same share, split by the reward every scored rollout got; "other" also counts a group with
+        # none scored. The three sum to group_zero_std_frac.
+        shared_reward = rewards[0] if is_zero_std and rewards else None
+        zero_std_share_by_reward = {
+            "reward_1": shared_reward == 1.0,
+            "reward_0": shared_reward == 0.0,
+            "reward_other": is_zero_std and shared_reward not in (0.0, 1.0),
+        }
+        for name, in_share in zero_std_share_by_reward.items():
+            metrics.append(
+                m.Metric(
+                    f"rollout_reward/group_zero_std_{name}_frac",
+                    m.Mean(1.0 if in_share else 0.0),
+                )
+            )
+
         if self.config.drop_zero_std_reward_groups and is_zero_std:
             metrics.append(
                 m.Metric(
