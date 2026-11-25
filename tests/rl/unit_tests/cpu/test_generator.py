@@ -158,9 +158,15 @@ def _request_output(
     )
 
 
-def _vllm_engine(*, reset_kv_cache_on_model_state_dict_load=False, model=None):
+def _vllm_engine(
+    *,
+    reset_kv_cache_on_model_state_dict_load=False,
+    model=None,
+    num_speculative_tokens=0,
+):
     """A `VLLMEngine` around a fake `LLMEngine` (no engine build)."""
     engine = VLLMEngine.__new__(VLLMEngine)
+    engine.config = SimpleNamespace(num_speculative_tokens=num_speculative_tokens)
     engine._engine = _FakeLLMEngine()
     engine._uses_kv_offload = False
     engine._coordinate_kv_offload = False
@@ -536,6 +542,23 @@ def test_admission_rejects_only_the_request_whose_image_does_not_decode():
     assert "k.png" in str(error) and "truncated" in str(error)
     llm_engine = cast(_FakeLLMEngine, engine._engine)
     assert [kwargs["request_id"] for _, kwargs in llm_engine.add_requests] == ["text"]
+
+
+def test_admission_rejects_one_token_prompts_with_drafts():
+    # vLLM pads a 1-token prompt with placeholder drafts, which GDN's verify kernels can't run.
+    engine = _vllm_engine(num_speculative_tokens=3)
+    one_token = _engine_request("one_token", min_policy_version=6)
+    one_token.prompt = Prompt(token_ids=[1])
+
+    [(request_id, error)] = engine.add_requests(
+        [one_token, _engine_request("two_tokens", min_policy_version=6)]
+    )
+
+    assert request_id == "one_token" and isinstance(error, ValueError)
+    llm_engine = cast(_FakeLLMEngine, engine._engine)
+    assert [kwargs["request_id"] for _, kwargs in llm_engine.add_requests] == [
+        "two_tokens"
+    ]
 
 
 def test_admission_rejects_only_the_invalid_request():
@@ -1183,22 +1206,20 @@ def test_full_mode_decode_dispatch(
 @pytest.mark.parametrize(
     "graph_mode, mixed_step",
     [
-        (CUDAGraphMode.FULL_AND_PIECEWISE, (CUDAGraphMode.PIECEWISE, False)),
+        (CUDAGraphMode.FULL, (CUDAGraphMode.FULL, False)),
         (CUDAGraphMode.FULL_DECODE_ONLY, (CUDAGraphMode.NONE, False)),
     ],
 )
 def test_runner_replays_the_verify_graph_only_when_every_row_verifies(
-    monkeypatch, graph_mode, mixed_step
+    graph_mode, mixed_step
 ):
     """k = 3, 4 rows of 4 tokens each:
 
-                                                         FULL_AND_PIECEWISE   FULL_DECODE_ONLY
-    draft counts [3, 3, 3, 3]                            FULL, uniform        FULL, uniform
-    draft counts [3, 3, 3, -1] (a 4-token prefill row)   PIECEWISE            NONE
-    a step without drafts, after an all-verify step      PIECEWISE            NONE
+                                                         FULL                FULL_DECODE_ONLY
+    draft counts [3, 3, 3, 3]                            FULL, uniform       FULL, uniform
+    draft counts [3, 3, 3, -1] (a 4-token prefill row)   FULL, mixed graph   NONE
+    a step without drafts, after an all-verify step      FULL, mixed graph   NONE
     """
-    # FULL_AND_PIECEWISE under CompilationMode.NONE needs breakable graphs: vLLM's config check rejects it otherwise.
-    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
     config = VllmConfig(device_config=DeviceConfig(device="cpu"))
     config.speculative_config = SimpleNamespace(
         num_speculative_tokens=3, parallel_drafting=False
@@ -1273,8 +1294,8 @@ def test_only_weights_use_cumem_allocator(monkeypatch):
 def test_eagle_proposer_hooks_match_vllm():
     # If vLLM renames a hook, its drafter keeps its own lm_head copy, which weight syncs
     # never update, and nothing else fails.
-    # TODO: a GPU test (an engine with num_speculative_tokens, weight aliases checked after a
-    # model state dict load) needs a small CI checkpoint with an MTP head.
+    # TODO: test_gdn_full_runner_matches_eager[drafts] runs Qwen3.5-0.8B's MTP head on GPU; check
+    # there that the draft's embedding and lm_head still alias the target's after a model state dict load.
     for name in (
         "_create_draft_vllm_config",
         "_maybe_share_embeddings",
@@ -1349,10 +1370,9 @@ def test_cuda_graph_config_with_draft_tokens():
         **kwargs
     )
     assert cfg.cudagraph_capture_sizes[-1] == 256
-    # vLLM's GDN builder graphs only uniform verify steps: steps with prefill replay
-    # piecewise graphs.
+    # FULL with drafts stays FULL: the runner captures verify and mixed graphs, no piecewise ones.
     cfg = VLLMCudaGraphConfig(mode="FULL").get_vllm_compilation_config(**kwargs)
-    assert cfg.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
+    assert cfg.cudagraph_mode == CUDAGraphMode.FULL
 
 
 def test_cuda_graph_full_mode_extends_capture_sizes_to_chunk():

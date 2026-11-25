@@ -159,7 +159,8 @@ def _validate_platform(
 
 
 def _enable_breakable_cuda_graphs() -> None:
-    """Turn on vLLM's breakable CUDA graphs: piecewise graphs that run attention eagerly.
+    """Turn on vLLM's breakable CUDA graphs: piecewise graphs that run attention eagerly,
+    which the MTP drafter replays.
 
     vLLM makes its attention op a graph break when it imports the op, and only if this
     variable is set then. Raises if the op was imported before.
@@ -267,10 +268,11 @@ class VLLMEngine(GenerationEngine):
           acceptance can fall as the policy drifts.
         - With `session_kv_holder`, prefix hits keep the last block that vLLM drops by
           default for drafts (see `_build_engine_args`).
-        - With `cuda_graph.mode="FULL"`, steps with prefill replay piecewise graphs
-          (`VLLMCudaGraphConfig.mode`).
-        - Not supported with `debug.batch_invariant`, models with a vision encoder or
-          non-CUDA devices."""
+        - With `cuda_graph.mode="FULL"`, every target step up to the largest capture size
+          replays a FULL graph; the drafter replays piecewise graphs (`VLLMCudaGraphConfig.mode`).
+        - Not supported with `debug.batch_invariant`, generator data parallelism > 1,
+          models with a vision encoder or non-CUDA devices. `add_requests` rejects
+          1-token prompts."""
 
         @property
         def uses_mooncake_store(self) -> bool:
@@ -343,6 +345,16 @@ class VLLMEngine(GenerationEngine):
                 f"num_speculative_tokens={config.num_speculative_tokens} needs "
                 "debug.batch_invariant=False: the target verifies 1 + k tokens per step "
                 "with kernels the trainer does not run"
+            )
+        if config.num_speculative_tokens > 0 and parallelism.data_parallel_degree > 1:
+            # TODO: support drafts at DP > 1 once tested: a rank's verify graph padded to a peer's size
+            # takes the packed graph (TorchTitanLinearAttentionMetadataBuilder._build_with_drafts), and
+            # idle ranks run dummy batches.
+            raise ValueError(
+                f"num_speculative_tokens={config.num_speculative_tokens} needs "
+                f"data_parallel_degree=1, got {parallelism.data_parallel_degree}: drafts at "
+                "DP > 1 are untested (verify graphs padded to a peer rank's size, idle ranks' "
+                "dummy batches)"
             )
         if config.cuda_graph.uses_breakable_cuda_graphs(config.num_speculative_tokens):
             _enable_breakable_cuda_graphs()
@@ -643,15 +655,27 @@ class VLLMEngine(GenerationEngine):
         rejected_requests: list[tuple[str, Exception]] = []
         for request in requests:
             # Rejected, not raised: the request's `generate` call fails and the engine keeps
-            # serving. Both checks run before LLMEngine.add_request registers the request,
+            # serving. These checks run before LLMEngine.add_request registers the request,
             # so a rejection leaves no engine state:
+            #   - a 1-token prompt with drafts (below);
             #   - `_preprocess_images`: no vision processor, or an image file does not decode;
             #   - vLLM's validation (prompt length, sampling params, token ids): render_cmpl
             #     and InputProcessor.process_inputs raise VLLMClientError (not a ValueError
             #     subclass) or ValueError (recheck on a vLLM upgrade).
-            # Both are deterministic and rank 0 broadcasts the same requests to every TP
+            # All are deterministic and rank 0 broadcasts the same requests to every TP
             # rank, so all ranks reject the same ones; otherwise their collectives hang.
             try:
+                # With drafts, vLLM pads a 1-token prompt with placeholder drafts, which GDN's
+                # verify kernels can't run (TorchTitanLinearAttentionMetadataBuilder raises).
+                if (
+                    self.config.num_speculative_tokens > 0
+                    and len(request.prompt.token_ids) < 2
+                ):
+                    raise ValueError(
+                        f"{request.request_id} has a {len(request.prompt.token_ids)}-token "
+                        f"prompt; num_speculative_tokens={self.config.num_speculative_tokens} "
+                        "needs at least 2 tokens"
+                    )
                 sampling_params = _build_sampling_params(request.sampling)
                 if self._coordinate_kv_offload:
                     # shared_request_id is a copy of Titan's request.request_id,
