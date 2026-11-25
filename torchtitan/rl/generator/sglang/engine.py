@@ -725,6 +725,8 @@ class SGLangEngine(GenerationEngine):
             # order requests of equal priority, so they keep their place in line.
             scheduler.waiting_queue.join(released)
         finished, self._finished = self._finished, []
+        # TODO: abort a request whose summed logprob turns NaN or -inf, as `VLLMEngine.step` does. Until then it
+        # runs until its context fills, and the Verifiers generation server writes its NaN logprobs as invalid JSON.
         finished.extend(request for request, _ in self._output_collector.take())
         return finished
 

@@ -17,6 +17,8 @@ import concurrent.futures
 import copy
 import inspect
 import json
+import logging
+import math
 import os
 import sys
 from contextlib import nullcontext
@@ -25,6 +27,7 @@ from types import ModuleType, SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, Mock, patch
 
+import numpy as np
 import pytest
 import torch
 
@@ -82,6 +85,10 @@ from vllm.exceptions import VLLMValidationError
 from vllm.logprobs import FlatLogprobs, Logprob
 from vllm.sampling_params import RequestOutputKind
 from vllm.utils.cache import LRUCache
+from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
+from vllm.v1.engine.input_processor import InputProcessor
+from vllm.v1.engine.output_processor import OutputProcessor
+from vllm.v1.outputs import LogprobsLists
 from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 
 
@@ -109,6 +116,8 @@ class _FakeLLMEngine:
         self.reset_prefix_cache_calls = []
         self.reset_encoder_cache_calls = 0
         self.renderer = _FakeRenderer()
+        # The running requests, by vLLM's internal id.
+        self.output_processor = SimpleNamespace(request_states={})
 
     def add_request(self, *args, **kwargs):
         self.add_requests.append((args, kwargs))
@@ -132,6 +141,7 @@ def _sample(*, token_ids=(10, 11), finish_reason="stop"):
         token_ids=list(token_ids),
         logprobs=logprobs,
         finish_reason=finish_reason,
+        cumulative_logprob=-0.1 * len(token_ids),
     )
 
 
@@ -165,6 +175,8 @@ def _vllm_engine(*, reset_kv_cache_on_model_state_dict_load=False, model=None):
     )
     engine._get_model = lambda: model
     engine._session_kv_holder = None
+    engine._is_tp_rank_0 = True
+    engine._generator_name = "generator_0"
     engine._vision_processor = None
     engine._pixel_values_lru_cache = LRUCache(
         1 << 20, getsizeof=lambda pixel_values: pixel_values.nbytes
@@ -630,6 +642,97 @@ def test_step_returns_finished_requests_without_grad():
     assert finished.token_logprobs == [-0.1, -0.1]
     assert finished.finish_reason == "stop"
     assert finished.metrics_inputs.num_generation_tokens == 4
+
+
+def test_step_aborts_requests_whose_summed_logprob_is_not_finite(caplog):
+    # vLLM's real OutputProcessor, request states and logprob sums; only the engine core is faked. The abort
+    # reads their fields, so a vLLM upgrade that renames one fails here.
+    output_processor = OutputProcessor(None, log_stats=False, stream_interval=1)
+    internal_ids = {}
+    for request_id in ("ok", "nan-running", "nan-last"):
+        request = EngineCoreRequest(
+            request_id=request_id,
+            prompt_token_ids=[5, 6, 7],
+            mm_features=None,
+            sampling_params=_build_sampling_params(
+                SamplingConfig(temperature=1.0, max_tokens=64, stop_token_ids=[2])
+            ),
+            pooling_params=None,
+            arrival_time=0.0,
+            lora_request=None,
+            cache_salt=None,
+            data_parallel_rank=None,
+        )
+        # vLLM appends a random suffix to the id: the abort must use it, the reply must not.
+        InputProcessor.assign_request_id(request)
+        output_processor.add_request(request, None, None, 0)
+        internal_ids[request_id] = request.request_id
+
+    def core_output(request_id, logprob, finish_reason=None):
+        return EngineCoreOutput(
+            request_id=internal_ids[request_id],
+            new_token_ids=[0],
+            new_logprobs=LogprobsLists(
+                np.array([[0]]),
+                np.array([[logprob]], dtype=np.float32),
+                np.array([1]),
+                None,
+            ),
+            finish_reason=finish_reason,
+        )
+
+    # Step 1: nan-running samples a NaN logprob. Step 2: nan-last ends on a -inf one.
+    # Step 3: a late output for nan-running, which vLLM ignores.
+    core_outputs_by_step = [
+        [
+            core_output("ok", -0.1),
+            core_output("nan-running", math.nan),
+            core_output("nan-last", -0.3),
+        ],
+        [
+            core_output("ok", -0.1),
+            core_output("nan-last", -math.inf, FinishReason.LENGTH),
+        ],
+        [core_output("ok", -0.1), core_output("nan-running", -0.5)],
+    ]
+    aborted_internal_ids = []
+
+    def abort_request(request_ids, internal=False):
+        assert internal
+        aborted_internal_ids.extend(
+            output_processor.abort_requests(request_ids, internal)
+        )
+
+    engine = _vllm_engine()
+    engine._engine = SimpleNamespace(
+        output_processor=output_processor,
+        step=lambda: output_processor.process_outputs(
+            core_outputs_by_step.pop(0), engine_core_timestamp=0.0, iteration_stats=None
+        ).request_outputs,
+        abort_request=abort_request,
+    )
+
+    with caplog.at_level(logging.WARNING, logger=vllm_engine_module.__name__):
+        finished_by_step = [
+            [
+                (request.request_id, request.finish_reason, request.token_ids)
+                for request in engine.step()
+            ]
+            for _ in range(3)
+        ]
+
+    assert finished_by_step == [
+        [("nan-running", "abort", [])],
+        [("nan-last", "abort", [])],
+        [],
+    ]
+    assert aborted_internal_ids == [internal_ids["nan-running"]]
+    assert list(output_processor.request_states) == [internal_ids["ok"]]
+    assert (
+        "generator_0: aborted request nan-running after 1 generated tokens"
+        in caplog.text
+    )
+    assert "aborted request nan-last after 2 generated tokens" in caplog.text
 
 
 def test_step_rejects_more_than_one_sample_per_request():
