@@ -403,9 +403,8 @@ def test_a_session_paused_past_the_bound_swaps_in_for_idle_sessions():
     unpaused = [f"g0/s{i}" for i in range(19)]
     for now in (500.0, 1000.0, 1500.0):
         assert policy.rebalance(now=now) == []
-        _call_again(
-            policy, unpaused[5:], num_tokens=240_000
-        )  # active, so not reclaimed
+        # Active, so not reclaimed.
+        _call_again(policy, unpaused[5:], num_tokens=240_000)
         _call_again(policy, unpaused[:5], num_tokens=262_000)
     assert policy.num_paused_sessions == 2
 
@@ -428,9 +427,8 @@ def test_a_session_idle_past_the_reclaim_time_holds_back_no_group():
         policy.start_call(
             f"again{i}", session_id=f"g0/s{i}", group_id=0, num_prompt_tokens=240_000
         )
-    policy.add_group(
-        1, num_sessions=60, validation=False
-    )  # 60 x 22 = 1,320: 1,624 + 1,320 > 2,878
+    # 60 x 22 = 1,320: 1,624 + 1,320 > 2,878
+    policy.add_group(1, num_sessions=60, validation=False)
     assert policy.place() == {}
 
     # Idle 601 s while a group waits (e.g. nobody released it): it leaves the ledger, and the group fits.
@@ -439,29 +437,61 @@ def test_a_session_idle_past_the_reclaim_time_holds_back_no_group():
     assert policy.ledger(0) == 9 * 164
     assert policy.num_reclaimed_sessions == 1
     assert policy.place() == {1: 0}
-    # Once it calls again, it waits for room like any paused session.
+    # Once it calls again, it waits for room like any paused session: one pause, then one resume.
     assert not policy.start_call(
         "back", session_id="g0/s9", group_id=0, num_prompt_tokens=240_000
     )
     assert policy.num_paused_sessions == 1
+    assert policy.num_pauses == 1
+    policy.release_group(1)
+    assert policy.rebalance(now=602.0) == ["back"]
+    assert (policy.num_pauses, policy.num_resumes) == (1, 1)
 
 
 def test_a_paused_session_that_stops_calling_is_reclaimed():
     policy = _policy()
     _idle_sessions(policy, _OVER_H, first_prompt_tokens=4000)
     policy.rebalance(now=0.0)  # g0/s19 and s20 stay paused, ledger 2,812
-    policy.add_group(
-        1, num_sessions=1, validation=False
-    )  # fits, but waits behind the paused sessions
-    for now in (
-        300.0,
-        601.0,
-    ):  # the unpaused sessions keep calling; s19 and s20 never call again
+    # Fits, but waits behind the paused sessions.
+    policy.add_group(1, num_sessions=1, validation=False)
+    # The unpaused sessions keep calling; s19 and s20 never call again.
+    for now in (300.0, 601.0):
         _call_again(policy, [f"g0/s{i}" for i in range(19)], num_tokens=240_000)
         policy.rebalance(now=now)
 
     assert policy.num_reclaimed_sessions == 2
     assert policy.place() == {1: 0}
+    # When s19 calls again, it keeps its place in the resume order: it has waited since its pause at 0 s.
+    assert not policy.start_call(
+        "back", session_id="g0/s19", group_id=0, num_prompt_tokens=240_000
+    )
+    assert policy.longest_pause_s() == 601.0
+
+
+def test_a_cancelled_call_picked_to_pause_pauses_its_session():
+    """A resumed call that `rebalance` picks to pause at its turn's end, then is cancelled before it
+    runs, pauses its session as a returned call would."""
+    # 300 usable blocks: a 100,000-token session holds 64 idle and charges 80 running; 200,000: 124 / 140.
+    policy = _policy(_budget(num_blocks=681))
+    _idle_sessions(policy, [200_000, 200_000, 100_000])
+    policy.rebalance(now=0.0)  # 312 > 300: g0/s2 pauses, 248
+    assert not policy.start_call(
+        "s2", session_id="g0/s2", group_id=0, num_prompt_tokens=100_000
+    )
+    # g0/s0's next prompt is compacted to 50,000 (50 running): 174 + 80 fits, so s2 resumes.
+    policy.start_call("s0", session_id="g0/s0", group_id=0, num_prompt_tokens=50_000)
+    assert policy.rebalance(now=1.0) == ["s2"]
+    policy.end_call("s0", num_tokens=50_000)
+
+    # All three run, 152 + 140 + 80 = 372: s2 and g0/s1 are picked to pause when their calls end.
+    policy.start_call("s0b", session_id="g0/s0", group_id=0, num_prompt_tokens=220_000)
+    policy.start_call("s1", session_id="g0/s1", group_id=0, num_prompt_tokens=200_000)
+    policy.rebalance(now=2.0)
+    # s2's caller leaves before its call is sent.
+    policy.cancel_call("s2")
+
+    assert policy.num_paused_sessions == 1
+    assert policy.ledger(0) == 152 + 140
 
 
 def test_a_cancelled_waiting_call_is_forgotten():

@@ -54,7 +54,8 @@ histories (`KVRoomAdmission.rebalance`; the constants are in `admission.py`):
     paused PAUSE_AGE_BOUND_S            swap it in for idle sessions, staying under ADMIT_FRACTION x H
     no unpaused session left            resume the longest-paused session at once
     idle IDLE_RECLAIM_S, work waits     reclaim it (a hung env, a session nobody released): it leaves the
-                                        ledger and holds back no group; once it calls, it waits as paused
+                                        ledger and holds back no group; once it calls, it waits as paused,
+                                        and one paused for room before keeps its place
 
 A paused session's next call waits in `reserve`; to the rollout it looks like a slow model call. A
 generator with paused sessions takes no new group. The controller logs `admission/*` each step, and
