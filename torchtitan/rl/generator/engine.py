@@ -173,7 +173,8 @@ class KVCacheBudget:
 
     # TODO: engine-neutral fields (usable blocks, an idle session's fixed blocks, a running session's extra
     # blocks), built by `VLLMSessionKVHolder`, which owns the free-floor rule. That changes every field and
-    # its readers, and waits on the upstream choice between the holder and #5919's evictor.
+    # its readers, and `test_kv_cache_budget_reads_the_kv_cache_groups` (a 5-level vLLM mock) becomes a
+    # holder test. It waits on the upstream choice between the holder and #5919's evictor.
     num_blocks: int
     """GPU KV cache blocks of one data-parallel replica."""
 

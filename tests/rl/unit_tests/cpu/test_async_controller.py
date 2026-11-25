@@ -26,6 +26,7 @@ from torchtitan.rl.controller.adaptive_demand import (
     StallDrivenDemand,
 )
 from torchtitan.rl.controller.controller import (
+    _AcquireGroupError,
     AsyncLoopConfig,
     Controller,
     ValidationConfig,
@@ -2083,9 +2084,7 @@ def test_rollout_loop_stops_a_group_the_buffer_cancels_on_its_worker() -> None:
     asyncio.run(run())
 
 
-def test_rollout_loop_acquires_before_rolling_out_and_releases_a_group_cancelled_while_waiting() -> (
-    None
-):
+def test_rollout_loop_acquires_first_and_releases_a_group_cancelled_while_waiting() -> None:
     async def run() -> None:
         buffer = _adaptive_buffer(
             num_prompts=1, max_offpolicy_steps=1, generation_capacity=4
@@ -2133,6 +2132,38 @@ def test_rollout_loop_acquires_before_rolling_out_and_releases_a_group_cancelled
         assert (await taker).group_id == 2
         await buffer.close()
         await asyncio.gather(*loops)
+
+    asyncio.run(run())
+
+
+def test_rollout_loop_ends_the_run_when_acquire_group_fails() -> None:
+    """A failed `acquire_group` (e.g. the router's admission tick stopped) ends the loop, which ends the
+    run: no later group could be placed either. It is not dropped as one failed group."""
+
+    async def run() -> None:
+        buffer = _adaptive_buffer(
+            num_prompts=1, max_offpolicy_steps=1, generation_capacity=4
+        )
+        run_group_rollouts = AsyncMock()
+        controller = _controller_for_rollout_loops(
+            run_group_rollouts=run_group_rollouts,
+            cancel_group=AsyncMock(),
+            events=[],
+            acquire_group=AsyncMock(
+                side_effect=RuntimeError("the admission tick task stopped")
+            ),
+        )
+        loop = asyncio.create_task(
+            controller._rollout_loop(
+                group_buffer=buffer, generate_fn=None, release_session_fn=None
+            )
+        )
+        await _admit(buffer, 0)
+
+        with pytest.raises(_AcquireGroupError):
+            await asyncio.wait_for(loop, timeout=5)
+        run_group_rollouts.assert_not_awaited()
+        await buffer.close()
 
     asyncio.run(run())
 

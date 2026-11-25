@@ -837,9 +837,11 @@ class Controller(Configurable):
         routing on `routing_session_id` (a sample's turns reuse one generator's prefix KV), and call it
         directly."""
         # TODO: make this a pluggable config (a GenerateFn factory) so non-router generate backends can be swapped in.
-        # Bind the handles to locals so the closure captures them instead of
-        # `self`. A GenerateFn may be shipped to another process, where an actor
-        # handle serializes cheaply and the whole controller does not.
+        # Bind the handles to locals so the closure captures them instead of `self`: the GenerateFn ships to
+        # a rollout worker with each group, and the whole controller does not serialize.
+        # TODO: so each group unpickles the router's and every generator's handle in its worker. If each leaks
+        # like a handle in a reply (~84 KiB with torchmonarch 0.8.0, unmeasured for arguments), that is ~1.5 MiB
+        # per group at 16 generators. Give each rollout worker the handles once at spawn, and ship no handles.
         generator_router = self.generator_router
         rank0_generators = self._rank0_generators
 
