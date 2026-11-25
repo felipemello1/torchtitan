@@ -17,6 +17,7 @@ from torchtitan.rl.generator.vllm.session_kv_holder import (
     cached_block_ids,
     VLLMSessionKVHolder,
 )
+from torchtitan.rl.generator.vllm.simple_cpu_offload import PromptCacheSplit
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_manager import KVCacheManager
@@ -552,8 +553,14 @@ def test_lost_prefix_counts_history_the_next_turn_recomputes(manager):
     cached_at_admission = {}
     connector = Mock()
     connector.get_pending_save_ids.return_value = set()
-    connector.pop_cached_tokens.side_effect = lambda request_id: (
-        cached_at_admission.pop(request_id, None)
+    connector.prompt_cache_split.side_effect = lambda request_id: (
+        None
+        if request_id not in cached_at_admission
+        else PromptCacheSplit(
+            gpu_cached_tokens=cached_at_admission[request_id],
+            cpu_cached_tokens=0,
+            computed_tokens=0,
+        )
     )
     requests = {}
     scheduler = _scheduler(
@@ -598,7 +605,6 @@ def test_lost_prefix_counts_history_the_next_turn_recomputes(manager):
     # A compacted history doesn't continue turn 2: nothing reusable, nothing lost.
     finished_turn("t3", list(range(500, 600)), 0)
     assert reusable_and_lost() == (64, 16)
-    assert not cached_at_admission
 
     # GPU pressure drops the hold first; the group release must still forget the session.
     holder.free_floor_blocks = manager.block_pool.get_num_free_blocks() + 1

@@ -75,7 +75,7 @@ class VLLMSessionKVHolder(Configurable):
         offload_connector: Optional connector with ``get_pending_save_ids()``,
             ``release_session_cache(released_hashes, active_hashes)``,
             ``drop_session_cache(block_hashes)`` and
-            ``pop_cached_tokens(request_id)``.
+            ``prompt_cache_split(request_id)``.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -459,12 +459,16 @@ class VLLMSessionKVHolder(Configurable):
         """
         # TODO: without a KV connector, take the cached tokens from the finished request's
         # num_cached_tokens, which VLLMEngine reads at finish, so lost prefix needs no offload.
-        num_cached_tokens = self._offload_connector.pop_cached_tokens(
+        prompt_cache_split = self._offload_connector.prompt_cache_split(
             request.request_id
         )
         last_turn = self._last_turns.get(session_id)
-        if num_cached_tokens is None or last_turn is None:
+        if prompt_cache_split is None or last_turn is None:
             return
+
+        num_cached_tokens = (
+            prompt_cache_split.gpu_cached_tokens + prompt_cache_split.cpu_cached_tokens
+        )
 
         num_last_hashes = last_turn.num_block_hashes
         continues_last_turn = (

@@ -13,11 +13,15 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 from torchtitan.rl.generator.vllm import simple_cpu_offload
-from torchtitan.rl.generator.vllm.simple_cpu_offload import SimpleCPUOffloadConnector
+from torchtitan.rl.generator.vllm.simple_cpu_offload import (
+    PromptCacheSplit,
+    SimpleCPUOffloadConnector,
+)
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, SlidingWindowSpec
+from vllm.v1.metrics.stats import PrefillStats
 from vllm.v1.simple_kv_offload.metadata import SimpleCPUOffloadMetadata
 
 
@@ -175,13 +179,24 @@ def test_gpu_block_reuse_counter_refuses_vllm_kv_cache_metrics():
         _connector(BlockPool(4, True, 16)).bind_gpu_block_pool(gpu_pool)
 
 
-def _prompt(request_id: str, block_hashes: list[bytes], num_cached_tokens: int):
+def _prompt(
+    request_id: str,
+    block_hashes: list[bytes],
+    num_cached_tokens: int,
+    num_cpu_cached_tokens: int = 0,
+):
     """A prompt of 6 full 16-token blocks plus 1 token, as the connector sees it."""
+    prefill_stats = PrefillStats()
+    prefill_stats.set(
+        num_prompt_tokens=16 * 6 + 1,
+        num_local_cached_tokens=num_cached_tokens - num_cpu_cached_tokens,
+        num_external_cached_tokens=num_cpu_cached_tokens,
+    )
     return SimpleNamespace(
         request_id=request_id,
         num_prompt_tokens=16 * 6 + 1,
         block_hashes=block_hashes,
-        prefill_stats=SimpleNamespace(num_cached_tokens=num_cached_tokens),
+        prefill_stats=prefill_stats,
     )
 
 
@@ -235,22 +250,27 @@ def test_broken_chain_counts_a_hole_and_a_missing_gdn_state(hash_block_size):
     assert connector.broken_chain_tokens == {"hole": 80, "no_state": 32}
 
 
-def test_cached_tokens_at_admission_are_popped_once_or_dropped_at_finish():
+def test_prompt_cache_split_lasts_until_the_engine_pops_it():
     connector = _connector(
         BlockPool(4, True, 16), fa_block_size=16, hash_block_size=16, fa_gidx=0
     )
     connector.bind_gpu_block_pool(BlockPool(4, True, 16))
-    held = _prompt("held", [f"held{index}".encode() for index in range(6)], 16)
-    aborted = _prompt("aborted", [f"aborted{index}".encode() for index in range(6)], 0)
-    for request in (held, aborted):
-        connector.update_state_after_alloc(request, None, 0)
+    # 97 prompt tokens: 16 from the GPU cache, 32 from the CPU cache, 49 computed.
+    request = _prompt(
+        "r", [f"r{index}".encode() for index in range(6)], 48, num_cpu_cached_tokens=32
+    )
+    connector.update_state_after_alloc(request, None, 0)
+    split = PromptCacheSplit(
+        gpu_cached_tokens=16, cpu_cached_tokens=32, computed_tokens=49
+    )
+    assert connector.prompt_cache_split("r") == split
 
-    assert connector.pop_cached_tokens("held") == 16
-    assert connector.pop_cached_tokens("held") is None
+    # A finished request keeps it, so the engine can log it after vLLM's step.
+    connector.request_finished_all_groups(request, ([],))
+    assert connector.prompt_cache_split("r") == split
 
-    # A request that finishes before the holder pops (e.g. aborted while queued) leaves nothing behind.
-    connector.request_finished_all_groups(aborted, ([],))
-    assert connector.pop_cached_tokens("aborted") is None
+    connector.pop_prompt_cache_split("r")
+    assert connector.prompt_cache_split("r") is None
 
 
 def test_store_count_and_cpu_gdn_state_scan():

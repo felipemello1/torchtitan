@@ -101,8 +101,8 @@ class SimpleCPUOffloadConnector(VllmSimpleCPUOffloadConnector):
         self.num_cpu_gdn_state_blocks = 0
         self._next_cpu_scan_time = 0.0
         self._gpu_block_pool: BlockPool | None = None
-        # Prefix tokens the GPU and CPU caches served at admission, by request id.
-        self._cached_tokens_at_admission: dict[str, int] = {}
+        # Where each request's prompt tokens came from at admission, until the engine pops it.
+        self._prompt_cache_splits: dict[str, PromptCacheSplit] = {}
         # When each request with a CPU hit was admitted, until its load finishes.
         self._load_start_times: dict[str, float] = {}
         # The stat logger drains these on the engine thread.
@@ -181,31 +181,40 @@ class SimpleCPUOffloadConnector(VllmSimpleCPUOffloadConnector):
     def update_state_after_alloc(
         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
     ) -> None:
-        """Record the prefix tokens cached at admission and a CPU load's start; count a broken prefix chain."""
+        """Record where the prompt's tokens came from at admission and a CPU load's start; count a broken
+        prefix chain."""
         super().update_state_after_alloc(request, blocks, num_external_tokens)
         if num_external_tokens > 0:
             self._load_start_times.setdefault(request.request_id, time.monotonic())
 
         # vLLM calls this again once a CPU load finishes; only the first call admits.
         stats = request.prefill_stats
-        if stats is None or request.request_id in self._cached_tokens_at_admission:
+        if stats is None or request.request_id in self._prompt_cache_splits:
             return
 
-        self._cached_tokens_at_admission[request.request_id] = stats.num_cached_tokens
+        self._prompt_cache_splits[request.request_id] = PromptCacheSplit(
+            gpu_cached_tokens=stats.num_local_cached_tokens,
+            cpu_cached_tokens=stats.num_external_cached_tokens,
+            computed_tokens=stats.num_computed_tokens,
+        )
         self._count_broken_chain(request, blocks, stats.num_cached_tokens)
 
-    def pop_cached_tokens(self, request_id: str) -> int | None:
-        """Return and forget the prefix tokens the GPU and CPU caches served at admission.
+    def prompt_cache_split(self, request_id: str) -> PromptCacheSplit | None:
+        """Where a request's prompt tokens came from at admission, until `pop_prompt_cache_split`.
 
         None if the request was never admitted with prefill stats (e.g. a preempted re-admission).
         """
-        return self._cached_tokens_at_admission.pop(request_id, None)
+        return self._prompt_cache_splits.get(request_id)
+
+    def pop_prompt_cache_split(self, request_id: str) -> None:
+        """Forget a finished request's split. The engine calls it after it read the step's
+        outputs: the split of a request that vLLM finished in the step is still readable there."""
+        self._prompt_cache_splits.pop(request_id, None)
 
     def request_finished_all_groups(
         self, request: Request, block_ids: tuple[list[int], ...]
     ) -> tuple[bool, dict[str, Any] | None]:
         # vLLM calls this one, not `request_finished`: this connector supports the hybrid allocator.
-        self._cached_tokens_at_admission.pop(request.request_id, None)
         self._load_start_times.pop(request.request_id, None)
         return super().request_finished_all_groups(request, block_ids)
 
@@ -379,6 +388,19 @@ class SimpleCPUOffloadConnector(VllmSimpleCPUOffloadConnector):
         cpu_pool.evict_blocks(cached_block_ids(cpu_pool, block_hashes))
         cpu_pool.metrics_collector = collector
         return not gpu_block_ids & saving
+
+
+@dataclass(frozen=True, slots=True)
+class PromptCacheSplit:
+    """Where one request's prompt tokens came from at admission.
+
+    Example: a 60,000-token prompt; the GPU cache held 40,000, the CPU cache 15,000:
+        PromptCacheSplit(gpu_cached_tokens=40_000, cpu_cached_tokens=15_000, computed_tokens=5_000)
+    """
+
+    gpu_cached_tokens: int
+    cpu_cached_tokens: int
+    computed_tokens: int
 
 
 @dataclass(frozen=True, slots=True)

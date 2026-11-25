@@ -60,7 +60,10 @@ from torchtitan.rl.generator.vllm.engine import (
     VLLMEngine,
 )
 from torchtitan.rl.generator.vllm.session_kv_holder import VLLMSessionKVHolder
-from torchtitan.rl.generator.vllm.simple_cpu_offload import SimpleCPUOffloadConnector
+from torchtitan.rl.generator.vllm.simple_cpu_offload import (
+    PromptCacheSplit,
+    SimpleCPUOffloadConnector,
+)
 from torchtitan.rl.generator.vllm.worker import (
     _alias_draft_weight,
     TorchTitanCudagraphDispatcher,
@@ -183,7 +186,10 @@ def _vllm_engine(*, reset_kv_cache_on_model_state_dict_load=False, model=None):
     )
     engine._get_model = lambda: model
     engine._session_kv_holder = None
+    engine._offload_connector = None
     engine._internal_request_ids = {}
+    engine._num_non_finite_aborts = 0
+    engine._num_non_finite_aborts_at_last_log = 0
     engine._is_tp_rank_0 = True
     engine._generator_name = "generator_0"
     engine._vision_processor = None
@@ -720,6 +726,7 @@ def test_stamp_sets_outstanding_generation_min_policy_version():
 
 def test_step_returns_finished_requests_without_grad():
     engine = _vllm_engine()
+    engine._internal_request_ids = {"r0": "r0-a9f"}
     grad_enabled = []
 
     def step():
@@ -805,10 +812,23 @@ def test_step_aborts_requests_whose_summed_logprob_is_not_finite(caplog):
         ).request_outputs,
         abort_request=abort_request,
     )
-    engine._session_kv_holder = Mock()
+    engine._session_kv_holder = Mock(num_sessions=0, num_evicted=0)
     engine._internal_request_ids = dict(internal_ids)
+    # The connector keeps each request's split until the engine pops it after the step.
+    splits = {
+        internal_ids["nan-running"]: PromptCacheSplit(
+            gpu_cached_tokens=2, cpu_cached_tokens=1, computed_tokens=0
+        ),
+        internal_ids["nan-last"]: PromptCacheSplit(
+            gpu_cached_tokens=0, cpu_cached_tokens=3, computed_tokens=0
+        ),
+    }
+    engine._offload_connector = SimpleNamespace(
+        prompt_cache_split=splits.get,
+        pop_prompt_cache_split=lambda request_id: splits.pop(request_id, None),
+    )
 
-    with caplog.at_level(logging.WARNING, logger=vllm_engine_module.__name__):
+    with caplog.at_level(logging.INFO, logger=vllm_engine_module.__name__):
         finished_by_step = [
             [
                 (request.request_id, request.finish_reason, request.token_ids)
@@ -816,6 +836,8 @@ def test_step_aborts_requests_whose_summed_logprob_is_not_finite(caplog):
             ]
             for _ in range(3)
         ]
+        engine.log_stats(step=3)
+        engine.log_stats(step=4)
 
     assert finished_by_step == [
         [("nan-running", "abort", [])],
@@ -834,11 +856,25 @@ def test_step_aborts_requests_whose_summed_logprob_is_not_finite(caplog):
         ({internal_ids["nan-last"]},),
         (set(),),
     ]
+    # Both abort paths log the first non-finite token and the prompt's split, then pop the split.
     assert (
-        "generator_0: aborted request nan-running after 1 generated tokens"
+        "generator_0: aborted request nan-running: the first NaN or -inf logprob is at generated "
+        "token index 0 of 1. Prompt tokens: GPU cache 2, CPU cache 1, computed 0"
         in caplog.text
     )
-    assert "aborted request nan-last after 2 generated tokens" in caplog.text
+    assert (
+        "aborted request nan-last: the first NaN or -inf logprob is at generated token index 1 "
+        "of 2. Prompt tokens: GPU cache 0, CPU cache 3, computed 0" in caplog.text
+    )
+    assert splits == {}
+    assert (
+        "generator_0 at step 3: 2 requests aborted for a non-finite logprob since the last "
+        "step (2 in total)" in caplog.text
+    )
+    assert (
+        "generator_0 at step 4: 0 requests aborted for a non-finite logprob since the last "
+        "step (2 in total)" in caplog.text
+    )
 
 
 def test_step_rejects_more_than_one_sample_per_request():

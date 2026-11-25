@@ -109,6 +109,9 @@ class GenerationServer(Configurable):
         self.bound_port: int | None = None
         self.request_counts: dict[str, int] = {}
         self.generation_metadata: dict[str, VerifiersGenerationMetadata] = {}
+        # Generate calls per session that the generator aborted (finish reason "abort"). No
+        # Verifiers trace keeps a failed call, so the rollouter reads them here.
+        self.num_aborted_calls: dict[str, int] = {}
 
     @property
     def port(self) -> int:
@@ -159,6 +162,7 @@ class GenerationServer(Configurable):
         self.bound_port = None
         self.request_counts.clear()
         self.generation_metadata.clear()
+        self.num_aborted_calls.clear()
 
     def pop_generation_metadata(
         self, session_id: str
@@ -281,6 +285,10 @@ class GenerationServer(Configurable):
                 status=500,
             )
         if completion.finish_reason not in ("stop", "length"):
+            if completion.finish_reason == "abort":
+                self.num_aborted_calls[session_id] = (
+                    self.num_aborted_calls.get(session_id, 0) + 1
+                )
             return web.json_response(
                 {
                     "error": "generation finished without a usable completion: "

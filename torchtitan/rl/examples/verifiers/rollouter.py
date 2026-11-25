@@ -289,6 +289,27 @@ class VerifiersRolloutWorker(BaseRolloutWorker):
         group = await self.make_scored_group(
             rollouts=[task.result() for task in tasks], sample=sample, group_id=group_id
         )
+        # Generate calls the generator aborted (e.g. for a non-finite logprob), and the rollouts
+        # that had one and don't train.
+        num_aborted_calls_per_rollout = [
+            rollout.logs.get("num_aborted_calls", 0) for rollout in group.rollouts
+        ]
+        num_untrainable_with_aborted_call = sum(
+            num_aborted_calls > 0 and not rollout.status.is_trainable()
+            for rollout, num_aborted_calls in zip(
+                group.rollouts, num_aborted_calls_per_rollout, strict=True
+            )
+        )
+        group.metrics += [
+            m.Metric(
+                "rollout/aborted_generate_calls",
+                m.Sum(float(sum(num_aborted_calls_per_rollout))),
+            ),
+            m.Metric(
+                "rollout/untrainable_with_aborted_call",
+                m.Sum(float(num_untrainable_with_aborted_call)),
+            ),
+        ]
         group.metrics += self.flush_process_metrics(group_id)
         return group
 
@@ -308,6 +329,7 @@ class VerifiersRolloutWorker(BaseRolloutWorker):
         if not isinstance(sample, VerifiersTaskSample):
             raise TypeError("Verifiers requires a VerifiersTaskSample")
 
+        num_aborted_calls = 0
         try:
             # ======== Run the whole rollout in Verifiers ========
             # One VerifiersEnvClient.run executes a complete rollout. The harness
@@ -334,14 +356,19 @@ class VerifiersRolloutWorker(BaseRolloutWorker):
 
             # TODO: an attempt Verifiers retried has no trace here, so its held KV waits for the
             # group's release. The generation server could record each rollout's session ids and
-            # release those too. Its metadata, with any top-k rows, also stays until `close()`, as
-            # does every session of a `run` that raises (no trace ids then). With router admission,
-            # such a session is reclaimed after `IDLE_RECLAIM_S`, and a rollout that raised before
-            # its first call stays charged until the group's release.
+            # release those too. Its metadata, with any top-k rows, and its count of aborted calls
+            # also stay until `close()`, as do those of every session of a `run` that raises (no
+            # trace ids then). With router admission, such a session is reclaimed after
+            # `IDLE_RECLAIM_S`, and a rollout that raised before its first call stays charged until
+            # the group's release.
             generation_metadata_by_session = {
                 trace.id: self._generation_server.pop_generation_metadata(trace.id)
                 for trace in verifiers_episode.traces
             }
+            num_aborted_calls = sum(
+                self._generation_server.num_aborted_calls.pop(trace.id, 0)
+                for trace in verifiers_episode.traces
+            )
 
             async def release(session_id: str) -> None:
                 try:
@@ -427,6 +454,9 @@ class VerifiersRolloutWorker(BaseRolloutWorker):
                 logs={"errors": [error_entry(error)]},
             )
 
+        # From the generation server: no trace keeps a failed generate call. Set only when one was.
+        if num_aborted_calls > 0:
+            rollout.logs["num_aborted_calls"] = num_aborted_calls
         log_failed_rollout(rollout)
 
         return rollout

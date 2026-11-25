@@ -234,16 +234,6 @@ def test_non_finite_abort_uncaches_the_sessions_kv_and_keeps_other_sessions(
     block_hasher = get_request_block_hasher(BLOCK, sha256)
     loads_in_flight: set[str] = set()
 
-    # Prefix tokens the GPU and CPU served each turn at admission (the holder pops them at prefill).
-    cached_tokens = {}
-    pop_cached_tokens = connector.pop_cached_tokens
-
-    def recording_pop_cached_tokens(request_id: str) -> int | None:
-        cached_tokens[request_id] = pop_cached_tokens(request_id)
-        return cached_tokens[request_id]
-
-    monkeypatch.setattr(connector, "pop_cached_tokens", recording_pop_cached_tokens)
-
     # The GPU and CPU copies of s1's and s2's KV just before and after the step that drops s0's.
     other_hashes: set[bytes] = set()
     other_copies = []
@@ -300,6 +290,8 @@ def test_non_finite_abort_uncaches_the_sessions_kv_and_keeps_other_sessions(
         abort=True,
     )
     s0_only_hashes |= set(aborted.block_hashes) - set(s1_first.block_hashes)
+    # The split the engine logs for this abort: s0's history came back from the CPU.
+    assert connector.prompt_cache_split("s0/t1").cpu_cached_tokens > 0
     assert not cached_block_ids(gpu_pool, s0_only_hashes)
     assert not cached_block_ids(cpu_pool, s0_only_hashes)
     assert not holder.has_pending_work
@@ -308,8 +300,10 @@ def test_non_finite_abort_uncaches_the_sessions_kv_and_keeps_other_sessions(
 
     # s0's next turn reuses at most the shared prompt; its sibling s1 reuses all of its last turn.
     run_turn("s0/t2", "s0", 0, list(aborted.prompt_token_ids) + list(range(500, 520)))
-    assert cached_tokens["s0/t2"] <= len(shared)
+    s0_split = connector.prompt_cache_split("s0/t2")
+    assert s0_split.gpu_cached_tokens + s0_split.cpu_cached_tokens <= len(shared)
     run_turn("s1/t1", "s1", 0, list(s1_first.all_token_ids) + list(range(900, 920)))
-    assert cached_tokens["s1/t1"] == 64
+    s1_split = connector.prompt_cache_split("s1/t1")
+    assert s1_split.gpu_cached_tokens + s1_split.cpu_cached_tokens == 64
     # s0's recompute is on purpose, not a lost prefix.
     assert holder.num_lost_prefix_tokens == 0

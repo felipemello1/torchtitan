@@ -16,7 +16,7 @@ import tempfile
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from hashlib import sha256
-from typing import Any, Literal
+from typing import Any, Literal, TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -74,6 +74,9 @@ from torchtitan.rl.generator.vllm.stat_logger import (
     VllmOtelStatLogger,
 )
 from torchtitan.tools.utils import device_type, has_cuda_capability
+
+if TYPE_CHECKING:
+    from vllm.logprobs import FlatLogprobs
 
 logger = logging.getLogger(__name__)
 
@@ -540,9 +543,14 @@ class VLLMEngine(GenerationEngine):
             and config.kv_transfer_config.kv_connector == "SimpleCPUOffloadConnector"
             else None
         )
+        self._offload_connector = offload_connector
         self._session_kv_holder: VLLMSessionKVHolder | None = None
-        # vLLM's request id for each of ours in flight (it may add a suffix), for the holder.
+        # vLLM's request id for each of ours in flight (it may add a suffix), for the holder and
+        # the connector, which key requests by it.
         self._internal_request_ids: dict[str, str] = {}
+        # Requests aborted for a non-finite logprob: in total, and at the last `log_stats`.
+        self._num_non_finite_aborts = 0
+        self._num_non_finite_aborts_at_last_log = 0
         if config.session_kv_holder is not None:
             self._session_kv_holder = config.session_kv_holder.build(
                 scheduler=scheduler, offload_connector=offload_connector
@@ -817,13 +825,13 @@ class VLLMEngine(GenerationEngine):
                     arrival_time=request.arrival_time,
                     priority=max(request.group_id, -1),
                 )
+                self._internal_request_ids[request.request_id] = internal_request_id
                 if self._session_kv_holder is not None:
                     self._session_kv_holder.track(
                         internal_request_id,
                         request.routing_session_id,
                         request.group_id,
                     )
-                    self._internal_request_ids[request.request_id] = internal_request_id
             except (ValueError, VLLMClientError) as exc:
                 rejected_requests.append((request.request_id, exc))
         return rejected_requests
@@ -943,21 +951,29 @@ class VLLMEngine(GenerationEngine):
                 finished_requests.append(
                     self._aborted_request(
                         request_output.request_id,
+                        internal_request_id=self._internal_request_ids[
+                            request_output.request_id
+                        ],
                         num_tokens=len(completion_output.token_ids),
+                        logprobs=completion_output.logprobs,
                     )
                 )
         finished_requests += self._abort_running_requests_with_non_finite_logprobs()
+
+        # Every finished request leaves the id map, and the connector forgets its split.
+        aborted_request_ids = set()
+        for request in finished_requests:
+            internal_request_id = self._internal_request_ids.pop(request.request_id)
+            if self._offload_connector is not None:
+                self._offload_connector.pop_prompt_cache_split(internal_request_id)
+            if request.finish_reason == "abort":
+                aborted_request_ids.add(internal_request_id)
 
         if self._session_kv_holder is not None:
             # Both abort paths: the holder drops each aborted turn's cached prefix.
             # TODO: this passes every request with finish reason "abort"; today only the two
             # non-finite paths abort. Before a cancel or timeout path aborts through vLLM, collect the
             # ids in the non-finite paths instead, else the holder drops the cancelled session's KV.
-            aborted_request_ids = set()
-            for request in finished_requests:
-                internal_request_id = self._internal_request_ids.pop(request.request_id)
-                if request.finish_reason == "abort":
-                    aborted_request_ids.add(internal_request_id)
             self._session_kv_holder.after_step(aborted_request_ids)
         return finished_requests
 
@@ -972,8 +988,9 @@ class VLLMEngine(GenerationEngine):
             -> vLLM drops "g7/r0-c21"; returns FinishedRequest(request_id="g7/r0", token_ids=[],
                finish_reason="abort"), which the caller's `generate` returns
         """
-        # TODO: find why logprobs turn non-finite: ~7 requests per hour with an fp8 KV cache, 3 MTP draft
-        # tokens and an FA4 build with fp8 SwapAB decode (candidates: vllm-project/vllm#62800, #67717).
+        # TODO: find why logprobs turn non-finite: ~40 requests per hour over 16 engines with an fp8 KV
+        # cache, 3 MTP draft tokens and an FA4 build with fp8 SwapAB decode (candidates:
+        # vllm-project/vllm#62800, #67717).
         # Until then this check ends such a request at once, so no non-finite logprob leaves the engine,
         # and the session KV holder drops the turn's cached prefix, so the next turn doesn't read it.
         # No collective: every TP rank samples from the same full logits, so all ranks abort the same
@@ -994,18 +1011,57 @@ class VLLMEngine(GenerationEngine):
         )
         return [
             self._aborted_request(
-                state.external_req_id, num_tokens=state.detokenizer.num_output_tokens()
+                state.external_req_id,
+                internal_request_id=state.request_id,
+                num_tokens=state.detokenizer.num_output_tokens(),
+                logprobs=state.logprobs_processor.logprobs,
             )
             for state in non_finite_states
         ]
 
-    def _aborted_request(self, request_id: str, *, num_tokens: int) -> FinishedRequest:
+    def _aborted_request(
+        self,
+        request_id: str,
+        *,
+        internal_request_id: str,
+        num_tokens: int,
+        logprobs: FlatLogprobs,
+    ) -> FinishedRequest:
         """Log the abort of a request whose summed logprob is not finite, and return it with finish
-        reason "abort" and no tokens: none of them can train."""
+        reason "abort" and no tokens: none of them can train.
+
+        Example log line: the last of 812 generated tokens has the first NaN or -inf logprob. Of the
+        60,000 prompt tokens, the GPU cache held 40,000 and the CPU cache 15,000:
+            gen3: aborted request g7/r0: the first NaN or -inf logprob is at generated token index
+            811 of 812. Prompt tokens: GPU cache 40000, CPU cache 15000, computed 5000
+        """
+        self._num_non_finite_aborts += 1
         if self._is_tp_rank_0:
+            # The sampled token's logprob comes first in each position's entries.
+            position = next(
+                (
+                    position
+                    for position, start in enumerate(logprobs.start_indices)
+                    if not math.isfinite(logprobs.logprobs[start])
+                ),
+                "unknown",
+            )
+            prompt_cache_split = (
+                None
+                if self._offload_connector is None
+                else self._offload_connector.prompt_cache_split(internal_request_id)
+            )
+            prompt_tokens = (
+                "unknown"
+                if prompt_cache_split is None
+                else f"GPU cache {prompt_cache_split.gpu_cached_tokens}, "
+                f"CPU cache {prompt_cache_split.cpu_cached_tokens}, "
+                f"computed {prompt_cache_split.computed_tokens}"
+            )
             logger.warning(
-                f"{self._generator_name}: aborted request {request_id} after {num_tokens} generated "
-                "tokens: its summed logprob is not finite (NaN or -inf)"
+                f"{self._generator_name}: aborted request {request_id}: the first NaN or -inf "
+                f"logprob is at generated token index {position} of {num_tokens}. Prompt tokens: "
+                f"{prompt_tokens}"
             )
         return FinishedRequest(
             request_id=request_id,
@@ -1068,6 +1124,18 @@ class VLLMEngine(GenerationEngine):
         )
 
     def log_stats(self, step: int) -> None:
+        num_new_aborts = (
+            self._num_non_finite_aborts - self._num_non_finite_aborts_at_last_log
+        )
+        self._num_non_finite_aborts_at_last_log = self._num_non_finite_aborts
+        logger.info(
+            "%s at step %d: %d requests aborted for a non-finite logprob since the last step "
+            "(%d in total)",
+            self._generator_name,
+            step,
+            num_new_aborts,
+            self._num_non_finite_aborts,
+        )
         if self._session_kv_holder is not None:
             logger.info(
                 "Session KV at step %d: %d sessions held, %d evicted so far",

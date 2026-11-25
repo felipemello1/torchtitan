@@ -39,7 +39,7 @@ from torchtitan.rl.examples.verifiers.rollouter import (
 from torchtitan.rl.generator.types import SamplingConfig
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout.rollouter import log_failed_rollout
-from torchtitan.rl.rollout.types import Completion, Rollout, RolloutStatus
+from torchtitan.rl.rollout.types import Completion, Rollout, RolloutGroup, RolloutStatus
 from verifiers.v1.trace import Error as VerifiersError
 
 
@@ -945,6 +945,7 @@ def test_generation_server_rejects_aborted_generation() -> None:
                 assert response.status == 502
                 payload = await response.json()
             generation_metadata = server.pop_generation_metadata("group=1/rollout=2")
+            num_aborted_calls = dict(server.num_aborted_calls)
         finally:
             await server.close()
 
@@ -952,6 +953,7 @@ def test_generation_server_rejects_aborted_generation() -> None:
             "error": "generation finished without a usable completion: abort"
         }
         assert generation_metadata is None
+        assert num_aborted_calls == {"group=1/rollout=2": 1}
 
     asyncio.run(run_test())
 
@@ -1290,6 +1292,7 @@ def test_a_rollout_with_no_turn_never_trains_and_each_failure_is_logged(
         pop_generation_metadata=lambda trace_id: VerifiersGenerationMetadata(
             min_policy_version=0, max_policy_version=0, metrics=[]
         ),
+        num_aborted_calls={},
     )
     worker._verifiers_env_client = SimpleNamespace(
         run=AsyncMock(
@@ -1579,6 +1582,7 @@ def test_timed_out_rollout_is_logged_and_keeps_no_reward(caplog) -> None:
         pop_generation_metadata=lambda trace_id: VerifiersGenerationMetadata(
             min_policy_version=0, max_policy_version=0, metrics=[]
         ),
+        num_aborted_calls={},
     )
     worker._verifiers_env_client = SimpleNamespace(
         run=AsyncMock(
@@ -1647,6 +1651,7 @@ def test_env_metrics_reach_the_last_turn_under_verifiers_env() -> None:
         pop_generation_metadata=lambda trace_id: VerifiersGenerationMetadata(
             min_policy_version=0, max_policy_version=0, metrics=[]
         ),
+        num_aborted_calls={},
     )
     worker._verifiers_env_client = SimpleNamespace(
         run=AsyncMock(
@@ -1709,7 +1714,9 @@ def test_rollout_releases_every_trace_session_even_if_one_release_fails(caplog) 
     worker = object.__new__(VerifiersRolloutWorker)
     popped_trace_ids = []
     worker._generation_server = SimpleNamespace(
-        model_id="model", pop_generation_metadata=popped_trace_ids.append
+        model_id="model",
+        pop_generation_metadata=popped_trace_ids.append,
+        num_aborted_calls={},
     )
     worker._verifiers_env_client = SimpleNamespace(
         run=AsyncMock(
@@ -1772,6 +1779,54 @@ def test_a_rollout_that_raises_fails_its_group_after_its_siblings_stop() -> None
         )
     assert [str(error) for error in raised.value.exceptions] == ["rollout 0 failed"]
     assert stopped == [1]
+
+
+def test_group_metrics_count_aborted_calls_and_the_untrainable_rollouts_with_one() -> None:
+    # Rollout 0 lost 2 calls and failed, rollout 1 lost 1 call and still trained, rollout 2 lost none.
+    rollouts = [
+        Rollout(
+            group_id=1,
+            rollout_id=0,
+            status=RolloutStatus.ERROR_INFRA,
+            logs={"num_aborted_calls": 2},
+        ),
+        Rollout(
+            group_id=1,
+            rollout_id=1,
+            status=RolloutStatus.COMPLETED,
+            logs={"num_aborted_calls": 1},
+        ),
+        Rollout(group_id=1, rollout_id=2, status=RolloutStatus.ERROR_INFRA),
+    ]
+
+    async def run_single_rollout(*, rollout_id: int, **kwargs) -> Rollout:
+        return rollouts[rollout_id]
+
+    async def make_scored_group(*, rollouts, sample, group_id) -> RolloutGroup:
+        return RolloutGroup(group_id=group_id, rollouts=rollouts)
+
+    worker = object.__new__(VerifiersRolloutWorker)
+    worker._generation_server = SimpleNamespace(set_generate_fn=lambda fn: None)
+    worker._run_single_rollout = run_single_rollout
+    worker.make_scored_group = make_scored_group
+    worker.flush_process_metrics = lambda group_id: []
+
+    group = asyncio.run(
+        worker.run_group(
+            generate_fn=AsyncMock(),
+            release_session_fn=AsyncMock(),
+            sample=None,
+            group_id=1,
+            group_size=3,
+            sampling=SamplingConfig(),
+        )
+    )
+
+    metrics = {metric.key: metric.value.value for metric in group.metrics}
+    assert metrics == {
+        "rollout/aborted_generate_calls": 3.0,
+        "rollout/untrainable_with_aborted_call": 1.0,
+    }
 
 
 def test_parse_sampling_config_requires_the_fields_the_rollouter_sends() -> None:
