@@ -394,20 +394,20 @@ def test_a_session_paused_past_the_bound_swaps_in_for_idle_sessions():
     policy = _policy()
     _idle_sessions(policy, _OVER_H)
     policy.rebalance(now=0.0)  # g0/s19 and s20 paused, ledger 2,812
-    # g0/s0-s4 grow to 161 blocks: 2,877. A paused session (148) no longer fits under 2,878.
+    for session_id in ("g0/s19", "g0/s20"):  # their next calls wait
+        assert not policy.start_call(
+            session_id, session_id=session_id, group_id=0, num_prompt_tokens=240_000
+        )
+    # g0/s0-s4 grow to 161 blocks: 2,877. A paused session (164 running) no longer fits under 2,878.
     _call_again(policy, [f"g0/s{i}" for i in range(5)], num_tokens=262_000)
     unpaused = [f"g0/s{i}" for i in range(19)]
     for now in (500.0, 1000.0, 1500.0):
         assert policy.rebalance(now=now) == []
         _call_again(
             policy, unpaused[5:], num_tokens=240_000
-        )  # active, so not reclaimed as hung
+        )  # active, so not reclaimed
         _call_again(policy, unpaused[:5], num_tokens=262_000)
     assert policy.num_paused_sessions == 2
-    for session_id in ("g0/s19", "g0/s20"):  # their next calls wait
-        assert not policy.start_call(
-            session_id, session_id=session_id, group_id=0, num_prompt_tokens=240_000
-        )
 
     # Past 1,800 s each swaps in for the smallest idle sessions, never going over 2,878:
     # 2,877 - 2 x 148 + 164 = 2,745 (s19 running), then 2,745 - 148 + 164 = 2,761 (s20).
@@ -444,6 +444,24 @@ def test_a_session_idle_past_the_reclaim_time_holds_back_no_group():
         "back", session_id="g0/s9", group_id=0, num_prompt_tokens=240_000
     )
     assert policy.num_paused_sessions == 1
+
+
+def test_a_paused_session_that_stops_calling_is_reclaimed():
+    policy = _policy()
+    _idle_sessions(policy, _OVER_H, first_prompt_tokens=4000)
+    policy.rebalance(now=0.0)  # g0/s19 and s20 stay paused, ledger 2,812
+    policy.add_group(
+        1, num_sessions=1, validation=False
+    )  # fits, but waits behind the paused sessions
+    for now in (
+        300.0,
+        601.0,
+    ):  # the unpaused sessions keep calling; s19 and s20 never call again
+        _call_again(policy, [f"g0/s{i}" for i in range(19)], num_tokens=240_000)
+        policy.rebalance(now=now)
+
+    assert policy.num_reclaimed_sessions == 2
+    assert policy.place() == {1: 0}
 
 
 def test_a_cancelled_waiting_call_is_forgotten():

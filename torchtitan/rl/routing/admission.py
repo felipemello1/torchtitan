@@ -418,15 +418,20 @@ class KVRoomAdmission(Configurable):
             for session in sessions
         )
         if work_waits:
-            for session in self._pause_victims(sessions):
+            # Paused or not: one paused for growth that then makes no call waits for nothing either.
+            for session in sessions:
                 if (
-                    not session.request_ids
-                    and self._clock - session.idle_since > IDLE_RECLAIM_S
+                    session.reclaimed
+                    or session.request_ids
+                    or session.parked_request_id is not None
+                    or self._clock - session.idle_since <= IDLE_RECLAIM_S
                 ):
+                    continue
+                if session.paused_at is None:
                     ledger -= budget.idle_session_blocks(session.num_tokens)
                     session.paused_at = self._clock
-                    session.reclaimed = True
-                    self.num_reclaims += 1
+                session.reclaimed = True
+                self.num_reclaims += 1
         return ledger
 
     def _resume(
