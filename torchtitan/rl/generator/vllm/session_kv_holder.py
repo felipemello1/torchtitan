@@ -274,6 +274,10 @@ class VLLMSessionKVHolder(Configurable):
 
     def release(self, session_ids: list[str] = (), group_ids: list[int] = ()) -> None:
         """Release sessions that make no more calls, and every session of finished groups."""
+        # TODO: an ended session's blocks go to the keep end of vLLM's free queue, so they outlive live
+        # idle history and the lazy CPU walk may copy them. Moving them to the evict end and dropping their
+        # hashes (as #5919's evictor does) needs private free-queue edits and a skip for blocks under a lazy
+        # copy; gain unmeasured, and it waits on the upstream choice between this holder and that evictor.
         released = set(session_ids)
         for group_id in group_ids:
             released |= self._group_sessions.pop(group_id, set())

@@ -171,6 +171,9 @@ class KVCacheBudget:
         budget.running_session_blocks(5000)   # 7 + 3 x 4 + 4 = 23
     """
 
+    # TODO: engine-neutral fields (usable blocks, an idle session's fixed blocks, a running session's extra
+    # blocks), built by `VLLMSessionKVHolder`, which owns the free-floor rule. That changes every field and
+    # its readers, and waits on the upstream choice between the holder and #5919's evictor.
     num_blocks: int
     """GPU KV cache blocks of one data-parallel replica."""
 
