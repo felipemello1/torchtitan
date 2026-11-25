@@ -365,7 +365,7 @@ class InterGeneratorRouter(Configurable):
         their `acquire_group`."""
         # TODO: if unpaused sessions keep losing their held KV (the holder releases idle sessions oldest
         # first, paused or not), tell the engine which to release first: a `release_first(session_ids)`
-        # call. Arm E (one GB300) saw 1.4 releases per minute, so it is not needed yet.
+        # call. Not needed yet: 30 min of one-GB300 load tests with admission released no unpaused session.
         for request_id in self._admission.rebalance(now=time.monotonic()):
             # Absent if its caller was cancelled during this tick's resume.
             parked = self._parked_calls.get(request_id)
