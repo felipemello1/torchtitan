@@ -25,8 +25,13 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dist_checkpoint
 import torch.nn as nn
 from safetensors import safe_open
+from torch.distributed.checkpoint import FileSystemWriter
 from torch.distributed.checkpoint.api import CheckpointException
-from torch.distributed.checkpoint.state_dict_saver import AsyncSaveResponse
+from torch.distributed.checkpoint.staging import DefaultStager
+from torch.distributed.checkpoint.state_dict_saver import (
+    AsyncCheckpointerType,
+    AsyncSaveResponse,
+)
 from torch.utils.data import DataLoader
 
 from torchtitan.components.checkpointer.base import (
@@ -46,6 +51,7 @@ from torchtitan.models.llama3 import MODEL_FLAVORS as LLAMA3_MODEL_FLAVORS
 from torchtitan.models.llama3.state_dict_adapter import Llama3StateDictAdapter
 from torchtitan.observability import structured_logger as sl
 from torchtitan.quantization._fsdp_tensor import _ShardedFSDPTensor
+from torchtitan.tools import filesystem
 
 
 # These tests name the checkpoint folder after the running test, so a bare
@@ -135,8 +141,8 @@ class DummyAsyncResult(AsyncSaveResponse):
 
 
 def fake_async_save(*args, **kwargs):
-    # Check if this is async_with_pinned_mem mode by looking for async_stager parameter
-    if kwargs.get("async_stager"):
+    # async_with_pinned_mem saves in a process; the "async" mode saves in a thread.
+    if kwargs.get("async_checkpointer_type") == AsyncCheckpointerType.PROCESS:
         return DummyAsyncResult()
     else:
         return DummyFuture()
@@ -263,6 +269,7 @@ class TestCheckpointManager(unittest.TestCase):
         with open(index_path, "w") as f:
             json.dump({"weight_map": weight_map}, f)
         manager = CheckpointManager.__new__(CheckpointManager)
+        manager.file_write_workers = 1
         manager.sd_adapter = Llama3StateDictAdapter(
             config, hf_assets_path=self.test_folder
         )
@@ -2132,6 +2139,106 @@ class TestCheckpointManagerEMAResumeFlexibility(unittest.TestCase):
         ]
         self.assertTrue(torch.equal(ema_weight, model2.weight.detach()))
         manager2.close()
+
+
+class TestCheckpointManagerWriter(unittest.TestCase):
+    """Real DCP saves through the writer and stager CheckpointManager passes."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._owns_pg = not dist.is_initialized()
+        if cls._owns_pg:
+            os.environ.setdefault("MASTER_ADDR", "localhost")
+            os.environ.setdefault("MASTER_PORT", "29511")
+            os.environ.setdefault("RANK", "0")
+            os.environ.setdefault("WORLD_SIZE", "1")
+            dist.init_process_group(backend="gloo")
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls._owns_pg:
+            dist.destroy_process_group()
+
+    def setUp(self):
+        self.base_temp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.base_temp_dir, ignore_errors=True)
+
+    def _build_manager(self, folder, model, **overrides):
+        config = CheckpointManager.Config(
+            folder=folder,
+            interval=1,
+            keep_latest_k=0,
+            last_save_model_only=False,
+            initial_load_model_only=False,
+            **overrides,
+        )
+        return CheckpointManager(
+            config=config,
+            model_parts=[model],
+            optimizers=FakeOptimizersContainer(),
+            lr_schedulers=FakeLRSchedulersContainer(),
+            ema=None,
+            extra_states={DATALOADER: FakeDataLoader()},
+            sd_adapter=None,
+            base_folder="",
+        )
+
+    def _assert_loads_back(self, folder, saved):
+        restored = nn.Linear(4, 4)
+        manager = self._build_manager(folder, restored)
+        manager.load(step=1)
+        manager.close()
+        torch.testing.assert_close(restored.weight, saved.weight)
+
+    def test_file_write_workers_writes_one_file_per_thread(self):
+        memory_name = f"test-{uuid.uuid4().hex}"
+        memory_fs = fsspec.filesystem("memory")
+        self.addCleanup(
+            lambda: memory_fs.rm(f"/{memory_name}", recursive=True)
+            if memory_fs.exists(f"/{memory_name}")
+            else None
+        )
+        local_folder = os.path.join(self.base_temp_dir, "ckpt")
+
+        for folder in (local_folder, f"memory://{memory_name}"):
+            with self.subTest(folder=folder):
+                saved = nn.Linear(4, 4)
+                manager = self._build_manager(folder, saved, file_write_workers=3)
+                manager.save(curr_step=1)
+                manager.close()
+
+                step_folder = filesystem.join(folder, "step-1")
+                shards = sorted(
+                    name
+                    for name in filesystem.listdir(step_folder)
+                    if name.endswith(".distcp")
+                )
+                self.assertEqual(
+                    ["__0_0.distcp", "__0_1.distcp", "__0_2.distcp"], shards
+                )
+                self._assert_loads_back(folder, saved)
+
+    def test_async_save_stages_with_the_default_stager(self):
+        folder = os.path.join(self.base_temp_dir, "ckpt")
+        saved = nn.Linear(4, 4)
+        manager = self._build_manager(folder, saved, async_mode="async")
+
+        with (
+            mock.patch.object(
+                DefaultStager, "stage", autospec=True, side_effect=DefaultStager.stage
+            ) as default_stage,
+            mock.patch.object(
+                FileSystemWriter,
+                "stage",
+                side_effect=AssertionError("staged with the writer"),
+            ),
+        ):
+            manager.save(curr_step=1)
+            # close() waits for the background write.
+            manager.close()
+
+        self.assertEqual(1, default_stage.call_count)
+        self._assert_loads_back(folder, saved)
 
 
 if __name__ == "__main__":
