@@ -457,5 +457,5 @@ def test_recipes_share_the_loop_and_keep_fp32_master_weights(name: str) -> None:
     loop = config.async_loop
     serve = config.rollouter.verifiers_env_server.serve
     assert serve.pool.num_workers * serve.max_concurrent >= (
-        loop.max_active_rollout_groups * loop.num_samples_per_prompt
+        loop.num_concurrent_rollout_groups * loop.num_samples_per_prompt
     )

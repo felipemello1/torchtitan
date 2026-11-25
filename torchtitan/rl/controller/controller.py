@@ -244,6 +244,17 @@ class AsyncLoopConfig(Configurable.Config):
     `target_offpolicy_steps + n`. A value of 1 is FIFO by batch. See
     ``torchtitan/rl/controller/WINDOWED_FIFO.md``."""
 
+    # TODO: when KV-room admission (pytorch/torchtitan#6008) lands, run its gate inside these loops to decide when a
+    # claimed group starts; keep this cap as the bound on the loops, vLLM's max_num_seqs and the worker pool.
+    max_concurrent_rollout_groups: int | None = None
+    """Groups that roll out at once; None: every active slot, `(S + 1) * P`. Set it when `(S + 1) * P * G`
+    rollouts would not fit in the generators' KV cache at once.
+
+        P=32, S=8, None -> all 288 groups (4,608 rollouts) roll out at the cold start
+        P=32, S=8, 64   -> 64 groups roll out; the other 224 slots hold groups that wait to
+                           start, wait for their batch, or train
+    """
+
     group_buffer: RolloutGroupWorkBuffer.Config = field(
         default_factory=RolloutGroupWorkBuffer.Config
     )
@@ -269,14 +280,29 @@ class AsyncLoopConfig(Configurable.Config):
                 f"windowed_fifo_batches must be None or >= 1, got {self.windowed_fifo_batches}"
             )
 
+        if self.max_concurrent_rollout_groups is not None and not (
+            1 <= self.max_concurrent_rollout_groups <= self.max_active_rollout_groups
+        ):
+            raise ValueError(
+                "max_concurrent_rollout_groups must be None or in [1, (S + 1) * P = "
+                f"{self.max_active_rollout_groups}], got {self.max_concurrent_rollout_groups}"
+            )
+
     @property
     def max_active_rollout_groups(self) -> int:
         return (self.target_offpolicy_steps + 1) * self.num_prompts_per_train_step
 
     @property
+    def num_concurrent_rollout_groups(self) -> int:
+        """Groups that roll out at once: `max_concurrent_rollout_groups`, or every active slot."""
+        if self.max_concurrent_rollout_groups is None:
+            return self.max_active_rollout_groups
+        return self.max_concurrent_rollout_groups
+
+    @property
     def max_rollouts_in_flight(self) -> int:
-        """The most training rollouts in flight at once: groups in flight x group size."""
-        return self.max_active_rollout_groups * self.num_samples_per_prompt
+        """The most training rollouts that roll out at once: `num_concurrent_rollout_groups` x group size."""
+        return self.num_concurrent_rollout_groups * self.num_samples_per_prompt
 
     @property
     def window_size(self) -> int | None:
@@ -573,14 +599,15 @@ class Controller(Configurable):
 
         @property
         def max_num_seqs_per_generator_dp_rank(self) -> int:
-            """2x each generator DP rank's even share of the training rollouts in flight,
-            rounded up to a power of two, clamped to [token budget / 64, token budget]. The token
-            budget is ``generator.max_num_batched_tokens``, or 2048 when unset.
+            """2x each generator DP rank's even share of the concurrent training rollouts
+            (`num_concurrent_rollout_groups` x G), rounded up to a power of two, clamped to
+            [token budget / 64, token budget]. The token budget is ``generator.max_num_batched_tokens``,
+            or 2048 when unset.
 
             Example (token budget unset):
-                1536 rollouts in flight, 8 generator DP ranks -> 2 x 192 = 384 -> 512
-                64 rollouts in flight, 3 generator DP ranks   -> 2 x 22 = 44   -> 64
-                16 rollouts in flight, 2 generator DP ranks   -> 2 x 8 = 16    -> 32
+                1536 concurrent rollouts, 8 generator DP ranks -> 2 x 192 = 384 -> 512
+                64 concurrent rollouts, 3 generator DP ranks   -> 2 x 22 = 44   -> 64
+                16 concurrent rollouts, 2 generator DP ranks   -> 2 x 8 = 16    -> 32
             """
             # TODO: add a generator.max_num_seqs override when a recipe needs a smaller value.
             num_generator_dp_ranks = (
@@ -1063,6 +1090,7 @@ class Controller(Configurable):
         window_size = async_loop.window_size
         logger.info(
             f"max_active_rollout_groups={max_active_rollout_groups}, "
+            f"num_concurrent_rollout_groups={async_loop.num_concurrent_rollout_groups}, "
             f"target_offpolicy_steps={async_loop.target_offpolicy_steps}, "
             f"windowed_fifo_batches={async_loop.windowed_fifo_batches}, "
             f"max_offpolicy_steps={async_loop.max_offpolicy_steps}"
@@ -1082,8 +1110,9 @@ class Controller(Configurable):
         generate_fn = self._make_generate_fn()
         release_session_fn = self._make_release_session_fn()
 
-        # One rollout loop per group that can be in flight at once (`max_active_rollout_groups`).
+        # One rollout loop per group that may roll out at once (`num_concurrent_rollout_groups`).
         # A loop is an asyncio task: it rolls out one group at a time, on the worker the rollouter picks.
+        # Groups past that wait in their active slot until a loop claims them.
         # TODO: support warm start
         rollout_tasks = [
             asyncio.create_task(
@@ -1094,7 +1123,7 @@ class Controller(Configurable):
                 ),
                 name=f"rollout_loop_{loop_index}",
             )
-            for loop_index in range(max_active_rollout_groups)
+            for loop_index in range(async_loop.num_concurrent_rollout_groups)
         ]
 
         # data_input_loop
