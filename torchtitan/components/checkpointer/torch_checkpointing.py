@@ -245,16 +245,15 @@ class TorchCheckpointingManager(BaseCheckpointManager):
     @dataclass(kw_only=True, slots=True)
     class Config(BaseCheckpointManager.Config):
         file_write_direct_io: bool = True
-        """Open checkpoint files for writing with O_DIRECT, which skips the page
-        cache. Set False on NFS, where buffered writes were faster for one rank's
-        save:
+        """Open local checkpoint files for writing with O_DIRECT, which skips the
+        page cache.
 
-            40.3 GB, file_write_workers=1:  41.0 s -> 22.5 s
-            10 GB,   file_write_workers=4:  8.97 s -> 5.22 s
+            True:   O_DIRECT where the filesystem accepts it, e.g. NFS.
+                    ext4 and XFS fall back to buffered writes.
+            False:  buffered writes, which are faster on NFS.
 
-        On ext4 and XFS the library falls back to buffered writes, so the value
-        changes nothing there. torch_checkpointing never fsyncs, so neither value
-        makes a save durable on its own.
+        Remote paths (gs://...) ignore it. torch_checkpointing doesn't fsync, so on
+        a local disk a crash right after a save can lose data.
         """
 
         def __post_init__(self) -> None:
