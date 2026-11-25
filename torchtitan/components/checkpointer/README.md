@@ -82,6 +82,8 @@ checkpointer=CheckpointManager.Config(
 
 A more exhaustive and up-to-date list of checkpoint config options can be found in `torchtitan/components/checkpointer/base.py` (`BaseCheckpointManager.Config`). That includes `async_mode`: the DCP manager supports all three modes, and `TorchCheckpointingManager` supports `disabled` and `async_with_pinned_mem`.
 
+Each manager reads only its own checkpoints. To switch managers, use a new `folder`: a manager pointed at a folder that holds the other manager's `step-N` raises on load.
+
 ## Remote storage with `TorchCheckpointingManager`
 
 `TorchCheckpointingManager` can keep checkpoints on a remote store through fsspec.

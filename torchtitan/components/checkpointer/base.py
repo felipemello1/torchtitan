@@ -42,6 +42,12 @@ DATALOADER = "dataloader"
 TRAIN_STATE = "train_state"
 EMA = "ema"
 
+# The file each checkpoint manager writes last to mark a step-N complete.
+_COMPLETION_FILE_TO_MANAGER = {
+    ".metadata": "CheckpointManager",
+    "metadata.pkl": "TorchCheckpointingManager",
+}
+
 
 def purge_thread(
     purge_queue: queue.Queue[str | None],
@@ -313,6 +319,7 @@ class BaseCheckpointManager(Configurable, ABC):
             has_checkpoint_folder = self._storage.isdir(self.folder)
             load_step = -1
             if has_checkpoint_folder:
+                self._raise_on_other_manager_checkpoints()
                 load_step = self._find_load_step() if step == -1 else step
 
             if step != -1 and not has_checkpoint_folder:
@@ -394,6 +401,14 @@ class BaseCheckpointManager(Configurable, ABC):
             # Explicit load_step and initial_load_path are only checked to be
             # directories above; automatic selection already filtered on this.
             if not from_hf and not self._is_resumable_checkpoint(checkpoint_id):
+                completion_file = self._other_manager_completion_file(checkpoint_id)
+                if completion_file is not None:
+                    raise ValueError(
+                        f"Checkpoint {checkpoint_id} holds {completion_file}, so "
+                        f"{_COMPLETION_FILE_TO_MANAGER[completion_file]} wrote it, "
+                        f"and {type(self).__name__} can't read it. Load it with "
+                        f"{_COMPLETION_FILE_TO_MANAGER[completion_file]}."
+                    )
                 raise ValueError(
                     f"Checkpoint {checkpoint_id} is not a complete checkpoint: it "
                     "has no completed checkpoint metadata, so its save never "
@@ -586,6 +601,53 @@ class BaseCheckpointManager(Configurable, ABC):
                 resumable_steps.append(step)
         return max(resumable_steps) if resumable_steps else -1
 
+    def _other_manager_completion_file(self, checkpoint_dir: str) -> str | None:
+        """The completion file another manager wrote in ``checkpoint_dir``, if any.
+
+        step-2/.metadata, seen by TorchCheckpointingManager  -> ".metadata"
+        step-2/.metadata, seen by CheckpointManager          -> None (its own)
+        step-3/ with neither file (an unfinished save)       -> None
+        """
+        if self._is_resumable_checkpoint(checkpoint_dir):
+            return None
+
+        for completion_file in _COMPLETION_FILE_TO_MANAGER:
+            if self._storage.isfile(filesystem.join(checkpoint_dir, completion_file)):
+                return completion_file
+        return None
+
+    def _raise_on_other_manager_checkpoints(self) -> None:
+        """Raise if ``self.folder`` holds a ``step-N`` that another manager wrote.
+
+            step-2/.metadata, seen by TorchCheckpointingManager         -> raises
+            the same step-2 next to its own step-0/metadata.pkl         -> raises
+            step-3/ with neither file (an unfinished save)              -> no raise
+
+        Without it, this manager would start fresh and retention would delete them.
+        """
+        other_checkpoints = []
+        for dirname in sorted(self._storage.listdir(self.folder)):
+            if self._parse_step(dirname) is None:
+                continue
+
+            checkpoint_dir = filesystem.join(self.folder, dirname)
+            completion_file = self._other_manager_completion_file(checkpoint_dir)
+            if completion_file is not None:
+                other_checkpoints.append(
+                    f"{dirname} ({completion_file}: "
+                    f"{_COMPLETION_FILE_TO_MANAGER[completion_file]})"
+                )
+
+        # TODO: convert those checkpoints instead of raising, once a converter
+        # between the DCP and torch_checkpointing formats exists.
+        if other_checkpoints:
+            raise ValueError(
+                f"checkpointer.folder {self.folder} holds checkpoints that "
+                f"{type(self).__name__} can't read: {', '.join(other_checkpoints)}. "
+                "Use the manager that wrote them, use a new checkpointer.folder, or "
+                f"move those step-N folders out of {self.folder}."
+            )
+
     def _purge_stale_checkpoints(
         self,
         *,
@@ -619,10 +681,22 @@ class BaseCheckpointManager(Configurable, ABC):
                 step = self._parse_step(dirname)
                 if step is None:
                     continue
+
                 if self._is_valid_checkpoint(checkpoint_dir):
                     checkpoints.append((step, checkpoint_dir))
-                else:
-                    abandoned.append(checkpoint_dir)
+                    continue
+
+                # Keep another manager's step-N. load() refuses the folder, but a
+                # seed-checkpoint save runs without a load.
+                if self._other_manager_completion_file(checkpoint_dir) is not None:
+                    logger.warning(
+                        "Checkpointer is keeping %s: another checkpoint manager "
+                        "wrote it.",
+                        checkpoint_dir,
+                    )
+                    continue
+
+                abandoned.append(checkpoint_dir)
 
             checkpoints.sort()
             num_to_keep = self.keep_latest_k - 1
