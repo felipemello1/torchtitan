@@ -542,8 +542,6 @@ class TestSGLangBitwiseParityGDN(SGLangBitwiseParityTestBase):
 
     __test__ = True
     config_fn = staticmethod(qwen3_5_debug_bitwise_config)
-    # SGLang cannot capture full prefill graphs of linear attention models.
-    cuda_graph = "breakable"
     sync_weights_from_trainer = True
     # Tests 4 and 5 then cover the reset path (retract, flush, continue).
     reset_kv_cache_on_model_state_dict_load = True
@@ -563,6 +561,8 @@ class TestSGLangBitwiseParityGDNHiCache(TestSGLangBitwiseParityGDN):
     host memory."""
 
     extra_server_args = {"enable_hierarchical_cache": True, "hicache_size": 8}
+    # Breakable prefill graphs; TestSGLangBitwiseParityGDN runs full ones.
+    cuda_graph = "breakable"
 
     def test_trainer_vs_sglang_decode_after_host_load_back(self):
         """Test 3 with the previous turns evicted from GPU memory, so the next turns
@@ -747,7 +747,8 @@ class TestSGLangBitwiseParityKDA(SGLangBitwiseParityTestBase):
 
     __test__ = True
     config_fn = staticmethod(kimi_k3_debug_bitwise_config)
-    # SGLang cannot capture full prefill graphs of linear attention models.
+    # Breakable prefill graphs; TestSGLangBitwiseParityGDN runs full ones, on the
+    # same linear attention backend.
     cuda_graph = "breakable"
     sync_weights_from_trainer = True
     # Chunked prefill off the 64-token grid: SGLang's prefix cache then snapshots KDA

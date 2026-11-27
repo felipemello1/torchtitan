@@ -347,7 +347,7 @@ class SGLangEngine(GenerationEngine):
             and parallelism.data_parallel_degree > 1
         ):
             # TODO: the prefill graph tables don't mask the batches SGLang pads a DP
-            # rank with yet (see TorchTitanGDNAttnBackend.supports_prefill_graph_extend).
+            # rank with yet (see TorchTitanLinearAttnBackend.supports_prefill_graph_extend).
             raise ValueError(
                 "SGLangEngine does not capture full prefill CUDA graphs of linear "
                 "attention (GDN, KDA) models under data_parallel_degree "
@@ -543,10 +543,11 @@ class SGLangEngine(GenerationEngine):
             skip_server_warmup=True,
             log_level="warning",
         )
-        if any(
+        has_linear_attention = any(
             isinstance(layer.attention, LinearAttention.Config)
             for layer in model.layers
-        ):
+        )
+        if has_linear_attention:
             # KV and GDN / KDA states share one pool, so memory one does not use can
             # hold the other (see the README). SGLang builds it for hybrid models only.
             server_kwargs["enable_unified_memory"] = True
@@ -556,23 +557,23 @@ class SGLangEngine(GenerationEngine):
             # has more requests than full_prefill_max_req. A prefill batch has at
             # most max_num_seqs requests, so with that many slots every prefill
             # batch runs in a graph.
-            server_kwargs["cuda_graph_config"] = {
-                "prefill": {"backend": "full", "full_prefill_max_req": max_num_seqs}
-            }
-            if any(
-                isinstance(layer.attention, LinearAttention.Config)
-                for layer in model.layers
-            ):
-                # The GDN and KDA tables keep a row per request, as in "breakable".
+            full_prefill_max_requests = max_num_seqs
+            if has_linear_attention:
+                # At most 256 requests per prefill batch, as in "breakable" below: the
+                # GDN and KDA tables keep a row per request.
                 server_kwargs["prefill_max_requests"] = 256
+                full_prefill_max_requests = min(max_num_seqs, 256)
+            server_kwargs["cuda_graph_config"] = {
+                "prefill": {
+                    "backend": "full",
+                    "full_prefill_max_req": full_prefill_max_requests,
+                }
+            }
         elif self.config.cuda_graph == "breakable":
             server_kwargs["cuda_graph_config"] = {"prefill": {"backend": "breakable"}}
             # Attention DP keeps the linear attention extend eager, with no tables
             # (TorchTitanLinearAttnBackend.supports_prefill_graph_extend).
-            if parallelism.data_parallel_degree == 1 and any(
-                isinstance(layer.attention, LinearAttention.Config)
-                for layer in model.layers
-            ):
+            if parallelism.data_parallel_degree == 1 and has_linear_attention:
                 # At most 256 requests per prefill batch; SGLang runs the rest in the next
                 # prefill step. The prefill graphs keep a table row per request, and each
                 # row costs GPU time in every GDN or KDA layer: 1,024 rows add about 3 ms to
