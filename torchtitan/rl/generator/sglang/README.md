@@ -97,16 +97,16 @@ batches. The default, `"full"`, also captures prefill batches as SGLang's full
 prefill CUDA graphs, one per token-count bucket, with a request slot per running
 request. Without them, prefill is bound by the eager model's CPU overhead (about
 7x the GPU time of a 16K-token prefill chunk of Qwen3-0.6B at TP 2). Linear
-attention (GDN, KDA) layers run inside these graphs on tables refilled before each
-replay (`PrefillGraphMetadata`); with attention DP, linear attention models raise
+attention (GDN, KDA) layers run inside these graphs, on tables refilled before each
+replay (`PrefillGraphMetadata`); under attention DP, linear attention models raise
 with `"full"`. `"breakable"` captures SGLang's breakable prefill graphs instead,
-where the model runs in graph segments, with attention and KDA layers eager in
-between, at a CPU cost per layer in every prefill step. GDN layers run inside the
-segments, on the same tables, except under attention DP
-(`TorchTitanGDNAttnBackend.supports_prefill_graph_extend`). The tables have a row
-per request, so for models whose prefill graphs run them the engine caps a prefill
-batch at 256 requests. Breakable capture takes about 37 s (Qwen3.5-0.8B) to 74 s
-(Qwen3.5-27B) at startup, on one GB300; `"decode"` skips it.
+where the model runs in graph segments, with attention eager in between, at a CPU
+cost per layer in every prefill step. GDN and KDA layers run inside the segments,
+on the same tables, except under attention DP
+(`TorchTitanLinearAttnBackend.supports_prefill_graph_extend`). The tables have a row
+per request, so for these models the engine caps a prefill batch at 256 requests.
+Breakable capture takes about 37 s (Qwen3.5-0.8B) to 74 s (Qwen3.5-27B) at startup,
+on one GB300; `"decode"` skips it.
 
 Attention kernels compile on first use for each kernel variant, so the first
 prefill batches of a run can take a few seconds.
