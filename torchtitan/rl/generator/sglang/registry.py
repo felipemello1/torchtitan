@@ -155,7 +155,10 @@ def _patch_page_major_attention_backend_allow_list() -> None:
 
     SGLang accepts only backends it audited for such views, by name. The TorchTitan
     backend is SGLang's FlashAttention backend with PyTorch's varlen FlashAttention
-    kernel (FA3 or FA4), which reads that stride, so check it as ``fa3``.
+    kernel (FA3 or FA4), which reads that stride, so check it as ``fa3``. The same
+    name check keeps SGLang's full prefill CUDA graphs on unified memory
+    (``handle_unified_memory_pool``): they need the FlashAttention backend's
+    ``_init_full_cg_prefill_metadata``, which the TorchTitan backend inherits.
 
     TODO(https://github.com/sgl-project/sglang/pull/49681): register the backend
     with ``page_major_kv_layout=True`` and drop this patch once the pinned SGLang
@@ -167,20 +170,23 @@ def _patch_page_major_attention_backend_allow_list() -> None:
         TORCHTITAN_VARLEN_ATTENTION_BACKEND,
     )
 
-    original = kv_cache_hook.handle_page_major_kv_layout
     backends_of = kv_cache_hook.attention_backends_of
 
-    def handle_page_major_kv_layout(server_args: Any) -> None:
-        kv_cache_hook.attention_backends_of = lambda cfg: tuple(
-            "fa3" if backend == TORCHTITAN_VARLEN_ATTENTION_BACKEND else backend
-            for backend in backends_of(cfg)
-        )
-        try:
-            original(server_args)
-        finally:
-            kv_cache_hook.attention_backends_of = backends_of
+    def with_backend_as_fa3(original):
+        def hook(server_args: Any) -> None:
+            kv_cache_hook.attention_backends_of = lambda cfg: tuple(
+                "fa3" if backend == TORCHTITAN_VARLEN_ATTENTION_BACKEND else backend
+                for backend in backends_of(cfg)
+            )
+            try:
+                original(server_args)
+            finally:
+                kv_cache_hook.attention_backends_of = backends_of
 
-    kv_cache_hook.handle_page_major_kv_layout = handle_page_major_kv_layout
+        return hook
+
+    for name in ("handle_page_major_kv_layout", "handle_unified_memory_pool"):
+        setattr(kv_cache_hook, name, with_backend_as_fa3(getattr(kv_cache_hook, name)))
 
 
 def register_to_sglang(

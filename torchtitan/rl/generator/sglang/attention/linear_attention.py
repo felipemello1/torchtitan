@@ -14,6 +14,7 @@ V = value head dim, W = conv kernel size (all rank-local under TP).
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 
 import torch
@@ -21,6 +22,7 @@ import torch.nn.functional as F
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.kv.router import STATE_PART
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner_utils.forward_batch import get_forward_batch
 from sglang.srt.runtime_context import get_schedule
 from transformers import PretrainedConfig
@@ -162,7 +164,8 @@ class TorchTitanLinearAttnBackend(MambaAttnBackendBase):
 
     A subclass whose ``supports_prefill_graph_extend`` holds runs its extend inside
     SGLang's breakable prefill CUDA graphs, on each bucket's ``PrefillGraphMetadata``, and
-    zeroes its output at ``padding_tokens``, which the kernels leave unwritten.
+    zeroes its output at ``padding_tokens``, which the kernels leave unwritten. SGLang's
+    full prefill CUDA graphs run every subclass's extend on those tables.
     """
 
     # Set by a bucket's capture or replay; the next eager forward (init_forward_metadata)
@@ -178,6 +181,8 @@ class TorchTitanLinearAttnBackend(MambaAttnBackendBase):
             self.req_to_token_pool.size,
             get_schedule().prefill_max_requests or self.req_to_token_pool.size,
         )
+        # The tables of each full prefill CUDA graph, by the bucket's token count.
+        self.full_prefill_graph_metadata: dict[int, PrefillGraphMetadata] = {}
         # TODO(https://github.com/sgl-project/sglang/issues/48463): SGLang has no
         # public hooks for the extra_buffer prefix cache. The backends rely on its
         # internals: conv_states_shape below, the forward_metadata track fields read
@@ -195,6 +200,51 @@ class TorchTitanLinearAttnBackend(MambaAttnBackendBase):
         # An eager forward reads SGLang's metadata of the batch, not a bucket's tables.
         self.prefill_graph_metadata = None
         super().init_forward_metadata(forward_batch)
+
+    def init_forward_metadata_out_graph(self, forward_batch, in_capture: bool = False):
+        """Before a full CUDA graph's capture or replay: a prefill graph fills its
+        bucket's tables, and the other graphs take SGLang's metadata.
+
+        SGLang's full prefill graphs keep a fixed number of request slots and fill the
+        unused ones with empty requests. The tables take the real requests only:
+
+            forward_batch.extend_seq_lens   [100, 30, 0, 0]   4 slots, 2 requests
+            tables refreshed from           [100, 30]
+        """
+        # TODO(https://github.com/sgl-project/sglang/pull/51225): on this pin, SGLang's
+        # base backend can't build full prefill graph metadata. At the pin bump, drop
+        # this override if SGLang's metadata then carries the extra_buffer snapshots.
+        if forward_batch.forward_mode not in (ForwardMode.EXTEND, ForwardMode.MIXED):
+            self.prefill_graph_metadata = None
+            super().init_forward_metadata_out_graph(
+                forward_batch, in_capture=in_capture
+            )
+            return
+
+        # The real requests come first; the empty ones fill the slots after them.
+        num_requests = sum(1 for length in forward_batch.extend_seq_lens_cpu if length)
+        requests = copy.copy(forward_batch)
+        requests.batch_size = num_requests
+        for name in (
+            "extend_prefix_lens",
+            "mamba_track_indices",
+            "mamba_track_mask",
+            "mamba_track_seqlens",
+        ):
+            value = getattr(forward_batch, name)
+            if value is not None:
+                setattr(requests, name, value[:num_requests])
+
+        # input_ids is the graph's static buffer: the bucket's size, at replay too.
+        num_tokens = forward_batch.input_ids.shape[0]
+        if in_capture:
+            self.full_prefill_graph_metadata[
+                num_tokens
+            ] = self.init_prefill_graph_metadata(requests)
+        else:
+            self.refresh_prefill_graph_metadata(
+                self.full_prefill_graph_metadata[num_tokens], requests
+            )
 
     def prefill_graph_extend_active(self) -> bool:
         return self.prefill_graph_metadata is not None
